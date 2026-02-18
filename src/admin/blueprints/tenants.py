@@ -378,7 +378,8 @@ def tenant_settings(tenant_id, section=None):
             except Exception as e:
                 logger.warning(f"Failed to load setup checklist: {e}")
 
-            script_name = request.script_root or request.environ.get("SCRIPT_NAME", "")
+            # Get script_name for production URL handling
+            script_name = request.script_root or ""
 
             # Get available currencies from Babel
             available_currencies = get_available_currencies()

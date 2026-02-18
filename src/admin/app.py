@@ -10,7 +10,6 @@ from flask import Flask, request
 from markupsafe import Markup
 from werkzeug.middleware.proxy_fix import ProxyFix as WerkzeugProxyFix
 
-from src.admin.blueprints.accounts import accounts_bp
 from src.admin.blueprints.activity_stream import activity_stream_bp
 from src.admin.blueprints.adapters import adapters_bp
 from src.admin.blueprints.api import api_bp
@@ -57,14 +56,35 @@ class CustomProxyFix:
     Also fixes hardcoded URLs in redirects to include the script name prefix.
     """
 
-    def __init__(self, app):
+    def __init__(self, app, script_name="/admin"):
         self.app = app
+        self.script_name = script_name
 
     def __call__(self, environ, start_response):
         # Handle X-Script-Name (standard for mounting path) or X-Forwarded-Prefix
         script_name = environ.get("HTTP_X_SCRIPT_NAME", "")
         if not script_name:
             script_name = environ.get("HTTP_X_FORWARDED_PREFIX", "")
+
+        # Use configured script_name if provided in production
+        # BUT only if this is NOT a custom domain request (via Approximated)
+        # Custom domains should have empty script_root to show landing page
+        if not script_name and os.environ.get("PRODUCTION") == "true":
+            # Check if this is a custom domain request via Approximated
+            apx_host = environ.get("HTTP_APX_INCOMING_HOST", "")
+
+            # Get the actual host being accessed
+            host = environ.get("HTTP_HOST", "")
+
+            # Check if this is a sales agent subdomain (tenant subdomain)
+            # Tenant subdomains should always use /admin prefix
+            from src.core.domain_config import is_sales_agent_domain
+            is_tenant_subdomain = is_sales_agent_domain(host)
+
+            if not apx_host or is_tenant_subdomain:
+                # No Approximated header OR tenant subdomain - use default /admin script_name
+                script_name = self.script_name
+            # If apx_host is set AND not a tenant subdomain, leave script_name empty for custom domains
 
         if script_name:
             # Store for use in response wrapper
@@ -307,7 +327,9 @@ def create_app(config=None):
 
         context = {}
 
-        context["script_name"] = request.script_root or request.environ.get("SCRIPT_NAME", "")
+        # Inject script_name from request.script_root (set by CustomProxyFix middleware)
+        from flask import request
+        context["script_name"] = request.script_root or ""
 
         # Inject support email (configurable via SUPPORT_EMAIL env var)
         context["support_email"] = get_support_email()
@@ -329,6 +351,26 @@ def create_app(config=None):
 
         return context
 
+    # Add after_request handler to fix hardcoded URLs in HTML responses
+    @app.after_request
+    def fix_hardcoded_urls(response):
+        """Fix hardcoded URLs in HTML responses to include script_name prefix."""
+        if os.environ.get("PRODUCTION") == "true" and response.content_type and "text/html" in response.content_type:
+            # Only process HTML responses
+            try:
+                html = response.get_data(as_text=True)
+                # Fix common hardcoded patterns
+                html = html.replace('href="/', 'href="/admin/')
+                html = html.replace("href='/", "href='/admin/")
+                html = html.replace('action="/', 'action="/admin/')
+                html = html.replace("action='/", "action='/admin/")
+                # Fix any that were already prefixed (avoid double prefixing)
+                html = html.replace("/admin/admin/", "/admin/")
+                response.set_data(html)
+            except Exception as e:
+                logger.error(f"Error fixing URLs in response: {e}")
+        return response
+
     # Register blueprints
     app.register_blueprint(public_bp)  # Public routes (no auth required) - MUST BE FIRST
     app.register_blueprint(core_bp)  # Core routes (/, /health, /static)
@@ -336,7 +378,6 @@ def create_app(config=None):
     app.register_blueprint(oidc_bp)  # OIDC/OAuth routes at /auth/oidc
     app.register_blueprint(tenant_management_settings_bp)  # Tenant management settings at /settings
     app.register_blueprint(tenants_bp, url_prefix="/tenant")
-    app.register_blueprint(accounts_bp, url_prefix="/tenant/<tenant_id>/accounts")
     app.register_blueprint(products_bp, url_prefix="/tenant/<tenant_id>/products")
     app.register_blueprint(principals_bp, url_prefix="/tenant/<tenant_id>")
     app.register_blueprint(users_bp)  # Already has url_prefix in blueprint
