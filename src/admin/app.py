@@ -69,10 +69,7 @@ class CustomProxyFix:
         # Use configured script_name if provided in production
         # BUT only if this is NOT a custom domain request (via Approximated)
         # Custom domains should have empty script_root to show landing page
-        if not script_name and os.environ.get("PRODUCTION") == "true":
-            # Check if this is a custom domain request via Approximated
-            apx_host = environ.get("HTTP_APX_INCOMING_HOST", "")
-
+        if not script_name:
             # Get the actual host being accessed
             host = environ.get("HTTP_HOST", "")
 
@@ -81,10 +78,16 @@ class CustomProxyFix:
             from src.core.domain_config import is_sales_agent_domain
             is_tenant_subdomain = is_sales_agent_domain(host)
 
-            if not apx_host or is_tenant_subdomain:
-                # No Approximated header OR tenant subdomain - use default /admin script_name
+            if os.environ.get("PRODUCTION") == "true":
+                # Check if this is a custom domain request via Approximated
+                apx_host = environ.get("HTTP_APX_INCOMING_HOST", "")
+                if not apx_host or is_tenant_subdomain:
+                    # No Approximated header OR tenant subdomain - use default /admin script_name
+                    script_name = self.script_name
+                # If apx_host is set AND not a tenant subdomain, leave script_name empty for custom domains
+            elif is_tenant_subdomain:
+                # Dev mode: only apply script_name for tenant subdomains
                 script_name = self.script_name
-            # If apx_host is set AND not a tenant subdomain, leave script_name empty for custom domains
 
         if script_name:
             # Store for use in response wrapper
