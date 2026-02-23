@@ -403,11 +403,11 @@ function addPricingOption(existingData = null) {
     container.insertAdjacentHTML('beforeend', optionHtml);
 
     // Create the update function for this specific option
-    window[`updatePricingFields${index}`] = function() {
-        const pricingModel = document.querySelector(`select[name="pricing_model_${index}"]`).value;
-        const rateGroup = document.getElementById(`rate-group-${index}`);
-        const floorGroup = document.getElementById(`floor-group-${index}`);
-        const priceGuidance = document.getElementById(`price-guidance-${index}`);
+    window['updatePricingFields' + index] = function() {
+        const pricingModel = document.querySelector('select[name="pricing_model_' + index + '"]').value;
+        const rateGroup = document.getElementById('rate-group-' + index);
+        const floorGroup = document.getElementById('floor-group-' + index);
+        const priceGuidance = document.getElementById('price-guidance-' + index);
 
         // Determine if fixed or auction from pricing model selection
         // Auction models: cpm_auction, vcpm, cpc
@@ -417,21 +417,21 @@ function addPricingOption(existingData = null) {
             rateGroup.style.display = 'block';
             floorGroup.style.display = 'none';
             priceGuidance.style.display = 'none';
-            document.querySelector(`input[name="rate_${index}"]`).required = true;
-            const floorInput = document.querySelector(`input[name="floor_${index}"]`);
+            document.querySelector('input[name="rate_' + index + '"]').required = true;
+            const floorInput = document.querySelector('input[name="floor_' + index + '"]');
             if (floorInput) floorInput.required = false;
         } else {
             // Auction mode (cpm_auction, vcpm, cpc)
             rateGroup.style.display = 'none';
             floorGroup.style.display = 'block';
             priceGuidance.style.display = 'block';
-            document.querySelector(`input[name="rate_${index}"]`).required = false;
-            document.querySelector(`input[name="floor_${index}"]`).required = true;
+            document.querySelector('input[name="rate_' + index + '"]').required = false;
+            document.querySelector('input[name="floor_' + index + '"]').required = true;
         }
 
         // Show model-specific parameters based on selected model
-        const parametersDiv = document.getElementById(`parameters-${index}`);
-        const paramsContent = document.getElementById(`params-content-${index}`);
+        const parametersDiv = document.getElementById('parameters-' + index);
+        const paramsContent = document.getElementById('params-content-' + index);
 
         // Extract base model from cpm_fixed/cpm_auction
         const baseModel = pricingModel.startsWith('cpm_') ? 'cpm' : pricingModel;
@@ -468,11 +468,11 @@ function addPricingOption(existingData = null) {
     };
 
     // Initialize fields
-    window[`updatePricingFields${index}`]();
+    window['updatePricingFields' + index]();
 }
 
 function removePricingOption(index) {
-    const option = document.getElementById(`pricing-option-${index}`);
+    const option = document.getElementById('pricing-option-' + index);
     if (option) {
         option.remove();
     }
