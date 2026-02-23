@@ -1886,10 +1886,10 @@ function addPricingOption(existingData = null) {
     container.insertAdjacentHTML('beforeend', optionHtml);
 
     // Create dynamic update function
-    window[`updatePricingFields${index}`] = function() {
-        const modelSelect = document.querySelector(`select[name="pricing_model_${index}"]`);
-        const rateGroup = document.getElementById(`rate-group-${index}`);
-        const floorGroup = document.getElementById(`floor-group-${index}`);
+    window['updatePricingFields' + index] = function() {
+        const modelSelect = document.querySelector('select[name="pricing_model_' + index + '"]');
+        const rateGroup = document.getElementById('rate-group-' + index);
+        const floorGroup = document.getElementById('floor-group-' + index);
 
         // vCPM and CPC are always auction-based (no fixed rate option)
         const value = modelSelect.value;
@@ -1898,24 +1898,24 @@ function addPricingOption(existingData = null) {
         if (isAuction) {
             rateGroup.style.display = 'none';
             floorGroup.style.display = 'block';
-            document.querySelector(`input[name="rate_${index}"]`).removeAttribute('required');
-            document.querySelector(`input[name="floor_${index}"]`).setAttribute('required', '');
+            document.querySelector('input[name="rate_' + index + '"]').removeAttribute('required');
+            document.querySelector('input[name="floor_' + index + '"]').setAttribute('required', '');
         } else {
             rateGroup.style.display = 'block';
             floorGroup.style.display = 'none';
-            document.querySelector(`input[name="rate_${index}"]`).setAttribute('required', '');
-            document.querySelector(`input[name="floor_${index}"]`).removeAttribute('required');
+            document.querySelector('input[name="rate_' + index + '"]').setAttribute('required', '');
+            document.querySelector('input[name="floor_' + index + '"]').removeAttribute('required');
         }
     };
 
     // Initialize fields if existing data
     if (existingData) {
-        window[`updatePricingFields${index}`]();
+        window['updatePricingFields' + index]();
     }
 }
 
 function removePricingOption(index) {
-    const element = document.getElementById(`pricing-option-${index}`);
+    const element = document.getElementById('pricing-option-' + index);
     if (element) {
         element.remove();
     }
