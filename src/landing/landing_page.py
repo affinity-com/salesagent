@@ -49,6 +49,12 @@ def _determine_base_url(virtual_host: str | None = None) -> str:
     if virtual_host:
         # Use http for localhost, https for everything else
         scheme = "http" if "localhost" in virtual_host or virtual_host.startswith("127.") else "https"
+        # Append external port if configured and not already present in virtual_host.
+        # ADCP_EXTERNAL_PORT is set when the container's internal port differs from the
+        # external port (e.g. Docker maps 8001 -> 8000 internally).
+        if ":" not in virtual_host:
+            if ext_port := os.getenv("ADCP_EXTERNAL_PORT"):
+                return f"{scheme}://{virtual_host}:{ext_port}"
         return f"{scheme}://{virtual_host}"
 
     # Local development fallback (should rarely be reached)
