@@ -54,9 +54,11 @@ async def app_lifespan(app: FastAPI):
     logger.info("FastAPI application shutting down")
 
 
-# Build the MCP sub-application.
-# path="/" because we mount it at /mcp — routes inside are relative.
-mcp_app = mcp.http_app(path="/")
+# Build the MCP sub-application with the full path "/mcp".
+# The Starlette sub-app registers Route("/mcp", streamable_http_app) internally.
+# We splice those routes directly into the FastAPI router AND add a duplicate
+# route for "/mcp/" so that both /mcp and /mcp/ are handled without redirects.
+mcp_app = mcp.http_app(path="/mcp")
 
 # Create the root FastAPI app with combined lifespans so that both
 # the MCP schedulers (delivery webhooks, media-buy status) and any
@@ -68,8 +70,24 @@ app = FastAPI(
     lifespan=combine_lifespans(app_lifespan, mcp_app.lifespan),
 )
 
-# Mount MCP at /mcp
-app.mount("/mcp", mcp_app)
+# Add MCP routes directly to the FastAPI router so both /mcp and /mcp/ work.
+# app.mount("/mcp", mcp_app) only matches /mcp/ (regex ^/mcp/(?P<path>.*)$).
+# By inserting the sub-app's Route("/mcp", ...) directly and adding a matching
+# Route("/mcp/", ...) pointing to the same endpoint, both paths are served.
+from starlette.routing import Route as _StarletteRoute  # noqa: E402
+
+for _route in mcp_app.routes:
+    app.router.routes.insert(0, _route)
+    # Also register the trailing-slash variant pointing to the same endpoint
+    if hasattr(_route, "path") and _route.path == "/mcp":
+        app.router.routes.insert(
+            1,
+            _StarletteRoute(
+                "/mcp/",
+                endpoint=_route.endpoint,
+                methods=_route.methods,
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
