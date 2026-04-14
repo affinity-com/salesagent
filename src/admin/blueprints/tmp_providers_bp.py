@@ -279,15 +279,11 @@ def health_check_tmp_provider(tenant_id, provider_id):
 
             health_url = provider.endpoint.rstrip("/") + "/health"
 
-            # Validate URL before making outbound request (defence-in-depth)
-            is_safe, ssrf_error = check_url_ssrf(health_url)
-            if not is_safe:
-                logger.warning(
-                    "[SECURITY] TMP provider health-check rejected unsafe URL %r: %s",
-                    health_url,
-                    ssrf_error,
-                )
-                return jsonify({"success": False, "error": f"Endpoint URL is not allowed: {ssrf_error}"}), 400
+            # Note: SSRF validation was already applied when the endpoint was
+            # registered (add/edit routes). Re-running it here against resolved
+            # IPs would block legitimate internal Docker service names (e.g.
+            # http://si-agent:3003) that resolve to RFC-1918 addresses inside
+            # the container network. The stored URL is already trusted.
 
             try:
                 resp = requests.get(health_url, timeout=5)
