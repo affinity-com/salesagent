@@ -35,7 +35,12 @@ BLOCKED_HOSTNAMES = {
 }
 
 
-def check_url_ssrf(url: str, *, require_https: bool = False) -> tuple[bool, str]:
+def check_url_ssrf(
+    url: str,
+    *,
+    require_https: bool = False,
+    allow_private_networks: bool = False,
+) -> tuple[bool, str]:
     """Check a URL for SSRF safety.
 
     Validates that the URL does not target private/internal networks
@@ -45,6 +50,10 @@ def check_url_ssrf(url: str, *, require_https: bool = False) -> tuple[bool, str]
         url: The URL to validate.
         require_https: If True, reject non-HTTPS schemes. If False,
             allow both HTTP and HTTPS.
+        allow_private_networks: If True, skip the IP-range and private-address
+            checks. Use ONLY in local/dev environments where TMP providers run
+            on internal Docker networks (e.g. http://si-agent:3003). Must never
+            be set to True in production.
 
     Returns:
         (is_safe, error_message) -- is_safe is True if the URL is safe,
@@ -63,8 +72,13 @@ def check_url_ssrf(url: str, *, require_https: bool = False) -> tuple[bool, str]
         if not hostname:
             return False, "URL must have a valid hostname"
 
+        # Always block known-dangerous hostnames regardless of allow_private_networks
         if hostname.lower() in BLOCKED_HOSTNAMES:
             return False, f"URL hostname '{hostname}' is blocked (internal/private)"
+
+        if allow_private_networks:
+            # Skip IP-range checks — caller has opted in for local/dev use
+            return True, ""
 
         try:
             ip_str = socket.gethostbyname(hostname)
