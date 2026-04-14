@@ -292,3 +292,126 @@ class TestSignalsAgentEndpointSSRFWiring:
         assert "edit" in response.headers.get("Location", "")
         # Confirm the agent URL was NOT committed as the unsafe value
         mock_session.commit.assert_not_called()
+
+
+def _make_tmp_provider_client():
+    """Create a Flask test client authenticated as super admin for TMP provider endpoints."""
+    from src.admin.app import create_app
+
+    app = create_app({"TESTING": True, "SECRET_KEY": "test-secret", "WTF_CSRF_ENABLED": False})
+    client = app.test_client()
+    with client.session_transaction() as sess:
+        sess["test_user"] = "test_super_admin@example.com"
+        sess["test_user_role"] = "super_admin"
+        sess["authenticated"] = True
+    return client
+
+
+def _mock_db_for_tmp_provider_add(mock_db, tenant_id="default"):
+    """Wire mock_db so the add handler can query Tenant."""
+    mock_tenant = MagicMock()
+    mock_tenant.tenant_id = tenant_id
+    mock_session = MagicMock()
+    mock_session.scalars.return_value.first.return_value = mock_tenant
+    mock_db.return_value.__enter__ = MagicMock(return_value=mock_session)
+    mock_db.return_value.__exit__ = MagicMock(return_value=False)
+    return mock_session
+
+
+class TestTMPProviderEndpointSSRFWiring:
+    """Flask endpoint-level tests confirming check_url_ssrf() is wired into handlers.
+
+    These tests exercise the actual POST /tenant/<id>/tmp-providers/add and
+    POST /tenant/<id>/tmp-providers/<id>/edit endpoints so that removing or
+    bypassing the check_url_ssrf() call in the handler would cause a real failure.
+    """
+
+    def test_add_endpoint_rejects_docker_internal_url(self):
+        """POST /tmp-providers/add with host.docker.internal URL must return a redirect with error flash."""
+        client = _make_tmp_provider_client()
+
+        with patch("src.admin.blueprints.tmp_providers_bp.get_db_session") as mock_db:
+            _mock_db_for_tmp_provider_add(mock_db)
+            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
+                response = client.post(
+                    "/tenant/default/tmp-providers/add",
+                    data={
+                        "endpoint": "http://host.docker.internal:9999",
+                        "name": "SSRF Test Provider",
+                        "context_match": "on",
+                        "identity_match": "on",
+                        "timeout_ms": "50",
+                    },
+                    follow_redirects=False,
+                )
+
+        # Must redirect back to add form (not to list — which would mean success)
+        assert response.status_code == 302
+        assert "add" in response.headers.get("Location", "")
+
+    def test_add_endpoint_accepts_safe_public_url(self):
+        """POST /tmp-providers/add with a safe public URL must proceed past the SSRF check."""
+        client = _make_tmp_provider_client()
+
+        with patch("src.admin.blueprints.tmp_providers_bp.get_db_session") as mock_db:
+            mock_session = _mock_db_for_tmp_provider_add(mock_db)
+            mock_session.add = MagicMock()
+            mock_session.commit = MagicMock()
+            with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
+                with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
+                    response = client.post(
+                        "/tenant/default/tmp-providers/add",
+                        data={
+                            "endpoint": "https://tmp-provider.example.com",
+                            "name": "Safe Provider",
+                            "context_match": "on",
+                            "identity_match": "on",
+                            "timeout_ms": "50",
+                        },
+                        follow_redirects=False,
+                    )
+
+        # Must redirect to list (success) — not back to add form
+        assert response.status_code == 302
+        assert "add" not in response.headers.get("Location", "")
+
+    def test_edit_endpoint_rejects_unsafe_url_on_update(self):
+        """POST /tmp-providers/<id>/edit updating endpoint to host.docker.internal must be rejected.
+
+        This is the exact scenario the reviewer asked about: editing from a safe URL
+        to an unsafe one. The handler assigns provider.endpoint from the form value first,
+        then validates it — so it is the new submitted value being checked.
+        """
+        import uuid
+
+        client = _make_tmp_provider_client()
+
+        provider_id = str(uuid.uuid4())
+        existing_provider = MagicMock()
+        existing_provider.provider_id = provider_id
+        existing_provider.endpoint = "https://safe.example.com/tmp"
+
+        mock_session = MagicMock()
+        mock_session.scalars.return_value.first.return_value = existing_provider
+
+        with patch("src.admin.blueprints.tmp_providers_bp.get_db_session") as mock_db:
+            mock_db.return_value.__enter__ = MagicMock(return_value=mock_session)
+            mock_db.return_value.__exit__ = MagicMock(return_value=False)
+            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
+                response = client.post(
+                    f"/tenant/default/tmp-providers/{provider_id}/edit",
+                    data={
+                        "endpoint": "http://host.docker.internal:9999",
+                        "name": "Existing Provider",
+                        "context_match": "on",
+                        "identity_match": "on",
+                        "timeout_ms": "50",
+                    },
+                    follow_redirects=False,
+                )
+
+        # Must redirect back to edit form (not to list — which would mean success)
+        assert response.status_code == 302
+        assert "edit" in response.headers.get("Location", "")
+        # Confirm the endpoint was NOT committed as the unsafe value
+        mock_session.commit.assert_not_called()
