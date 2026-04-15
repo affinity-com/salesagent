@@ -4,14 +4,13 @@ Covers:
 - check_url_ssrf: core validator used across signals agents, webhooks, property lists
 - validate_agent_url: media_buy_create wrapper
 - BLOCKED_HOSTNAMES: Docker-internal and cloud metadata hostname coverage
-- _is_localhost_subdomain: RFC 6761 *.localhost bypass rule
-- Flask endpoint-level wiring for signals agents add/edit handlers
+- Flask endpoint-level wiring for signals agents and TMP provider add/edit handlers
 """
 
 import os
 from unittest.mock import MagicMock, patch
 
-from src.core.security.url_validator import BLOCKED_HOSTNAMES, _is_localhost_subdomain, check_url_ssrf
+from src.core.security.url_validator import BLOCKED_HOSTNAMES, check_url_ssrf
 
 
 class TestCheckUrlSsrf:
@@ -109,52 +108,6 @@ class TestCheckUrlSsrf:
             is_safe, error = check_url_ssrf("http://this-hostname-does-not-exist.invalid")
         assert is_safe is False
         assert "resolve" in error.lower() or "cannot" in error.lower()
-
-
-class TestLocalhostSubdomain:
-    """*.localhost hostnames (RFC 6761) bypass IP-range checks."""
-
-    def test_single_label_localhost_subdomain_allowed(self):
-        """si-agent.localhost is explicitly local — no DNS resolution needed."""
-        is_safe, error = check_url_ssrf("http://si-agent.localhost:3003")
-        assert is_safe is True
-        assert error == ""
-
-    def test_multi_label_localhost_subdomain_allowed(self):
-        """tmp-router.localhost follows the same convention."""
-        is_safe, error = check_url_ssrf("http://tmp-router.localhost:8084")
-        assert is_safe is True
-        assert error == ""
-
-    def test_bare_localhost_still_blocked(self):
-        """'localhost' itself is in BLOCKED_HOSTNAMES and must not pass."""
-        is_safe, error = check_url_ssrf("http://localhost:3003")
-        assert is_safe is False
-        assert "blocked" in error.lower()
-
-    def test_is_localhost_subdomain_true_for_dotlocalhost(self):
-        assert _is_localhost_subdomain("si-agent.localhost") is True
-
-    def test_is_localhost_subdomain_true_case_insensitive(self):
-        assert _is_localhost_subdomain("SI-AGENT.LOCALHOST") is True
-
-    def test_is_localhost_subdomain_false_for_bare_localhost(self):
-        assert _is_localhost_subdomain("localhost") is False
-
-    def test_is_localhost_subdomain_false_for_public_domain(self):
-        assert _is_localhost_subdomain("example.com") is False
-
-    def test_is_localhost_subdomain_false_for_docker_internal(self):
-        assert _is_localhost_subdomain("host.docker.internal") is False
-
-    def test_localhost_subdomain_with_https_allowed(self):
-        is_safe, error = check_url_ssrf("https://si-agent.localhost:3003")
-        assert is_safe is True
-
-    def test_localhost_subdomain_require_https_rejects_http(self):
-        is_safe, error = check_url_ssrf("http://si-agent.localhost:3003", require_https=True)
-        assert is_safe is False
-        assert "https" in error.lower()
 
 
 class TestBlockedHostnames:
@@ -396,15 +349,20 @@ class TestTMPProviderEndpointSSRFWiring:
         assert response.status_code == 302
         assert "add" in response.headers.get("Location", "")
 
-    def test_add_endpoint_accepts_localhost_subdomain_url(self):
-        """POST /tmp-providers/add with a *.localhost URL must pass SSRF check (RFC 6761)."""
+    def test_add_endpoint_accepts_internal_url_when_env_var_set(self):
+        """POST /tmp-providers/add with si-agent.localhost URL passes when TMP_ALLOW_INTERNAL_ENDPOINTS=true.
+
+        In local/dev environments, TMP_ALLOW_INTERNAL_ENDPOINTS=true sets allow_private_networks=True
+        so that *.localhost Docker service aliases (e.g. http://si-agent.localhost:3003) can be
+        registered as TMP provider endpoints. This env var must never be set in production.
+        """
         client = _make_tmp_provider_client()
 
         with patch("src.admin.blueprints.tmp_providers_bp.get_db_session") as mock_db:
             mock_session = _mock_db_for_tmp_provider_add(mock_db)
             mock_session.add = MagicMock()
             mock_session.commit = MagicMock()
-            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
+            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true", "TMP_ALLOW_INTERNAL_ENDPOINTS": "true"}):
                 response = client.post(
                     "/tenant/default/tmp-providers/add",
                     data={
@@ -488,8 +446,13 @@ class TestTMPProviderEndpointSSRFWiring:
         # Confirm the endpoint was NOT committed as the unsafe value
         mock_session.commit.assert_not_called()
 
-    def test_edit_endpoint_accepts_localhost_subdomain_url(self):
-        """POST /tmp-providers/<id>/edit updating endpoint to *.localhost must be accepted (RFC 6761)."""
+    def test_edit_endpoint_accepts_internal_url_when_env_var_set(self):
+        """POST /tmp-providers/<id>/edit with si-agent.localhost passes when TMP_ALLOW_INTERNAL_ENDPOINTS=true.
+
+        In local/dev environments, TMP_ALLOW_INTERNAL_ENDPOINTS=true sets allow_private_networks=True
+        so that *.localhost Docker service aliases can be updated on existing TMP providers.
+        This env var must never be set in production.
+        """
         import uuid
 
         client = _make_tmp_provider_client()
@@ -506,7 +469,7 @@ class TestTMPProviderEndpointSSRFWiring:
         with patch("src.admin.blueprints.tmp_providers_bp.get_db_session") as mock_db:
             mock_db.return_value.__enter__ = MagicMock(return_value=mock_session)
             mock_db.return_value.__exit__ = MagicMock(return_value=False)
-            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
+            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true", "TMP_ALLOW_INTERNAL_ENDPOINTS": "true"}):
                 response = client.post(
                     f"/tenant/default/tmp-providers/{provider_id}/edit",
                     data={
