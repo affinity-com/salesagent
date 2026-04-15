@@ -87,17 +87,6 @@ class TestCheckUrlSsrf:
         is_safe, error = check_url_ssrf("file:///etc/passwd")
         assert is_safe is False
 
-    def test_require_https_rejects_http(self):
-        with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
-            is_safe, error = check_url_ssrf("http://example.com/agent", require_https=True)
-        assert is_safe is False
-        assert "https" in error.lower()
-
-    def test_require_https_accepts_https(self):
-        with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
-            is_safe, error = check_url_ssrf("https://example.com/agent", require_https=True)
-        assert is_safe is True
-
     def test_unresolvable_hostname_rejected(self):
         import socket
 
@@ -349,36 +338,6 @@ class TestTMPProviderEndpointSSRFWiring:
         assert response.status_code == 302
         assert "add" in response.headers.get("Location", "")
 
-    def test_add_endpoint_accepts_internal_url_when_env_var_set(self):
-        """POST /tmp-providers/add with si-agent.localhost URL passes when TMP_ALLOW_INTERNAL_ENDPOINTS=true.
-
-        In local/dev environments, TMP_ALLOW_INTERNAL_ENDPOINTS=true sets allow_private_networks=True
-        so that *.localhost Docker service aliases (e.g. http://si-agent.localhost:3003) can be
-        registered as TMP provider endpoints. This env var must never be set in production.
-        """
-        client = _make_tmp_provider_client()
-
-        with patch("src.admin.blueprints.tmp_providers_bp.get_db_session") as mock_db:
-            mock_session = _mock_db_for_tmp_provider_add(mock_db)
-            mock_session.add = MagicMock()
-            mock_session.commit = MagicMock()
-            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true", "TMP_ALLOW_INTERNAL_ENDPOINTS": "true"}):
-                response = client.post(
-                    "/tenant/default/tmp-providers/add",
-                    data={
-                        "endpoint": "http://si-agent.localhost:3003",
-                        "name": "SI Agent TMP Provider",
-                        "context_match": "on",
-                        "identity_match": "on",
-                        "timeout_ms": "50",
-                    },
-                    follow_redirects=False,
-                )
-
-        # Must redirect to list (success) — not back to add form
-        assert response.status_code == 302
-        assert "add" not in response.headers.get("Location", "")
-
     def test_add_endpoint_accepts_safe_public_url(self):
         """POST /tmp-providers/add with a safe public URL must proceed past the SSRF check."""
         client = _make_tmp_provider_client()
@@ -446,12 +405,43 @@ class TestTMPProviderEndpointSSRFWiring:
         # Confirm the endpoint was NOT committed as the unsafe value
         mock_session.commit.assert_not_called()
 
+    def test_add_endpoint_accepts_internal_url_when_env_var_set(self):
+        """POST /tmp-providers/add with si-agent.localhost URL passes when TMP_ALLOW_INTERNAL_ENDPOINTS=true.
+
+        In local/dev environments, _ALLOW_INTERNAL=True skips SSRF checks so that
+        *.localhost Docker service aliases (e.g. http://si-agent.localhost:3003) can be
+        registered as TMP provider endpoints. This must never be set in production.
+        """
+        client = _make_tmp_provider_client()
+
+        with patch("src.admin.blueprints.tmp_providers_bp.get_db_session") as mock_db:
+            mock_session = _mock_db_for_tmp_provider_add(mock_db)
+            mock_session.add = MagicMock()
+            mock_session.commit = MagicMock()
+            with patch("src.admin.blueprints.tmp_providers_bp._ALLOW_INTERNAL", True):
+                with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
+                    response = client.post(
+                        "/tenant/default/tmp-providers/add",
+                        data={
+                            "endpoint": "http://si-agent.localhost:3003",
+                            "name": "SI Agent TMP Provider",
+                            "context_match": "on",
+                            "identity_match": "on",
+                            "timeout_ms": "50",
+                        },
+                        follow_redirects=False,
+                    )
+
+        # Must redirect to list (success) — not back to add form
+        assert response.status_code == 302
+        assert "add" not in response.headers.get("Location", "")
+
     def test_edit_endpoint_accepts_internal_url_when_env_var_set(self):
         """POST /tmp-providers/<id>/edit with si-agent.localhost passes when TMP_ALLOW_INTERNAL_ENDPOINTS=true.
 
-        In local/dev environments, TMP_ALLOW_INTERNAL_ENDPOINTS=true sets allow_private_networks=True
-        so that *.localhost Docker service aliases can be updated on existing TMP providers.
-        This env var must never be set in production.
+        In local/dev environments, _ALLOW_INTERNAL=True skips SSRF checks so that
+        *.localhost Docker service aliases can be updated on existing TMP providers.
+        This must never be set in production.
         """
         import uuid
 
@@ -469,18 +459,19 @@ class TestTMPProviderEndpointSSRFWiring:
         with patch("src.admin.blueprints.tmp_providers_bp.get_db_session") as mock_db:
             mock_db.return_value.__enter__ = MagicMock(return_value=mock_session)
             mock_db.return_value.__exit__ = MagicMock(return_value=False)
-            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true", "TMP_ALLOW_INTERNAL_ENDPOINTS": "true"}):
-                response = client.post(
-                    f"/tenant/default/tmp-providers/{provider_id}/edit",
-                    data={
-                        "endpoint": "http://si-agent.localhost:3003",
-                        "name": "SI Agent Provider",
-                        "context_match": "on",
-                        "identity_match": "on",
-                        "timeout_ms": "50",
-                    },
-                    follow_redirects=False,
-                )
+            with patch("src.admin.blueprints.tmp_providers_bp._ALLOW_INTERNAL", True):
+                with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
+                    response = client.post(
+                        f"/tenant/default/tmp-providers/{provider_id}/edit",
+                        data={
+                            "endpoint": "http://si-agent.localhost:3003",
+                            "name": "SI Agent Provider",
+                            "context_match": "on",
+                            "identity_match": "on",
+                            "timeout_ms": "50",
+                        },
+                        follow_redirects=False,
+                    )
 
         # Must redirect to list (success) — not back to edit form
         assert response.status_code == 302

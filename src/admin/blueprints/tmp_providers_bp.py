@@ -22,8 +22,8 @@ from src.core.security.url_validator import check_url_ssrf
 
 logger = logging.getLogger(__name__)
 
-# When TMP_ALLOW_INTERNAL_ENDPOINTS=true (local/dev only), skip IP-range SSRF
-# checks so that *.localhost service names like http://si-agent.localhost:3003
+# When TMP_ALLOW_INTERNAL_ENDPOINTS=true (local/dev only), skip SSRF checks
+# so that *.localhost service names like http://si-agent.localhost:3003
 # can be registered. This must never be set in production.
 _ALLOW_INTERNAL = os.environ.get("TMP_ALLOW_INTERNAL_ENDPOINTS", "").lower() in ("1", "true", "yes")
 
@@ -114,11 +114,12 @@ def add_tmp_provider(tenant_id):
                 flash("Endpoint URL is required", "error")
                 return redirect(url_for("tmp_providers.add_tmp_provider", tenant_id=tenant_id))
 
-            is_safe, ssrf_error = check_url_ssrf(endpoint, allow_private_networks=_ALLOW_INTERNAL)
-            if not is_safe:
-                logger.warning("[SECURITY] TMP provider add rejected unsafe URL %r: %s", endpoint, ssrf_error)
-                flash(f"Endpoint URL is not allowed: {ssrf_error}", "error")
-                return redirect(url_for("tmp_providers.add_tmp_provider", tenant_id=tenant_id))
+            if not _ALLOW_INTERNAL:
+                is_safe, ssrf_error = check_url_ssrf(endpoint)
+                if not is_safe:
+                    logger.warning("[SECURITY] TMP provider add rejected unsafe URL %r: %s", endpoint, ssrf_error)
+                    flash(f"Endpoint URL is not allowed: {ssrf_error}", "error")
+                    return redirect(url_for("tmp_providers.add_tmp_provider", tenant_id=tenant_id))
 
             if not name:
                 flash("Provider name is required", "error")
@@ -202,13 +203,14 @@ def edit_tmp_provider(tenant_id, provider_id):
                     url_for("tmp_providers.edit_tmp_provider", tenant_id=tenant_id, provider_id=provider_id)
                 )
 
-            is_safe, ssrf_error = check_url_ssrf(provider.endpoint, allow_private_networks=_ALLOW_INTERNAL)
-            if not is_safe:
-                logger.warning("[SECURITY] TMP provider edit rejected unsafe URL %r: %s", provider.endpoint, ssrf_error)
-                flash(f"Endpoint URL is not allowed: {ssrf_error}", "error")
-                return redirect(
-                    url_for("tmp_providers.edit_tmp_provider", tenant_id=tenant_id, provider_id=provider_id)
-                )
+            if not _ALLOW_INTERNAL:
+                is_safe, ssrf_error = check_url_ssrf(provider.endpoint)
+                if not is_safe:
+                    logger.warning("[SECURITY] TMP provider edit rejected unsafe URL %r: %s", provider.endpoint, ssrf_error)
+                    flash(f"Endpoint URL is not allowed: {ssrf_error}", "error")
+                    return redirect(
+                        url_for("tmp_providers.edit_tmp_provider", tenant_id=tenant_id, provider_id=provider_id)
+                    )
 
             if not provider.name:
                 flash("Provider name is required", "error")

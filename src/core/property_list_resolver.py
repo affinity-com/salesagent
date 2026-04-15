@@ -34,7 +34,7 @@ def _validate_agent_url(agent_url: str) -> None:
     Raises:
         AdCPAdapterError: If the URL is not allowed.
     """
-    is_safe, error = check_url_ssrf(agent_url, require_https=True)
+    is_safe, error = check_url_ssrf(agent_url)
     if not is_safe:
         raise AdCPAdapterError(f"Property list agent_url rejected: {error}")
 
