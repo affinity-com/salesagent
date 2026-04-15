@@ -87,6 +87,17 @@ class TestCheckUrlSsrf:
         is_safe, error = check_url_ssrf("file:///etc/passwd")
         assert is_safe is False
 
+    def test_require_https_rejects_http(self):
+        with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
+            is_safe, error = check_url_ssrf("http://example.com/agent", require_https=True)
+        assert is_safe is False
+        assert "https" in error.lower()
+
+    def test_require_https_accepts_https(self):
+        with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
+            is_safe, error = check_url_ssrf("https://example.com/agent", require_https=True)
+        assert is_safe is True
+
     def test_unresolvable_hostname_rejected(self):
         import socket
 
