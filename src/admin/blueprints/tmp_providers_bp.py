@@ -8,7 +8,6 @@ configured latency budget, then merges results for the publisher-side join.
 """
 
 import logging
-import os
 
 import requests
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
@@ -21,11 +20,6 @@ from src.core.database.models import TMPProvider, Tenant
 from src.core.security.url_validator import check_url_ssrf
 
 logger = logging.getLogger(__name__)
-
-# When TMP_ALLOW_INTERNAL_ENDPOINTS=true (local/dev only), skip IP-range SSRF
-# checks so that internal Docker service names like http://si-agent:3003 can be
-# registered. This must never be set in production.
-_ALLOW_INTERNAL = os.environ.get("TMP_ALLOW_INTERNAL_ENDPOINTS", "").lower() in ("1", "true", "yes")
 
 # Create Blueprint
 tmp_providers_bp = Blueprint("tmp_providers", __name__)
@@ -114,7 +108,7 @@ def add_tmp_provider(tenant_id):
                 flash("Endpoint URL is required", "error")
                 return redirect(url_for("tmp_providers.add_tmp_provider", tenant_id=tenant_id))
 
-            is_safe, ssrf_error = check_url_ssrf(endpoint, allow_private_networks=_ALLOW_INTERNAL)
+            is_safe, ssrf_error = check_url_ssrf(endpoint)
             if not is_safe:
                 logger.warning("[SECURITY] TMP provider add rejected unsafe URL %r: %s", endpoint, ssrf_error)
                 flash(f"Endpoint URL is not allowed: {ssrf_error}", "error")
@@ -202,7 +196,7 @@ def edit_tmp_provider(tenant_id, provider_id):
                     url_for("tmp_providers.edit_tmp_provider", tenant_id=tenant_id, provider_id=provider_id)
                 )
 
-            is_safe, ssrf_error = check_url_ssrf(provider.endpoint, allow_private_networks=_ALLOW_INTERNAL)
+            is_safe, ssrf_error = check_url_ssrf(provider.endpoint)
             if not is_safe:
                 logger.warning("[SECURITY] TMP provider edit rejected unsafe URL %r: %s", provider.endpoint, ssrf_error)
                 flash(f"Endpoint URL is not allowed: {ssrf_error}", "error")
@@ -286,10 +280,10 @@ def health_check_tmp_provider(tenant_id, provider_id):
             health_url = provider.endpoint.rstrip("/") + "/health"
 
             # Note: SSRF validation was already applied when the endpoint was
-            # registered (add/edit routes). Re-running it here against resolved
-            # IPs would block legitimate internal Docker service names (e.g.
-            # http://si-agent:3003) that resolve to RFC-1918 addresses inside
-            # the container network. The stored URL is already trusted.
+            # registered (add/edit routes). *.localhost endpoints (e.g.
+            # http://si-agent.localhost:3003) are permitted by the RFC 6761
+            # suffix rule and resolve to private IPs inside the container
+            # network — the stored URL is already trusted.
 
             try:
                 resp = requests.get(health_url, timeout=5)

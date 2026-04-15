@@ -35,25 +35,48 @@ BLOCKED_HOSTNAMES = {
 }
 
 
+def _is_localhost_subdomain(hostname: str) -> bool:
+    """Return True if hostname ends with .localhost (RFC 6761 special-use TLD).
+
+    RFC 6761 reserves the .localhost TLD as a special-use domain that always
+    refers to the local machine. Services named <name>.localhost are explicitly
+    local by convention — unlike bare Docker service names (e.g. si-agent) which
+    are opaque and resolve to private RFC-1918 addresses inside container networks.
+
+    Allowing *.localhost bypasses IP-range checks without a blanket flag, so only
+    explicitly-named local services can be registered as TMP provider endpoints.
+    The bare hostname "localhost" itself remains in BLOCKED_HOSTNAMES and is
+    rejected before this check is reached.
+
+    Examples:
+        si-agent.localhost       → True  (allowed: explicitly local)
+        tmp-router.localhost     → True  (allowed: explicitly local)
+        host.docker.internal     → False (blocked by BLOCKED_HOSTNAMES first)
+        localhost                → False (blocked by BLOCKED_HOSTNAMES first)
+        example.com              → False (public domain, goes through IP checks)
+    """
+    return hostname.lower().endswith(".localhost")
+
+
 def check_url_ssrf(
     url: str,
     *,
     require_https: bool = False,
-    allow_private_networks: bool = False,
 ) -> tuple[bool, str]:
     """Check a URL for SSRF safety.
 
     Validates that the URL does not target private/internal networks
     or cloud metadata services.
 
+    *.localhost hostnames (RFC 6761) are permitted without IP-range checks —
+    they are explicitly local by naming convention (e.g. http://si-agent.localhost:3003).
+    Bare Docker service names (e.g. http://si-agent:3003) and Docker-internal
+    hostnames (e.g. http://host.docker.internal) remain blocked.
+
     Args:
         url: The URL to validate.
         require_https: If True, reject non-HTTPS schemes. If False,
             allow both HTTP and HTTPS.
-        allow_private_networks: If True, skip the IP-range and private-address
-            checks. Use ONLY in local/dev environments where TMP providers run
-            on internal Docker networks (e.g. http://si-agent:3003). Must never
-            be set to True in production.
 
     Returns:
         (is_safe, error_message) -- is_safe is True if the URL is safe,
@@ -72,12 +95,13 @@ def check_url_ssrf(
         if not hostname:
             return False, "URL must have a valid hostname"
 
-        # Always block known-dangerous hostnames regardless of allow_private_networks
+        # Always block known-dangerous hostnames regardless of other checks
         if hostname.lower() in BLOCKED_HOSTNAMES:
             return False, f"URL hostname '{hostname}' is blocked (internal/private)"
 
-        if allow_private_networks:
-            # Skip IP-range checks — caller has opted in for local/dev use
+        # *.localhost hostnames are RFC 6761 special-use — explicitly local by
+        # naming convention. Skip IP-range checks for these only.
+        if _is_localhost_subdomain(hostname):
             return True, ""
 
         try:
