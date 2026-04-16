@@ -22,6 +22,7 @@ from src.core.database.repositories.media_buy import MediaBuyRepository
 from src.core.database.repositories.product import ProductRepository
 from src.core.database.repositories.push_notification_config import PushNotificationConfigRepository
 from src.core.database.repositories.tenant_config import TenantConfigRepository
+from src.core.database.repositories.tmp_provider import TMPProviderRepository
 from src.core.database.repositories.uow import (
     AccountUoW,
     MediaBuyUoW,
@@ -44,6 +45,7 @@ __all__ = [
     "ProductUoW",
     "PushNotificationConfigRepository",
     "PushNotificationConfigUoW",
+    "TMPProviderRepository",
     "TenantConfigRepository",
     "TenantConfigUoW",
     "WorkflowRepository",
