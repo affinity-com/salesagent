@@ -1329,12 +1329,12 @@ class TMPProvider(Base):
     """Buyer-side TMP provider endpoint registration.
 
     Each tenant can register one or more TMP providers (buyer-side agents that
-    implement the Trusted Match Protocol). The Go TMP Router reads these rows
-    at startup and refreshes every 30 seconds to discover which endpoints to
-    fan out context and identity match requests to.
+    implement the Trusted Match Protocol). The TMP Router polls the discovery
+    endpoint (GET /tenant/{tenant_id}/tmp-providers/discovery) every 30 s to
+    discover which endpoints to fan out context and identity match requests to.
 
     The Sales Agent never calls the TMP Router — it only stores provider
-    registrations that the router reads directly from this table.
+    registrations that the router reads via the discovery HTTP endpoint.
     """
 
     __tablename__ = "tmp_providers"
@@ -1355,6 +1355,37 @@ class TMPProvider(Base):
     identity_match: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     timeout_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=50)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    # --- Fields added by migration 20260421000000 ---
+
+    # ISO 3166-1 alpha-2 country codes this provider serves.
+    # None / null means the provider accepts all countries.
+    # Required (non-null) when identity_match is True per TMP spec.
+    countries: Mapped[list[str] | None] = mapped_column(JSONType, nullable=True)
+
+    # Identity token types this provider accepts, e.g.
+    # ["publisher_first_party", "uid2", "hashed_email"].
+    # None / null means the provider accepts all uid_types.
+    # Required (non-null) when identity_match is True per TMP spec.
+    uid_types: Mapped[list[str] | None] = mapped_column(JSONType, nullable=True)
+
+    # Fan-out priority: lower integer = higher priority (default 0).
+    # The router uses this to break ties and to select the highest-priority
+    # provider's tmpx value when multiple providers return one.
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # Provider lifecycle state used by the discovery endpoint.
+    # active   — include in fan-out
+    # inactive — skip entirely
+    # draining — stop including in new fan-outs; in-flight requests complete
+    # The legacy is_active boolean is kept for admin-UI backward compatibility.
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="active",
+        server_default=text("'active'"),
+    )
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -1364,8 +1395,10 @@ class TMPProvider(Base):
     tenant = relationship("Tenant", back_populates="tmp_providers")
 
     __table_args__ = (
+        CheckConstraint("status IN ('active', 'inactive', 'draining')", name="ck_tmp_providers_status"),
         Index("idx_tmp_providers_tenant", "tenant_id"),
         Index("idx_tmp_providers_active", "is_active"),
+        Index("idx_tmp_providers_status", "status"),
     )
 
 
