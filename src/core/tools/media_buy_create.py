@@ -3603,6 +3603,22 @@ async def _create_media_buy_impl(
             },
         )
 
+        # Fire-and-forget TMP package sync (non-blocking, non-fatal)
+        # Runs after all DB commits so packages are visible to the sync query.
+        import asyncio
+
+        from src.services.tmp_provider_sync import sync_packages_to_tmp_provider
+
+        with MediaBuyUoW(tenant["tenant_id"]) as sync_uow:
+            assert sync_uow.session is not None
+            asyncio.create_task(
+                sync_packages_to_tmp_provider(
+                    media_buy_id=response.media_buy_id,
+                    tenant_id=tenant["tenant_id"],
+                    session=sync_uow.session,
+                )
+            )
+
         return CreateMediaBuyResult(response=modified_response, status=AdcpTaskStatus.completed.value)
 
     except AdCPError as adcp_err:

@@ -1292,6 +1292,27 @@ def _update_media_buy_impl(
             response_data=final_response.model_dump(mode="json"),
         )
 
+    # Fire-and-forget TMP package sync (non-blocking, non-fatal)
+    # Runs after the UoW commits so updated packages are visible to the sync query.
+    import asyncio
+
+    from src.services.tmp_provider_sync import sync_packages_to_tmp_provider
+
+    _media_buy_id_for_sync = req.media_buy_id
+    _tenant_id_for_sync = tenant["tenant_id"]
+    if _media_buy_id_for_sync and _tenant_id_for_sync:
+        from src.core.database.repositories import MediaBuyUoW
+
+        with MediaBuyUoW(_tenant_id_for_sync) as sync_uow:
+            assert sync_uow.session is not None
+            asyncio.create_task(
+                sync_packages_to_tmp_provider(
+                    media_buy_id=_media_buy_id_for_sync,
+                    tenant_id=_tenant_id_for_sync,
+                    session=sync_uow.session,
+                )
+            )
+
     return final_response
 
 
