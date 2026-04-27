@@ -1,11 +1,16 @@
 """TMP Provider discovery endpoint.
 
 Exposes:
-    GET  /tenant/{tenant_id}/tmp-providers/discovery
-         Polled by the TMP Router every 30 s to discover active providers.
-         Unauthenticated — internal network only.
+    GET /tenant/{tenant_id}/tmp-providers/discovery
 
-Response schema (mirrors the plan's discovery format):
+This endpoint is polled by the TMP Router every 30 s to discover which
+provider endpoints to fan out context and identity match requests to.
+
+The endpoint is **unauthenticated** — it is intended for internal network
+use only (Docker network / VPC). Do not expose it on a public interface
+without adding authentication.
+
+Response schema (mirrors the plan's discovery response format):
 {
   "tenant_id": "si-host",
   "providers": [
@@ -44,11 +49,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["tmp-providers"])
 
 
-# ---------------------------------------------------------------------------
-# GET /tenant/{tenant_id}/tmp-providers/discovery — polled by TMP Router
-# ---------------------------------------------------------------------------
-
-
 @router.get("/tenant/{tenant_id}/tmp-providers/discovery")
 async def tmp_providers_discovery(tenant_id: str) -> JSONResponse:
     """Return the active TMP provider set for a tenant.
@@ -56,9 +56,9 @@ async def tmp_providers_discovery(tenant_id: str) -> JSONResponse:
     Polled by the TMP Router every 30 s.  Internal network only — no auth.
 
     Lifecycle filtering:
-      active   -> included
-      draining -> included (router stops sending new requests but in-flight complete)
-      inactive -> excluded
+      active   → included
+      draining → included (router stops sending new requests but in-flight complete)
+      inactive → excluded
     """
     with get_db_session() as session:
         # Verify tenant exists — return 404 for unknown tenants so the router
