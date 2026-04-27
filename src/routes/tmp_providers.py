@@ -1,16 +1,16 @@
-"""TMP Provider discovery endpoint.
+"""TMP Provider discovery and registration endpoints.
 
 Exposes:
-    GET /tenant/{tenant_id}/tmp-providers/discovery
+    GET  /tenant/{tenant_id}/tmp-providers/discovery
+         Polled by the TMP Router every 30 s to discover active providers.
+         Unauthenticated — internal network only.
 
-This endpoint is polled by the TMP Router every 30 s to discover which
-provider endpoints to fan out context and identity match requests to.
+    POST /tenant/{tenant_id}/tmp-providers
+         Register (or idempotently upsert) a TMP provider for a tenant.
+         Used by seed-local.sh and CI tooling instead of raw SQL.
+         Unauthenticated — internal network only.
 
-The endpoint is **unauthenticated** — it is intended for internal network
-use only (Docker network / VPC). Do not expose it on a public interface
-without adding authentication.
-
-Response schema (mirrors the plan's discovery response format):
+Response schema for GET /discovery (mirrors the plan's discovery format):
 {
   "tenant_id": "si-host",
   "providers": [
@@ -29,7 +29,7 @@ Response schema (mirrors the plan's discovery response format):
   ]
 }
 
-Only providers whose status is 'active' or 'draining' are returned.
+Only providers whose status is 'active' or 'draining' are returned by /discovery.
 Providers with status 'inactive' are excluded entirely.
 """
 
@@ -39,14 +39,165 @@ import logging
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from sqlalchemy import select
 
 from src.core.database.database_session import get_db_session
 from src.core.database.models import TMPProvider, Tenant
+from src.core.database.repositories.tmp_provider import TMPProviderRepository
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["tmp-providers"])
+
+# ---------------------------------------------------------------------------
+# Validation constants
+# ---------------------------------------------------------------------------
+
+_VALID_UID_TYPES = frozenset([
+    "uid2", "rampid", "id5", "euid", "pairid",
+    "maid", "hashed_email", "publisher_first_party", "other",
+])
+
+_VALID_STATUSES = frozenset(["active", "draining", "inactive"])
+
+
+# ---------------------------------------------------------------------------
+# Request schema for POST /tenant/{tenant_id}/tmp-providers
+# ---------------------------------------------------------------------------
+
+
+class TMPProviderRegisterRequest(BaseModel):
+    """Body for POST /tenant/{tenant_id}/tmp-providers."""
+
+    name: str
+    endpoint: str
+    context_match: bool = True
+    identity_match: bool = True
+    countries: list[str] = ["US"]
+    uid_types: list[str] = ["publisher_first_party", "uid2", "hashed_email"]
+    timeout_ms: int = 200
+    priority: int = 0
+    status: str = "active"
+
+
+# ---------------------------------------------------------------------------
+# POST /tenant/{tenant_id}/tmp-providers — register / upsert a provider
+# ---------------------------------------------------------------------------
+
+
+@router.post("/tenant/{tenant_id}/tmp-providers", status_code=201)
+async def register_tmp_provider(
+    tenant_id: str,
+    body: TMPProviderRegisterRequest,
+) -> JSONResponse:
+    """Register (or idempotently upsert) a TMP provider for a tenant.
+
+    Designed for use by seed-local.sh and CI tooling so that no raw SQL is
+    needed to register a provider.  The endpoint is unauthenticated and
+    intended for internal network use only.
+
+    Idempotency: if a provider with the same ``name`` already exists for the
+    tenant, its mutable fields are updated in-place and the existing
+    ``provider_id`` is returned.  This makes the call safe to repeat on every
+    ``make local-seed`` run.
+
+    Returns:
+        201 with ``{"provider_id": "...", "created": true}`` on creation.
+        200 with ``{"provider_id": "...", "created": false}`` on update.
+    """
+    # Basic validation
+    if not body.name.strip():
+        raise HTTPException(status_code=422, detail="name is required")
+    if not body.endpoint.strip():
+        raise HTTPException(status_code=422, detail="endpoint is required")
+    if body.status not in _VALID_STATUSES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"status must be one of {sorted(_VALID_STATUSES)}",
+        )
+    invalid_uid_types = [u for u in body.uid_types if u not in _VALID_UID_TYPES]
+    if invalid_uid_types:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Invalid uid_type(s): {invalid_uid_types}. "
+                f"Valid values: {sorted(_VALID_UID_TYPES)}"
+            ),
+        )
+
+    with get_db_session() as session:
+        # Verify tenant exists
+        tenant_row = session.scalar(select(Tenant).where(Tenant.tenant_id == tenant_id))
+        if tenant_row is None:
+            raise HTTPException(status_code=404, detail=f"Tenant '{tenant_id}' not found")
+
+        repo = TMPProviderRepository(session, tenant_id)
+
+        # Idempotency: look up by name within the tenant
+        existing = session.scalar(
+            select(TMPProvider).where(
+                TMPProvider.tenant_id == tenant_id,
+                TMPProvider.name == body.name,
+            )
+        )
+
+        if existing is not None:
+            # Update mutable fields in-place
+            repo.update_fields(
+                existing.provider_id,
+                endpoint=body.endpoint,
+                context_match=body.context_match,
+                identity_match=body.identity_match,
+                countries=body.countries,
+                uid_types=body.uid_types,
+                timeout_ms=body.timeout_ms,
+                priority=body.priority,
+                status=body.status,
+            )
+            session.commit()
+            logger.info(
+                "[TMP register] Updated provider name=%s provider_id=%s tenant=%s",
+                body.name,
+                existing.provider_id,
+                tenant_id,
+            )
+            return JSONResponse(
+                status_code=200,
+                content={"provider_id": existing.provider_id, "created": False},
+            )
+
+        # Create new provider
+        provider = TMPProvider(
+            tenant_id=tenant_id,
+            name=body.name,
+            endpoint=body.endpoint,
+            context_match=body.context_match,
+            identity_match=body.identity_match,
+            countries=body.countries,
+            uid_types=body.uid_types,
+            timeout_ms=body.timeout_ms,
+            priority=body.priority,
+            status=body.status,
+        )
+        repo.create(provider)
+        session.commit()
+
+        logger.info(
+            "[TMP register] Created provider name=%s provider_id=%s tenant=%s",
+            body.name,
+            provider.provider_id,
+            tenant_id,
+        )
+        return JSONResponse(
+            status_code=201,
+            content={"provider_id": provider.provider_id, "created": True},
+        )
+
+
+# ---------------------------------------------------------------------------
+# GET /tenant/{tenant_id}/tmp-providers/discovery — polled by TMP Router
+# ---------------------------------------------------------------------------
 
 
 @router.get("/tenant/{tenant_id}/tmp-providers/discovery")
@@ -56,9 +207,9 @@ async def tmp_providers_discovery(tenant_id: str) -> JSONResponse:
     Polled by the TMP Router every 30 s.  Internal network only — no auth.
 
     Lifecycle filtering:
-      active   → included
-      draining → included (router stops sending new requests but in-flight complete)
-      inactive → excluded
+      active   -> included
+      draining -> included (router stops sending new requests but in-flight complete)
+      inactive -> excluded
     """
     with get_db_session() as session:
         # Verify tenant exists — return 404 for unknown tenants so the router
