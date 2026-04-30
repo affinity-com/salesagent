@@ -99,7 +99,7 @@ def seed_tenant(conn, tenant_id, name, subdomain, adapter, admin_token, principa
         ON CONFLICT (tenant_id) DO NOTHING
     """)
     run_sql(conn, f"""
-        INSERT INTO adapter_configs (tenant_id, adapter_type, created_at, updated_at)
+        INSERT INTO adapter_config (tenant_id, adapter_type, created_at, updated_at)
         VALUES ('{tenant_id}', '{adapter}', NOW(), NOW())
         ON CONFLICT (tenant_id) DO NOTHING
     """)
@@ -119,13 +119,13 @@ def seed_tenant(conn, tenant_id, name, subdomain, adapter, admin_token, principa
 def migrate_siteplug_adapter(conn):
     """Migrate siteplug tenant from mock → siteplug adapter if stale."""
     cur = conn.cursor()
-    cur.execute("SELECT adapter_type FROM adapter_configs WHERE tenant_id='siteplug' LIMIT 1")
+    cur.execute("SELECT adapter_type FROM adapter_config WHERE tenant_id='siteplug' LIMIT 1")
     row = cur.fetchone()
     cur.close()
     if row and row[0] == "mock":
         print("  ⚠️  Migrating siteplug adapter: mock → siteplug")
         run_sql(conn, """
-            UPDATE adapter_configs SET adapter_type = 'siteplug', updated_at = NOW()
+            UPDATE adapter_config SET adapter_type = 'siteplug', updated_at = NOW()
             WHERE tenant_id = 'siteplug' AND adapter_type = 'mock'
         """)
         run_sql(conn, """
