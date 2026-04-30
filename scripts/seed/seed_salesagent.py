@@ -75,7 +75,6 @@ TENANTS = [
     ("mcanvas",  "mCanvas",  "mcanvas",  "mock",     "mcanvas-admin-token",  "mcanvas-token"),
     ("veve",     "Veve",     "veve",     "mock",     "veve-admin-token",     "veve-token"),
     ("siteplug", "SitePlug", "siteplug", "siteplug", "siteplug-admin-token", "siteplug-token"),
-    ("si-host",  "SI Host",  "si-host",  "mock",     "si-host-admin-token",  "si-host-token"),
 ]
 
 
@@ -255,12 +254,12 @@ def seed_authorized_properties(conn, tenant_id, label):
 
 
 def seed_tmp_provider(conn):
-    n = count(conn, "SELECT COUNT(*) FROM tmp_providers WHERE tenant_id='si-host'")
+    n = count(conn, "SELECT COUNT(*) FROM tmp_providers WHERE tenant_id='siteplug'")
     if n > 0:
-        print(f"  ✓ si-host already has {n} tmp_provider(s) — skipping")
+        print(f"  ✓ siteplug already has {n} tmp_provider(s) — skipping")
         return
 
-    print(f"  Seeding tmp_providers for si-host (endpoint: {TMP_PROVIDER_ENDPOINT})...")
+    print(f"  Seeding tmp_providers for siteplug (endpoint: {TMP_PROVIDER_ENDPOINT})...")
     run_sql(conn, f"""
         INSERT INTO tmp_providers
           (tenant_id, name, endpoint, context_match, identity_match,
@@ -268,7 +267,7 @@ def seed_tmp_provider(conn):
            timeout_ms, created_at, updated_at)
         VALUES
           (
-            'si-host', 'tmp-provider-demo', '{TMP_PROVIDER_ENDPOINT}',
+            'siteplug', 'tmp-provider-demo', '{TMP_PROVIDER_ENDPOINT}',
             true, true,
             '["US"]'::jsonb,
             '["publisher_first_party","uid2","hashed_email"]'::jsonb,
@@ -319,7 +318,7 @@ def main():
         seed_authorized_properties(conn, tenant_id, name)
     print()
 
-    print("Step 5: Seeding tmp_providers for si-host...")
+    print("Step 5: Seeding tmp_providers for siteplug...")
     seed_tmp_provider(conn)
     print()
 
@@ -330,8 +329,8 @@ def main():
         ap_n      = count(conn, f"SELECT COUNT(*) FROM authorized_properties WHERE tenant_id='{tenant_id}'")
         pp_n      = count(conn, f"SELECT COUNT(*) FROM publisher_partners WHERE tenant_id='{tenant_id}'")
         print(f"  {tenant_id}: {prod_n} products, {pricing_n} pricing, {ap_n} auth props, {pp_n} partners")
-    tmp_n = count(conn, "SELECT COUNT(*) FROM tmp_providers WHERE tenant_id='si-host' AND status='active'")
-    print(f"  si-host: {tmp_n} active TMP provider(s)")
+    tmp_n = count(conn, "SELECT COUNT(*) FROM tmp_providers WHERE tenant_id='siteplug' AND status='active'")
+    print(f"  siteplug: {tmp_n} active TMP provider(s)")
 
     conn.close()
 
@@ -340,7 +339,7 @@ def main():
     print("  ✅ salesagent seed complete!")
     print("=" * 60)
     print()
-    print("  Tenants: mcanvas, veve, siteplug, si-host")
+    print("  Tenants: mcanvas, veve, siteplug")
     print("  Well-known tokens (dev/staging only):")
     for tenant_id, _, __, ___, ____, token in TENANTS:
         print(f"    {tenant_id}: {token}")
