@@ -215,6 +215,32 @@ def seed_pricing_options(conn, tenant_id, label):
     """, f"{label} pricing_options seeded (5 options)")
 
 
+def seed_currency_limits(conn, tenant_id, label):
+    """Seed default currency limits (USD, EUR, GBP) for a tenant.
+
+    Required for create_media_buy — the salesagent validates that at least one
+    currency is configured before accepting a media buy request.  The alembic
+    migration 9309ac2fa74f adds these for tenants that existed at migration time,
+    but tenants created afterwards (via this seed script) are not covered.
+    """
+    n = count(conn, f"SELECT COUNT(*) FROM currency_limits WHERE tenant_id='{tenant_id}'")
+    if n > 0:
+        print(f"  ✓ {label} already has {n} currency limit(s) — skipping")
+        return
+
+    print(f"  Seeding currency_limits for {label}...")
+    run_sql(conn, f"""
+        INSERT INTO currency_limits
+          (tenant_id, currency_code, min_package_budget, max_daily_package_spend,
+           created_at, updated_at)
+        VALUES
+          ('{tenant_id}', 'USD', 0.00, 100000.00, NOW(), NOW()),
+          ('{tenant_id}', 'EUR', 0.00, 100000.00, NOW(), NOW()),
+          ('{tenant_id}', 'GBP', 0.00, 100000.00, NOW(), NOW())
+        ON CONFLICT (tenant_id, currency_code) DO NOTHING
+    """, f"{label} currency_limits seeded (USD, EUR, GBP — no minimum, $100k daily max)")
+
+
 def seed_authorized_properties(conn, tenant_id, label):
     domain = f"{tenant_id}.example.com"
 
@@ -318,17 +344,23 @@ def main():
         seed_authorized_properties(conn, tenant_id, name)
     print()
 
-    print("Step 5: Seeding tmp_providers for siteplug...")
+    print("Step 5: Seeding currency_limits...")
+    for tenant_id, name, *_ in TENANTS:
+        seed_currency_limits(conn, tenant_id, name)
+    print()
+
+    print("Step 6: Seeding tmp_providers for siteplug...")
     seed_tmp_provider(conn)
     print()
 
-    print("Step 6: Verification...")
+    print("Step 7: Verification...")
     for tenant_id, name, *_ in TENANTS:
-        prod_n    = count(conn, f"SELECT COUNT(*) FROM products WHERE tenant_id='{tenant_id}'")
-        pricing_n = count(conn, f"SELECT COUNT(*) FROM pricing_options WHERE tenant_id='{tenant_id}'")
-        ap_n      = count(conn, f"SELECT COUNT(*) FROM authorized_properties WHERE tenant_id='{tenant_id}'")
-        pp_n      = count(conn, f"SELECT COUNT(*) FROM publisher_partners WHERE tenant_id='{tenant_id}'")
-        print(f"  {tenant_id}: {prod_n} products, {pricing_n} pricing, {ap_n} auth props, {pp_n} partners")
+        prod_n     = count(conn, f"SELECT COUNT(*) FROM products WHERE tenant_id='{tenant_id}'")
+        pricing_n  = count(conn, f"SELECT COUNT(*) FROM pricing_options WHERE tenant_id='{tenant_id}'")
+        ap_n       = count(conn, f"SELECT COUNT(*) FROM authorized_properties WHERE tenant_id='{tenant_id}'")
+        pp_n       = count(conn, f"SELECT COUNT(*) FROM publisher_partners WHERE tenant_id='{tenant_id}'")
+        currency_n = count(conn, f"SELECT COUNT(*) FROM currency_limits WHERE tenant_id='{tenant_id}'")
+        print(f"  {tenant_id}: {prod_n} products, {pricing_n} pricing, {ap_n} auth props, {pp_n} partners, {currency_n} currencies")
     tmp_n = count(conn, "SELECT COUNT(*) FROM tmp_providers WHERE tenant_id='siteplug' AND status='active'")
     print(f"  siteplug: {tmp_n} active TMP provider(s)")
 
@@ -340,6 +372,8 @@ def main():
     print("=" * 60)
     print()
     print("  Tenants: mcanvas, veve, siteplug")
+    print("  Each tenant seeded with: products, pricing, auth props, publisher partners,")
+    print("  currency limits (USD/EUR/GBP — required for create_media_buy)")
     print("  Well-known tokens (dev/staging only):")
     for tenant_id, _, __, ___, ____, token in TENANTS:
         print(f"    {tenant_id}: {token}")
