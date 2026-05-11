@@ -603,6 +603,12 @@ async def _sync_accounts_impl(
                 repo.create(new_account)
                 seen_account_ids.add(account_id)
 
+                # Ensure the calling agent has a stub principal row so the
+                # agent_account_access FK to principals(tenant_id, principal_id)
+                # is satisfied. Remote agents (e.g. buyer-agent) are identified
+                # by their own principal_id which may not exist locally.
+                repo.ensure_principal_exists(principal_id)
+
                 # Grant agent access to the new account
                 repo.grant_access(principal_id, account_id)
 

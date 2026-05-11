@@ -9,9 +9,10 @@ beads: salesagent-m44
 from __future__ import annotations
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from src.core.database.models import Account, AgentAccountAccess
+from src.core.database.models import Account, AgentAccountAccess, Principal
 
 
 class AccountRepository:
@@ -218,6 +219,45 @@ class AccountRepository:
             setattr(account, key, value)
         self._session.flush()
         return account
+
+    # ------------------------------------------------------------------
+    # Principal auto-provisioning
+    # ------------------------------------------------------------------
+
+    def ensure_principal_exists(self, principal_id: str) -> None:
+        """Ensure a stub principal row exists for the calling agent.
+
+        Remote agents (e.g. buyer-agent) authenticate with their own
+        principal_id, but that ID may not exist in the salesagent's
+        ``principals`` table. The ``agent_account_access`` table has a
+        composite FK to ``principals(tenant_id, principal_id)``, so we
+        must guarantee the row exists before calling ``grant_access``.
+
+        Uses INSERT … ON CONFLICT DO NOTHING so the call is idempotent
+        and safe to repeat on every sync_accounts invocation.
+
+        The stub row carries:
+        - ``name``: a human-readable label derived from the principal_id
+        - ``platform_mappings``: empty dict (no adapter mapping needed)
+        - ``access_token``: a deterministic, non-guessable sentinel value
+          that cannot be used to authenticate (it is not a real bearer
+          token — real tokens come from the auth system).
+        """
+        sentinel_token = f"__agent_stub__{self._tenant_id}__{principal_id}"
+        stmt = (
+            pg_insert(Principal)
+            .values(
+                tenant_id=self._tenant_id,
+                principal_id=principal_id,
+                name=principal_id,
+                platform_mappings={},
+                access_token=sentinel_token,
+            )
+            .on_conflict_do_nothing(
+                index_elements=["tenant_id", "principal_id"],
+            )
+        )
+        self._session.execute(stmt)
 
     # ------------------------------------------------------------------
     # AgentAccountAccess methods
