@@ -39,10 +39,8 @@ import logging
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
-from sqlalchemy import select
 
-from src.core.database.database_session import get_db_session
-from src.core.database.models import TMPProvider, Tenant
+from src.core.database.repositories.uow import TenantConfigUoW, TMPProviderUoW
 
 logger = logging.getLogger(__name__)
 
@@ -60,23 +58,17 @@ async def tmp_providers_discovery(tenant_id: str) -> JSONResponse:
       draining → included (router stops sending new requests but in-flight complete)
       inactive → excluded
     """
-    with get_db_session() as session:
-        # Verify tenant exists — return 404 for unknown tenants so the router
-        # can distinguish "no providers" from "wrong tenant_id".
-        tenant_row = session.scalar(select(Tenant).where(Tenant.tenant_id == tenant_id))
+    # Verify tenant exists — return 404 for unknown tenants so the router
+    # can distinguish "no providers" from "wrong tenant_id".
+    with TenantConfigUoW(tenant_id) as uow:
+        assert uow.tenant_config is not None
+        tenant_row = uow.tenant_config.get_tenant()
         if tenant_row is None:
             raise HTTPException(status_code=404, detail=f"Tenant '{tenant_id}' not found")
 
-        stmt = (
-            select(TMPProvider)
-            .where(
-                TMPProvider.tenant_id == tenant_id,
-                # Exclude inactive providers; active + draining are forwarded.
-                TMPProvider.status.in_(["active", "draining"]),
-            )
-            .order_by(TMPProvider.priority.asc(), TMPProvider.name.asc())
-        )
-        providers = session.scalars(stmt).all()
+    with TMPProviderUoW(tenant_id) as uow:
+        assert uow.tmp_providers is not None
+        providers = uow.tmp_providers.list_syncable()
 
     provider_list = []
     for p in providers:

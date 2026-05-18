@@ -9,7 +9,7 @@ Covers:
 """
 
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -112,8 +112,8 @@ class TestTMPProviderAddSSRF:
         # Must redirect to list (success) — not back to add form
         assert response.status_code == 302
         assert "add" not in response.headers.get("Location", "")
-        mock_repo.create.assert_called_once()
-        mock_session.commit.assert_called_once()
+        mock_repo.create.assert_called_once_with(ANY)
+        mock_session.commit.assert_called_once_with()
 
 
 class TestTMPProviderEditSSRF:
@@ -230,7 +230,7 @@ class TestTMPProviderDeactivate:
         data = response.get_json()
         assert data["success"] is True
         mock_repo.deactivate.assert_called_once_with("test-uuid-1234")
-        mock_session.commit.assert_called_once()
+        mock_session.commit.assert_called_once_with()
 
     def test_deactivate_returns_404_for_missing_provider(self):
         """POST /tmp-providers/<id>/deactivate returns 404 when provider not found."""
@@ -281,7 +281,7 @@ class TestTMPProviderDelete:
         data = response.get_json()
         assert data["success"] is True
         mock_repo.delete.assert_called_once_with("test-uuid-1234")
-        mock_session.commit.assert_called_once()
+        mock_session.commit.assert_called_once_with()
 
     def test_delete_returns_404_for_missing_provider(self):
         """DELETE /tmp-providers/<id>/delete returns 404 when provider not found."""
@@ -429,7 +429,7 @@ class TestTMPProviderDiscovery:
         assert data[0]["name"] == "Provider A"
         assert data[0]["status"] == "active"
         assert data[1]["provider_id"] == "uuid-2"
-        mock_repo.list_active.assert_called_once()
+        mock_repo.list_active.assert_called_once_with()
 
     def test_discovery_returns_empty_list_when_no_active_providers(self):
         """GET /tmp-providers/discovery returns [] when no active providers."""

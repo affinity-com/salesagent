@@ -32,11 +32,8 @@ import os
 from typing import Any
 
 import httpx
-from sqlalchemy import select
 
-from src.core.database.database_session import get_db_session
-from src.core.database.models import Tenant
-from src.core.database.repositories.uow import MediaBuyUoW, TMPProviderUoW
+from src.core.database.repositories.uow import MediaBuyUoW, TMPProviderUoW, TenantConfigUoW
 
 logger = logging.getLogger(__name__)
 
@@ -62,13 +59,11 @@ def _resolve_seller_agent_url(tenant_id: str) -> str:
     if override:
         return override.rstrip("/")
 
-    # Load tenant to resolve virtual_host / subdomain.
-    # This is a lightweight read-only query — no UoW needed.
+    # Load tenant to resolve virtual_host / subdomain via repository.
     try:
-        with get_db_session() as session:
-            tenant = session.scalar(
-                select(Tenant).where(Tenant.tenant_id == tenant_id)
-            )
+        with TenantConfigUoW(tenant_id) as uow:
+            assert uow.tenant_config is not None
+            tenant = uow.tenant_config.get_tenant()
             if tenant and tenant.virtual_host:
                 host = tenant.virtual_host
                 scheme = "https" if "localhost" not in host else "http"
