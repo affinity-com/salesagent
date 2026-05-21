@@ -6,9 +6,18 @@ Exposes:
 This endpoint is polled by the TMP Router every 30 s to discover which
 provider endpoints to fan out context and identity match requests to.
 
-The endpoint is **unauthenticated** — it is intended for internal network
-use only (Docker network / VPC). Do not expose it on a public interface
-without adding authentication.
+Authentication is **fail-closed**: the endpoint is locked by default.
+
+Set ``TMP_DISCOVERY_API_KEYS`` to a comma-separated list of accepted keys to
+grant access.  To explicitly disable authentication for internal-network-only
+deployments, set ``TMP_DISCOVERY_API_KEYS=OPEN``.  Leaving the variable unset
+or empty returns HTTP 503 so that misconfigured deployments fail loudly rather
+than silently exposing tenant topology.
+
+Accepted auth headers (any one is sufficient):
+  - ``x-adcp-auth: <key>``
+  - ``X-API-Key: <key>``
+  - ``Authorization: Bearer <key>``
 
 Response schema (mirrors the plan's discovery response format):
 {
@@ -36,67 +45,98 @@ Providers with status 'inactive' are excluded entirely.
 from __future__ import annotations
 
 import logging
+import os
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import select
 
-from src.core.database.database_session import get_db_session
-from src.core.database.models import TMPProvider, Tenant
+from src.core.database.repositories.uow import TenantConfigUoW, TMPProviderUoW
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["tmp-providers"])
 
 
+async def require_api_key(request: Request) -> None:
+    """Require API key for the TMP discovery endpoint.
+
+    Fail-closed: the endpoint is locked unless ``TMP_DISCOVERY_API_KEYS`` is
+    explicitly configured.
+
+    - ``TMP_DISCOVERY_API_KEYS=key1,key2`` — accept those keys only.
+    - ``TMP_DISCOVERY_API_KEYS=OPEN`` — disable auth (internal-network-only
+      deployments where the operator has made a deliberate choice).
+    - Unset or empty — return HTTP 503 so misconfigured deployments fail loudly
+      instead of silently exposing tenant topology.
+
+    Accepted headers (first non-empty value wins):
+      - ``x-adcp-auth``
+      - ``X-API-Key``
+      - ``Authorization: Bearer <key>``
+    """
+    raw = os.environ.get("TMP_DISCOVERY_API_KEYS", "").strip()
+
+    if raw.upper() == "OPEN":
+        logger.warning("[TMP discovery] API key auth disabled — TMP_DISCOVERY_API_KEYS=OPEN")
+        return
+
+    allowed = {k.strip() for k in raw.split(",") if k.strip()}
+    if not allowed:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "ENDPOINT_NOT_CONFIGURED",
+                "message": (
+                    "TMP_DISCOVERY_API_KEYS is not configured. "
+                    "Set it to a comma-separated list of API keys, "
+                    "or to 'OPEN' to disable authentication."
+                ),
+            },
+        )
+
+    api_key = (
+        request.headers.get("x-adcp-auth", "")
+        or request.headers.get("X-API-Key", "")
+        or request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+    )
+    if api_key not in allowed:
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "AUTH_REQUIRED", "message": "Authentication required"},
+        )
+
+
 @router.get("/tenant/{tenant_id}/tmp-providers/discovery")
-async def tmp_providers_discovery(tenant_id: str) -> JSONResponse:
+async def tmp_providers_discovery(tenant_id: str, _: None = Depends(require_api_key)) -> JSONResponse:
     """Return the active TMP provider set for a tenant.
 
-    Polled by the TMP Router every 30 s.  Internal network only — no auth.
+    Polled by the TMP Router every 30 s.  Requires API key authentication
+    via ``TMP_DISCOVERY_API_KEYS`` (open when env var is unset).
 
     Lifecycle filtering:
       active   → included
       draining → included (router stops sending new requests but in-flight complete)
       inactive → excluded
     """
-    with get_db_session() as session:
-        # Verify tenant exists — return 404 for unknown tenants so the router
-        # can distinguish "no providers" from "wrong tenant_id".
-        tenant_row = session.scalar(select(Tenant).where(Tenant.tenant_id == tenant_id))
-        if tenant_row is None:
-            raise HTTPException(status_code=404, detail=f"Tenant '{tenant_id}' not found")
-
-        stmt = (
-            select(TMPProvider)
-            .where(
-                TMPProvider.tenant_id == tenant_id,
-                # Exclude inactive providers; active + draining are forwarded.
-                TMPProvider.status.in_(["active", "draining"]),
+    with TenantConfigUoW(tenant_id) as uow:
+        if uow.tenant_config is None:
+            raise HTTPException(
+                status_code=500,
+                detail={"code": "INTERNAL_ERROR", "message": "Tenant config repository unavailable"},
             )
-            .order_by(TMPProvider.priority.asc(), TMPProvider.name.asc())
-        )
-        providers = session.scalars(stmt).all()
+        if uow.tenant_config.get_tenant() is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "TENANT_NOT_FOUND", "message": f"Tenant '{tenant_id}' not found"},
+            )
 
-    provider_list = []
-    for p in providers:
-        provider_list.append(
-            {
-                "provider_id": p.provider_id,
-                "name": p.name,
-                "endpoint": p.endpoint,
-                "context_match": p.context_match,
-                "identity_match": p.identity_match,
-                # countries / uid_types may be None for legacy rows that pre-date
-                # the 20260421000000 migration.  The router treats None as
-                # "accepts all" for backward compatibility.
-                "countries": p.countries,
-                "uid_types": p.uid_types,
-                "timeout_ms": p.timeout_ms,
-                "priority": p.priority,
-                "status": p.status,
-            }
-        )
+    with TMPProviderUoW(tenant_id) as uow:
+        assert uow.tmp_providers is not None
+        providers = uow.tmp_providers.list_syncable()
+
+    # include_conditional=False: the TMP Router expects countries/uid_types
+    # to always be present (None means "accepts all" for legacy rows).
+    provider_list = [p.to_dict(include_conditional=False) for p in providers]
 
     logger.debug(
         "[TMP discovery] tenant=%s returned %d provider(s)",

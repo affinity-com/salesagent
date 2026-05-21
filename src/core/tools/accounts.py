@@ -17,7 +17,7 @@ import base64
 import logging
 import uuid
 from datetime import UTC
-from typing import Any
+from typing import Annotated, Any
 
 from adcp.types.generated_poc.account.list_accounts_request import (
     Status as AccountStatus,
@@ -33,6 +33,7 @@ from adcp.types.generated_poc.core.pagination_request import PaginationRequest
 from adcp.types.generated_poc.core.pagination_response import PaginationResponse
 from fastmcp.server.context import Context
 from fastmcp.tools.tool import ToolResult
+from pydantic import Field
 
 from src.core.audit_logger import get_audit_logger
 from src.core.database.models import Account as DBAccount
@@ -178,7 +179,7 @@ def _list_accounts_impl(
 async def list_accounts(
     status: AccountStatus | None = None,
     pagination: PaginationRequest | None = None,
-    sandbox: bool | None = None,
+    sandbox: Annotated[bool | None, Field(description="When true, return only sandbox/test accounts")] = None,
     context: ContextObject | None = None,
     ctx: Context | ToolContext | None = None,
 ) -> Any:
@@ -261,13 +262,20 @@ def _enum_to_str(val: Any) -> str | None:
 
 
 def _serialize_governance_agents(agents: Any) -> list[dict[str, Any]] | None:
-    """Convert GovernanceAgent models to JSON-serializable dicts for DB storage."""
+    """Convert GovernanceAgent models to JSON-serializable dicts for DB storage.
+
+    Both dict and model inputs are normalized through model_dump(mode="json")
+    to ensure consistent comparison (e.g., AnyUrl → str).
+    """
+    from adcp.types.generated_poc.core.account import GovernanceAgent
+
     if agents is None:
         return None
     result: list[dict[str, Any]] = []
     for g in agents:
         if isinstance(g, dict):
-            result.append(g)
+            # Validate through model to normalize types (AnyUrl → str, etc.)
+            result.append(GovernanceAgent.model_validate(g).model_dump(mode="json"))
         elif hasattr(g, "model_dump"):
             result.append(g.model_dump(mode="json"))
         else:
@@ -300,7 +308,7 @@ def _account_fields_changed(db_account: DBAccount, entry: Any) -> dict[str, Any]
     # Compare governance_agents (JSON field)
     # Both sides must be serialized to dicts for comparison — db_account.governance_agents
     # is hydrated to list[GovernanceAgent] by JSONType, while incoming is already serialized.
-    incoming_gov = _serialize_governance_agents(entry.governance_agents)
+    incoming_gov = _serialize_governance_agents(getattr(entry, "governance_agents", None))
     db_gov = _serialize_governance_agents(db_account.governance_agents)
     if db_gov != incoming_gov:
         changes["governance_agents"] = incoming_gov
@@ -314,18 +322,26 @@ def _build_sync_result(
     operator: str,
     action: str,
     status: str,
+    account_id: str | None = None,
     name: str | None = None,
     billing: str | None = None,
     sandbox: bool | None = None,
     errors: list[Any] | None = None,
     setup: Any | None = None,
 ) -> SyncResponseAccount:
-    """Build an AdCP sync response Account object."""
+    """Build an AdCP sync response Account object.
+
+    The seller-assigned ``account_id`` MUST be echoed back for any non-failure
+    action (created/updated/unchanged) so the buyer can reference the account
+    in subsequent calls (BR-UC-011 POST-S5). Only ``failed`` results legitimately
+    omit it because no account was provisioned.
+    """
     return SyncResponseAccount(
         brand=brand,
         operator=operator,
         action=action,
         status=status,
+        account_id=account_id,
         name=name,
         billing=billing,
         sandbox=sandbox,
@@ -369,7 +385,7 @@ def _check_domain_validity(brand_domain: str) -> list[Any] | None:
         if brand_domain.endswith(tld):
             return [
                 Error(
-                    code="INVALID_DOMAIN",
+                    code="VALIDATION_ERROR",
                     message=f"Domain '{brand_domain}' uses reserved TLD '{tld}' "
                     f"and cannot be used for account provisioning.",
                     suggestion="Use a real domain name for production accounts.",
@@ -400,7 +416,7 @@ def _check_billing_policy(
     if billing_val not in supported:
         return [
             Error(
-                code="BILLING_NOT_SUPPORTED",
+                code="UNSUPPORTED_FEATURE",
                 message=f"Billing model '{billing_val}' is not supported by this seller. "
                 f"Supported models: {', '.join(supported)}.",
                 suggestion=f"Use one of the supported billing models: {', '.join(supported)}.",
@@ -447,7 +463,7 @@ async def _sync_accounts_impl(
         SyncAccountsResponse with per-account action results.
     """
     if req is None:
-        req = SyncAccountsRequest(accounts=[])
+        req = SyncAccountsRequest(accounts=[], idempotency_key=str(uuid.uuid4()))
 
     # BR-RULE-055: sync requires auth
     if identity is None or identity.principal_id is None or identity.tenant_id is None:
@@ -527,6 +543,7 @@ async def _sync_accounts_impl(
                             operator=operator,
                             action=action,
                             status=existing.status,
+                            account_id=existing.account_id,
                             name=existing.name,
                             billing=existing.billing,
                             sandbox=existing.sandbox,
@@ -548,6 +565,7 @@ async def _sync_accounts_impl(
                         operator=operator,
                         action=action,
                         status=existing.status,
+                        account_id=existing.account_id,
                         name=existing.name,
                         billing=existing.billing,
                         sandbox=existing.sandbox,
@@ -557,7 +575,7 @@ async def _sync_accounts_impl(
                 # Create new account
                 billing_val = _enum_to_str(entry.billing)
                 payment_terms_val = _enum_to_str(entry.payment_terms)
-                governance_agents_val = _serialize_governance_agents(entry.governance_agents)
+                governance_agents_val = _serialize_governance_agents(getattr(entry, "governance_agents", None))
 
                 account_id = _generate_account_id()
                 account_name = _generate_account_name(brand_domain, operator, brand_id)
@@ -573,12 +591,16 @@ async def _sync_accounts_impl(
                 initial_status = "pending_approval" if setup else "active"
 
                 if dry_run:
+                    # account_id was generated above (BR-RULE-062 — preview reflects
+                    # what a real create would return). It is a preview value, not a
+                    # commitment to that specific id.
                     results.append(
                         _build_sync_result(
                             brand=entry.brand,
                             operator=operator,
                             action="created",
                             status=initial_status,
+                            account_id=account_id,
                             name=account_name,
                             billing=billing_val,
                             sandbox=sandbox,
@@ -612,6 +634,7 @@ async def _sync_accounts_impl(
                         operator=operator,
                         action="created",
                         status=initial_status,
+                        account_id=account_id,
                         name=account_name,
                         billing=billing_val,
                         sandbox=sandbox,
@@ -631,6 +654,7 @@ async def _sync_accounts_impl(
                             operator=db_acct.operator or "",
                             action="updated",
                             status="closed",
+                            account_id=db_acct.account_id,
                             name=db_acct.name,
                             billing=db_acct.billing,
                             sandbox=db_acct.sandbox,
@@ -659,8 +683,10 @@ async def _sync_accounts_impl(
 
 async def sync_accounts(
     accounts: list[SyncAccountInput] | None = None,
-    delete_missing: bool | None = None,
-    dry_run: bool | None = None,
+    delete_missing: Annotated[
+        bool | None, Field(description="Deactivate accounts not present in the sync list")
+    ] = None,
+    dry_run: Annotated[bool | None, Field(description="Preview sync results without making changes")] = None,
     context: ContextObject | None = None,
     ctx: Context | ToolContext | None = None,
 ) -> Any:
@@ -684,6 +710,7 @@ async def sync_accounts(
         delete_missing=delete_missing,
         dry_run=dry_run,
         context=context,
+        idempotency_key=str(uuid.uuid4()),
     )
     identity = (await ctx.get_state("identity")) if isinstance(ctx, Context) else None
     response = await _sync_accounts_impl(req, identity)

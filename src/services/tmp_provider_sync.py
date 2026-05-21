@@ -32,11 +32,9 @@ import os
 from typing import Any
 
 import httpx
-from sqlalchemy import select
 
-from src.core.database.database_session import get_db_session
-from src.core.database.models import Tenant
-from src.core.database.repositories.uow import MediaBuyUoW, TMPProviderUoW
+from src.core.database.models import MediaPackage
+from src.core.database.repositories.uow import MediaBuyUoW, TenantConfigUoW, TMPProviderUoW
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +51,7 @@ def _resolve_seller_agent_url(tenant_id: str) -> str:
 
     Resolution order:
       1. ADCP_AGENT_URL env var (explicit override for non-standard deployments)
-      2. Tenant virtual_host (the public domain, e.g. "si-host.salesagent.unifyaffinity.com")
+      2. Tenant virtual_host (the public domain, e.g. "tenant.salesagent.example.com")
       3. Tenant subdomain fallback (e.g. "si-host.sales-agent.localhost:8001")
 
     Returns the URL with /mcp suffix (the standard MCP endpoint).
@@ -63,12 +61,11 @@ def _resolve_seller_agent_url(tenant_id: str) -> str:
         return override.rstrip("/")
 
     # Load tenant to resolve virtual_host / subdomain.
-    # This is a lightweight read-only query — no UoW needed.
+    # Uses TenantConfigUoW for architecture compliance (no raw get_db_session).
     try:
-        with get_db_session() as session:
-            tenant = session.scalar(
-                select(Tenant).where(Tenant.tenant_id == tenant_id)
-            )
+        with TenantConfigUoW(tenant_id) as uow:
+            assert uow.tenant_config is not None
+            tenant = uow.tenant_config.get_tenant()
             if tenant and tenant.virtual_host:
                 host = tenant.virtual_host
                 scheme = "https" if "localhost" not in host else "http"
@@ -87,7 +84,7 @@ def _resolve_seller_agent_url(tenant_id: str) -> str:
 
 def _build_package_payload(
     media_buy_id: str,
-    pkg_row: Any,
+    pkg_row: MediaPackage,
     seller_agent_url: str,
 ) -> dict[str, Any]:
     """Build the POST /packages/sync payload from a MediaPackage DB row.
@@ -124,24 +121,32 @@ def _build_package_payload(
     }
 
 
-def _post_packages_sync(endpoint: str, payloads: list[dict[str, Any]]) -> None:
+def _post_packages_sync(endpoint: str, payloads: list[dict[str, Any]], auth_credentials: str = "") -> None:
     """POST /packages/sync to a single TMP Provider endpoint.
 
     Sends the full list as a JSON array.  The TMP Provider's handler accepts
     both a single object and an array (see handlers_packages.go).
 
+    Auth: Bearer token — when auth_credentials is set, sends
+    ``Authorization: Bearer <credentials>``.  The TMP Provider resolves
+    the tenant server-side from the credential.
+
     Raises httpx.HTTPError on non-2xx responses so the caller can log and
     continue to the next provider.
     """
     url = endpoint.rstrip("/") + "/packages/sync"
+    headers: dict[str, str] = {}
+    if auth_credentials:
+        headers["Authorization"] = f"Bearer {auth_credentials}"
     with httpx.Client(timeout=_SYNC_TIMEOUT_S) as client:
-        resp = client.post(url, json=payloads)
+        resp = client.post(url, json=payloads, headers=headers)
         resp.raise_for_status()
     logger.info(
-        "[TMP sync] POST %s → %d (%d package(s))",
+        "[TMP sync] POST %s → %d (%d package(s), auth=%s)",
         url,
         resp.status_code,
         len(payloads),
+        "bearer" if auth_credentials else "none",
     )
 
 
@@ -217,7 +222,7 @@ def sync_packages_for_media_buy(tenant_id: str, media_buy_id: str) -> None:
     # --- Step 4: fan out to each provider (best-effort) ---
     for provider in providers:
         try:
-            _post_packages_sync(provider.endpoint, payloads)
+            _post_packages_sync(provider.endpoint, payloads, provider.auth_credentials or "")
         except Exception:
             # Log with full context but do NOT re-raise — one provider failure
             # must not block the others.  The media buy is already committed.

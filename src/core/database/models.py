@@ -99,7 +99,7 @@ class Tenant(Base, JSONValidatorMixin):
 
     # Naming templates (business rules - shared across all adapters)
     order_name_template: Mapped[str | None] = mapped_column(
-        String(500), nullable=True, server_default="{campaign_name|brand_name} - {buyer_ref} - {date_range}"
+        String(500), nullable=True, server_default="{campaign_name|brand_name} - {media_buy_id} - {date_range}"
     )
     line_item_name_template: Mapped[str | None] = mapped_column(
         String(500), nullable=True, server_default="{order_name} - {product_name}"
@@ -907,7 +907,6 @@ class MediaBuy(Base):
         String(50), ForeignKey("tenants.tenant_id", ondelete="CASCADE"), nullable=False
     )
     principal_id: Mapped[str] = mapped_column(String(50), nullable=False)
-    buyer_ref: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
     order_name: Mapped[str] = mapped_column(String(255), nullable=False)
     advertiser_name: Mapped[str] = mapped_column(String(255), nullable=False)
     campaign_objective: Mapped[str | None] = mapped_column(String(100), nullable=True)
@@ -929,6 +928,7 @@ class MediaBuy(Base):
     strategy_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     is_paused: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     account_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     # Relationships
     tenant = relationship("Tenant", back_populates="media_buys", overlaps="media_buys")
@@ -965,16 +965,18 @@ class MediaBuy(Base):
             ["accounts.tenant_id", "accounts.account_id"],
             ondelete="SET NULL",
         ),
-        UniqueConstraint(
-            "tenant_id",
-            "principal_id",
-            "buyer_ref",
-            name="uq_media_buys_buyer_ref",
-        ),
         Index("idx_media_buys_tenant", "tenant_id"),
         Index("idx_media_buys_status", "status"),
         Index("idx_media_buys_strategy", "strategy_id"),
         Index("idx_media_buys_account", "account_id"),
+        Index(
+            "idx_media_buys_idempotency_key",
+            "tenant_id",
+            "principal_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+        ),
     )
 
 
@@ -1327,6 +1329,8 @@ class TMPProvider(Base):
     timeout_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=50)
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    auth_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    auth_credentials: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -1339,6 +1343,37 @@ class TMPProvider(Base):
         Index("idx_tmp_providers_tenant", "tenant_id"),
         Index("idx_tmp_providers_status", "status"),
     )
+
+    def to_dict(self, *, include_conditional: bool = True) -> dict:
+        """Serialize provider to a dict matching the TMP Router contract.
+
+        Args:
+            include_conditional: When True (default), include countries/uid_types/
+                properties only if they are non-None.  When False, always include
+                them (as None for legacy rows).
+        """
+        result: dict = {
+            "provider_id": self.provider_id,
+            "name": self.name,
+            "endpoint": self.endpoint,
+            "context_match": self.context_match,
+            "identity_match": self.identity_match,
+            "timeout_ms": self.timeout_ms,
+            "priority": self.priority,
+            "status": self.status,
+        }
+        if include_conditional:
+            if self.countries:
+                result["countries"] = self.countries
+            if self.uid_types:
+                result["uid_types"] = self.uid_types
+            if self.properties:
+                result["properties"] = self.properties
+        else:
+            result["countries"] = self.countries
+            result["uid_types"] = self.uid_types
+            result["properties"] = self.properties
+        return result
 
 
 class GAMInventory(Base):

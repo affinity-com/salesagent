@@ -8,8 +8,6 @@ beads: salesagent-m44
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -87,9 +85,7 @@ class TMPProviderRepository:
         """List all providers for the tenant, ordered by name."""
         return list(
             self._session.scalars(
-                select(TMPProvider)
-                .where(TMPProvider.tenant_id == self._tenant_id)
-                .order_by(TMPProvider.name)
+                select(TMPProvider).where(TMPProvider.tenant_id == self._tenant_id).order_by(TMPProvider.name)
             ).all()
         )
 
@@ -127,7 +123,7 @@ class TMPProviderRepository:
     def update_fields(self, provider_id: str, **kwargs: object) -> TMPProvider | None:
         """Update mutable fields on a provider. Returns None if not found.
 
-        Raises ValueError if any immutable field is in kwargs.
+        Raises ValueError if any immutable field or unknown attribute is in kwargs.
         """
         bad = self._IMMUTABLE_FIELDS & set(kwargs)
         if bad:
@@ -136,6 +132,8 @@ class TMPProviderRepository:
         if provider is None:
             return None
         for key, value in kwargs.items():
+            if not hasattr(provider, key):
+                raise ValueError(f"TMPProvider has no attribute {key!r}")
             setattr(provider, key, value)
         self._session.flush()
         return provider
@@ -157,12 +155,3 @@ class TMPProviderRepository:
         self._session.delete(provider)
         self._session.flush()
         return True
-
-    def update_health_status(self, provider_id: str, status: str) -> TMPProvider | None:
-        """Update health-related info on a provider. Returns None if not found."""
-        provider = self.get_by_id(provider_id)
-        if provider is None:
-            return None
-        provider.status = status
-        self._session.flush()
-        return provider

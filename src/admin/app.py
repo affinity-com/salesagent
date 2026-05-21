@@ -37,6 +37,7 @@ from src.admin.blueprints.tmp_providers_bp import tmp_providers_bp
 
 # from src.admin.blueprints.tasks import tasks_bp  # Disabled - tasks eliminated in favor of workflow system
 from src.admin.blueprints.tenants import tenants_bp
+from src.admin.blueprints.tmp_providers import tmp_providers_bp
 from src.admin.blueprints.users import users_bp
 from src.admin.blueprints.workflows import workflows_bp
 from src.core.config_loader import is_single_tenant_mode
