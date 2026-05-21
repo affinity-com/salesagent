@@ -63,6 +63,8 @@ _VERSION_FIELDS: frozenset[str] = frozenset({"adcp_version", "adcp_major_version
 KNOWN_SCHEMA_LIBRARY_MISMATCHES: dict[str, set[str]] = {
     "/schemas/latest/media-buy/get-products-request.json": {
         "fields",  # Schema defines field selection, library doesn't have it yet
+        "if_catalog_version",  # Schema defines catalog version conditional, library doesn't have it yet
+        "if_pricing_version",  # Schema defines pricing version conditional, library doesn't have it yet
         "preferred_delivery_types",  # Schema defines delivery type preferences, library doesn't have it yet
         "refine",  # Schema defines refinement array, library doesn't have it yet
         "required_policies",  # Schema defines policy IDs, library doesn't have it yet
@@ -75,7 +77,9 @@ KNOWN_SCHEMA_LIBRARY_MISMATCHES: dict[str, set[str]] = {
     },
     "/schemas/latest/media-buy/get-media-buy-delivery-request.json": {
         "account",  # Schema says 'account' (object), library uses 'account_id' (string)
+        "include_window_breakdown",  # Schema defines window breakdown flag, library doesn't have it yet
         "reporting_dimensions",  # Schema defines it, library doesn't have it yet
+        "time_granularity",  # Schema defines time granularity, library doesn't have it yet
     },
     "/schemas/latest/media-buy/sync-creatives-request.json": {
         "account",  # Schema says 'account' (object), library uses 'account_id' (string)

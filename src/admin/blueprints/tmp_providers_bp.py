@@ -21,17 +21,26 @@ from sqlalchemy import select
 from src.admin.utils import require_tenant_access
 from src.admin.utils.audit_decorator import log_admin_action
 from src.core.database.database_session import get_db_session
-from src.core.database.models import TMPProvider, Tenant
+from src.core.database.models import Tenant, TMPProvider
 from src.core.database.repositories.tmp_provider import TMPProviderRepository
 from src.core.security.url_validator import check_url_ssrf
 
 logger = logging.getLogger(__name__)
 
 # Valid uid_type values per AdCP spec (uid-type enum).
-VALID_UID_TYPES = frozenset([
-    "uid2", "rampid", "id5", "euid", "pairid",
-    "maid", "hashed_email", "publisher_first_party", "other",
-])
+VALID_UID_TYPES = frozenset(
+    [
+        "uid2",
+        "rampid",
+        "id5",
+        "euid",
+        "pairid",
+        "maid",
+        "hashed_email",
+        "publisher_first_party",
+        "other",
+    ]
+)
 
 # Create Blueprint
 tmp_providers_bp = Blueprint("tmp_providers", __name__)
@@ -90,8 +99,7 @@ def _validate_provider_form(form: dict) -> tuple[dict, str | None]:
         invalid_types = [u for u in uid_types if u not in VALID_UID_TYPES]
         if invalid_types:
             return {}, (
-                f"Invalid uid_type(s): {', '.join(invalid_types)}. "
-                f"Valid values: {', '.join(sorted(VALID_UID_TYPES))}"
+                f"Invalid uid_type(s): {', '.join(invalid_types)}. Valid values: {', '.join(sorted(VALID_UID_TYPES))}"
             )
 
     data = {
@@ -294,9 +302,7 @@ def edit_tmp_provider(tenant_id, provider_id):
     except Exception as e:
         logger.error(f"Error updating TMP provider: {e}", exc_info=True)
         flash("Error updating TMP provider", "error")
-        return redirect(
-            url_for("tmp_providers.edit_tmp_provider", tenant_id=tenant_id, provider_id=provider_id)
-        )
+        return redirect(url_for("tmp_providers.edit_tmp_provider", tenant_id=tenant_id, provider_id=provider_id))
 
 
 @tmp_providers_bp.route("/<provider_id>/deactivate", methods=["POST"])
@@ -371,9 +377,7 @@ def health_check_tmp_provider(tenant_id, provider_id):
                 if resp.status_code == 200:
                     return jsonify({"success": True, "status": "healthy", "provider": provider.name})
                 else:
-                    return jsonify(
-                        {"success": False, "status": f"HTTP {resp.status_code}", "provider": provider.name}
-                    )
+                    return jsonify({"success": False, "status": f"HTTP {resp.status_code}", "provider": provider.name})
             except requests.RequestException as req_err:
                 return jsonify({"success": False, "error": str(req_err), "provider": provider.name})
 
