@@ -346,8 +346,11 @@ def main():
     # Check database connectivity
     check_database_health()
 
-    # Run migrations
-    run_migrations()
+    # Run migrations (skip if SKIP_MIGRATIONS=true — migrations run via dedicated CI seed job)
+    if os.environ.get("SKIP_MIGRATIONS", "false").lower() == "true":
+        print("⏭️  Skipping migrations (SKIP_MIGRATIONS=true)")
+    else:
+        run_migrations()
 
     # Check for schema issues (non-blocking)
     check_schema_issues()
