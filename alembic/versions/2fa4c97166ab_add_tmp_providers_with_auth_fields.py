@@ -34,6 +34,18 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     """Create tmp_providers table with auth fields aligned with provider-registration.json schema."""
+    # Guard: table may already exist from migration 20260413120000 (parallel branch)
+    conn = op.get_bind()
+    inspector = sa.inspect(conn)
+    if "tmp_providers" in inspector.get_table_names():
+        # Table exists — just add the auth columns if missing
+        existing_cols = {c["name"] for c in inspector.get_columns("tmp_providers")}
+        if "auth_type" not in existing_cols:
+            op.add_column("tmp_providers", sa.Column("auth_type", sa.String(length=50), nullable=True))
+        if "auth_credentials" not in existing_cols:
+            op.add_column("tmp_providers", sa.Column("auth_credentials", sa.Text(), nullable=True))
+        return
+
     op.create_table(
         "tmp_providers",
         sa.Column(
