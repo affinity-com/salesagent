@@ -1451,15 +1451,20 @@ async def _create_media_buy_impl(
 
             logger.info(f"[MCP/A2A] Registering push notification config from request: {push_notification_config}")
 
-            # Extract config details
+            # Extract config details — coerce AnyUrl to str for SQLAlchemy compatibility
             url = push_notification_config.get("url")
+            if url is not None:
+                url = str(url)
             authentication = push_notification_config.get("authentication", {})
 
             if url:
                 # Extract authentication details (A2A format: schemes + credentials)
+                # Coerce enum/AnyUrl objects to plain strings for SQLAlchemy compatibility
                 schemes = authentication.get("schemes", []) if authentication else []
-                auth_type = schemes[0] if schemes else None
+                auth_type = str(schemes[0]) if schemes else None
                 credentials = authentication.get("credentials") if authentication else None
+                if credentials is not None:
+                    credentials = str(credentials)
 
                 # Generate config ID
                 config_id = push_notification_config.get("id") or f"pnc_{uuid.uuid4().hex[:16]}"
@@ -3558,7 +3563,28 @@ async def _create_media_buy_impl(
         if hooks_result.media_buy_id_override:
             modified_response = adcp_response.model_copy(update={"media_buy_id": hooks_result.media_buy_id_override})
 
-        # Mark workflow step as completed on success
+        # Link workflow step to media buy for webhook delivery (auto-approve path)
+        # _send_push_notifications queries ObjectWorkflowMapping to find the webhook URL;
+        # without this mapping it returns early with "No object mappings found".
+        try:
+            with MediaBuyUoW(tenant["tenant_id"]) as wf_uow:
+                # FIXME(salesagent-9f2): workflow mapping should use a repository method
+                assert wf_uow.session is not None
+                from src.core.database.models import ObjectWorkflowMapping
+
+                mapping = ObjectWorkflowMapping(
+                    object_type="media_buy",
+                    object_id=response.media_buy_id,
+                    step_id=step.step_id,
+                    action="create",
+                )
+                wf_uow.session.add(mapping)
+                # UoW auto-commits on clean exit
+                logger.info(f"✅ Linked workflow step {step.step_id} to media buy {response.media_buy_id} (auto-approve path)")
+        except Exception as e:
+            logger.warning(f"Failed to create ObjectWorkflowMapping for auto-approve path: {e}")
+
+        # Mark workflow step as completed on success (triggers _send_push_notifications)
         ctx_manager.update_workflow_step(step.step_id, status="completed")
 
         # Send Slack notification for successful media buy creation

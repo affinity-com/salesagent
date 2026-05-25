@@ -33,56 +33,37 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    """Create tmp_providers table with auth fields aligned with provider-registration.json schema."""
-    op.create_table(
-        "tmp_providers",
-        sa.Column(
-            "provider_id",
-            postgresql.UUID(as_uuid=False),
-            server_default=sa.text("gen_random_uuid()"),
-            nullable=False,
-        ),
-        sa.Column("tenant_id", sa.String(length=50), nullable=False),
-        sa.Column("name", sa.String(length=200), nullable=False),
-        sa.Column("endpoint", sa.String(length=500), nullable=False),
-        sa.Column("context_match", sa.Boolean(), nullable=False, server_default=sa.text("true")),
-        sa.Column("identity_match", sa.Boolean(), nullable=False, server_default=sa.text("true")),
-        sa.Column("countries", postgresql.JSONB(), nullable=True),
-        sa.Column("uid_types", postgresql.JSONB(), nullable=True),
-        sa.Column("properties", postgresql.JSONB(), nullable=True),
-        sa.Column("timeout_ms", sa.Integer(), nullable=False, server_default=sa.text("50")),
-        sa.Column("priority", sa.Integer(), nullable=False, server_default=sa.text("0")),
-        sa.Column(
-            "status",
-            sa.String(length=20),
-            nullable=False,
-            server_default=sa.text("'active'"),
-        ),
-        sa.Column("auth_type", sa.String(length=50), nullable=True),
-        sa.Column("auth_credentials", sa.Text(), nullable=True),
-        sa.Column(
-            "created_at",
-            sa.DateTime(timezone=True),
-            server_default=sa.text("now()"),
-            nullable=True,
-        ),
-        sa.Column(
-            "updated_at",
-            sa.DateTime(timezone=True),
-            server_default=sa.text("now()"),
-            nullable=True,
-        ),
-        sa.ForeignKeyConstraint(["tenant_id"], ["tenants.tenant_id"], ondelete="CASCADE"),
-        sa.PrimaryKeyConstraint("provider_id"),
-    )
+    """Add auth_type and auth_credentials columns to existing tmp_providers table.
 
-    # Create indexes
-    op.create_index("idx_tmp_providers_tenant", "tmp_providers", ["tenant_id"])
-    op.create_index("idx_tmp_providers_status", "tmp_providers", ["status"])
+    The tmp_providers table was created by migration 20260413120000 without auth fields.
+    This migration adds the two auth columns introduced in the auth-fields revision.
+    Uses IF NOT EXISTS guards so it is safe to run even if columns already exist
+    (e.g. on a fresh DB where both migrations run in sequence via a merge head).
+    """
+    conn = op.get_bind()
+
+    # Add auth_type column if it doesn't already exist
+    result = conn.execute(
+        sa.text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name='tmp_providers' AND column_name='auth_type'"
+        )
+    )
+    if result.fetchone() is None:
+        op.add_column("tmp_providers", sa.Column("auth_type", sa.String(length=50), nullable=True))
+
+    # Add auth_credentials column if it doesn't already exist
+    result = conn.execute(
+        sa.text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name='tmp_providers' AND column_name='auth_credentials'"
+        )
+    )
+    if result.fetchone() is None:
+        op.add_column("tmp_providers", sa.Column("auth_credentials", sa.Text(), nullable=True))
 
 
 def downgrade() -> None:
-    """Drop tmp_providers table."""
-    op.drop_index("idx_tmp_providers_status", table_name="tmp_providers")
-    op.drop_index("idx_tmp_providers_tenant", table_name="tmp_providers")
-    op.drop_table("tmp_providers")
+    """Remove auth columns added by this migration."""
+    op.drop_column("tmp_providers", "auth_credentials")
+    op.drop_column("tmp_providers", "auth_type")
