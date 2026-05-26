@@ -27,6 +27,7 @@ def _validate_creative_input(
     creative: CreativeAsset,
     registry: Any,
     principal_id: str,
+    validation_mode: str = "strict",
 ) -> Creative:
     """Validate a CreativeAsset and return a validated Creative model.
 
@@ -38,6 +39,9 @@ def _validate_creative_input(
         creative: CreativeAsset model from the sync payload.
         registry: CreativeAgentRegistry instance for format validation.
         principal_id: Authenticated principal ID for ownership.
+        validation_mode: Validation strictness ("strict" or "lenient").
+            In "lenient" mode, unknown formats from the creative agent registry
+            are skipped (useful for salesagent-side formats like text_ad_search).
 
     Returns:
         Validated Creative schema object.
@@ -113,37 +117,45 @@ def _validate_creative_input(
     is_adapter_format = not agent_url.startswith(("http://", "https://"))
 
     if not is_adapter_format:
-        # Check if format exists (uses in-memory cache with 1-hour TTL)
-        # Use run_async_in_sync_context to handle both sync and async contexts
-        format_spec = None
-        validation_error = None
+        if validation_mode == "lenient":
+            # In lenient mode, skip external format registry check.
+            # This is used for salesagent-side formats (e.g. text_ad_search) that are
+            # not registered with a separate creative agent registry.
+            logger.debug(
+                f"[lenient] Skipping format registry check for '{format_id}' from agent {agent_url}"
+            )
+        else:
+            # Check if format exists (uses in-memory cache with 1-hour TTL)
+            # Use run_async_in_sync_context to handle both sync and async contexts
+            format_spec = None
+            validation_error = None
 
-        try:
-            format_spec = run_async_in_sync_context(registry.get_format(agent_url, format_id))
-        except Exception as e:
-            # Network error, agent unreachable, etc.
-            validation_error = e
-            logger.warning(
-                f"Failed to fetch format '{format_id}' from agent {agent_url}: {e}",
-                exc_info=True,
-            )
+            try:
+                format_spec = run_async_in_sync_context(registry.get_format(agent_url, format_id))
+            except Exception as e:
+                # Network error, agent unreachable, etc.
+                validation_error = e
+                logger.warning(
+                    f"Failed to fetch format '{format_id}' from agent {agent_url}: {e}",
+                    exc_info=True,
+                )
 
-        if validation_error:
-            # Agent unreachable or network error
-            raise ValueError(
-                f"Cannot validate format '{format_id}': Creative agent at {agent_url} "
-                f"is unreachable or returned an error. Please verify the agent URL is correct "
-                f"and the agent is running. Error: {str(validation_error)}"
-            )
-        elif not format_spec:
-            # Format not found (agent is reachable but format doesn't exist)
-            raise ValueError(
-                f"Unknown format '{format_id}' from agent {agent_url}. "
-                f"Format must be registered with the creative agent. "
-                f"Use list_creative_formats to see available formats."
-            )
-        # TODO(#767): Call validate_creative when available in creative agent spec
-        # to validate that creative manifest matches format requirements
+            if validation_error:
+                # Agent unreachable or network error
+                raise ValueError(
+                    f"Cannot validate format '{format_id}': Creative agent at {agent_url} "
+                    f"is unreachable or returned an error. Please verify the agent URL is correct "
+                    f"and the agent is running. Error: {str(validation_error)}"
+                )
+            elif not format_spec:
+                # Format not found (agent is reachable but format doesn't exist)
+                raise ValueError(
+                    f"Unknown format '{format_id}' from agent {agent_url}. "
+                    f"Format must be registered with the creative agent. "
+                    f"Use list_creative_formats to see available formats."
+                )
+            # TODO(#767): Call validate_creative when available in creative agent spec
+            # to validate that creative manifest matches format requirements
     else:
         logger.debug(f"Skipping external validation for adapter-provided format '{format_id}' (agent_url: {agent_url})")
 

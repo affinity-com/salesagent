@@ -162,7 +162,7 @@ def _sync_creatives_impl(
 
                 # Validate the creative against schema and business rules
                 try:
-                    validated_creative = _validate_creative_input(creative, registry, principal_id)
+                    validated_creative = _validate_creative_input(creative, registry, principal_id, validation_mode=validation_mode)
                     format_value = validated_creative.format
 
                 except (ValidationError, ValueError) as validation_error:

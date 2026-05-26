@@ -555,7 +555,9 @@ def process_and_upload_package_creatives(
                 # AdCP 2.5: Full upsert semantics (no patch parameter)
                 assignments=None,  # Assign separately after creation
                 dry_run=testing_ctx.dry_run if testing_ctx else False,
-                validation_mode="strict",
+                # Use lenient mode so salesagent-side formats (e.g. text_ad_search)
+                # are accepted without requiring registration in the creative agent registry.
+                validation_mode="lenient",
                 push_notification_config=None,
                 identity=context,  # ResolvedIdentity for principal_id extraction
             )
