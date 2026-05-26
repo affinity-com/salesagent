@@ -1335,6 +1335,9 @@ class TMPProvider(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
     auth_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
     auth_credentials: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Background health-check results (written by TMP health scheduler, read by admin UI).
+    health_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    last_health_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

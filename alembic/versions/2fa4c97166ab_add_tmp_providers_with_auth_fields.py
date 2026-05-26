@@ -12,6 +12,8 @@ Schema aligned with provider-registration.json (AdCP spec PR #2210):
   - priority (integer, default 0)
   - auth_type (string, e.g. "bearer", "api_key") — nullable
   - auth_credentials (text, stores token/key value) — nullable
+  - health_status (string, written by background scheduler) — nullable
+  - last_health_checked_at (datetime, written by background scheduler) — nullable
 
 TMP Provider sync always uses the standard Authorization: Bearer header,
 so auth_header is intentionally omitted (unlike CreativeAgent/SignalsAgent).
@@ -60,6 +62,8 @@ def upgrade() -> None:
         ),
         sa.Column("auth_type", sa.String(length=50), nullable=True),
         sa.Column("auth_credentials", sa.Text(), nullable=True),
+        sa.Column("health_status", sa.String(length=20), nullable=True),
+        sa.Column("last_health_checked_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),

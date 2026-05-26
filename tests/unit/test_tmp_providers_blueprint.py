@@ -481,16 +481,17 @@ class TestTMPProviderDelete:
 
 
 class TestTMPProviderHealthCheck:
-    """Health check endpoint calls provider.endpoint/health."""
+    """Health check endpoint reads from DB (background scheduler writes health_status)."""
 
-    def test_health_check_returns_healthy(self):
-        """GET /tmp-providers/<id>/health returns healthy when endpoint responds 200."""
+    def test_health_check_returns_healthy_from_db(self):
+        """GET /tmp-providers/<id>/health returns healthy when health_status='healthy'."""
+        from datetime import UTC, datetime
+
         client = _make_tmp_provider_client()
 
         existing_provider = _make_mock_provider()
-
-        mock_response = MagicMock()
-        mock_response.status_code = 200
+        existing_provider.health_status = "healthy"
+        existing_provider.last_health_checked_at = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
 
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW") as mock_uow_cls:
             mock_uow = MagicMock()
@@ -498,26 +499,26 @@ class TestTMPProviderHealthCheck:
             mock_uow.tmp_providers.get_by_id.return_value = existing_provider
             mock_uow_cls.return_value.__enter__ = MagicMock(return_value=mock_uow)
             mock_uow_cls.return_value.__exit__ = MagicMock(return_value=False)
-            with patch("src.admin.blueprints.tmp_providers.requests.get", return_value=mock_response) as mock_get:
-                with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                    response = client.get(
-                        "/tenant/default/tmp-providers/test-uuid-1234/health",
-                    )
+            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
+                response = client.get(
+                    "/tenant/default/tmp-providers/test-uuid-1234/health",
+                )
 
         assert response.status_code == 200
         data = response.get_json()
         assert data["success"] is True
         assert data["status"] == "healthy"
-        mock_get.assert_called_once_with("https://provider.example.com/tmp/health", timeout=5, allow_redirects=False)
+        assert data["last_checked"] is not None
 
-    def test_health_check_returns_unhealthy_on_non_200(self):
-        """GET /tmp-providers/<id>/health returns unhealthy when endpoint responds non-200."""
+    def test_health_check_returns_unhealthy_from_db(self):
+        """GET /tmp-providers/<id>/health returns unhealthy when health_status='unhealthy'."""
+        from datetime import UTC, datetime
+
         client = _make_tmp_provider_client()
 
         existing_provider = _make_mock_provider()
-
-        mock_response = MagicMock()
-        mock_response.status_code = 503
+        existing_provider.health_status = "unhealthy"
+        existing_provider.last_health_checked_at = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
 
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW") as mock_uow_cls:
             mock_uow = MagicMock()
@@ -525,24 +526,23 @@ class TestTMPProviderHealthCheck:
             mock_uow.tmp_providers.get_by_id.return_value = existing_provider
             mock_uow_cls.return_value.__enter__ = MagicMock(return_value=mock_uow)
             mock_uow_cls.return_value.__exit__ = MagicMock(return_value=False)
-            with patch("src.admin.blueprints.tmp_providers.requests.get", return_value=mock_response):
-                with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                    response = client.get(
-                        "/tenant/default/tmp-providers/test-uuid-1234/health",
-                    )
+            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
+                response = client.get(
+                    "/tenant/default/tmp-providers/test-uuid-1234/health",
+                )
 
         assert response.status_code == 200
         data = response.get_json()
         assert data["success"] is False
-        assert "503" in data["status"]
+        assert data["status"] == "unhealthy"
 
-    def test_health_check_returns_error_on_connection_failure(self):
-        """GET /tmp-providers/<id>/health returns error when endpoint is unreachable."""
-        import requests as req_lib
-
+    def test_health_check_returns_pending_when_never_checked(self):
+        """GET /tmp-providers/<id>/health returns pending when health_status is None."""
         client = _make_tmp_provider_client()
 
         existing_provider = _make_mock_provider()
+        existing_provider.health_status = None
+        existing_provider.last_health_checked_at = None
 
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW") as mock_uow_cls:
             mock_uow = MagicMock()
@@ -550,19 +550,15 @@ class TestTMPProviderHealthCheck:
             mock_uow.tmp_providers.get_by_id.return_value = existing_provider
             mock_uow_cls.return_value.__enter__ = MagicMock(return_value=mock_uow)
             mock_uow_cls.return_value.__exit__ = MagicMock(return_value=False)
-            with patch(
-                "src.admin.blueprints.tmp_providers.requests.get",
-                side_effect=req_lib.ConnectionError("Connection refused"),
-            ):
-                with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                    response = client.get(
-                        "/tenant/default/tmp-providers/test-uuid-1234/health",
-                    )
+            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
+                response = client.get(
+                    "/tenant/default/tmp-providers/test-uuid-1234/health",
+                )
 
         assert response.status_code == 200
         data = response.get_json()
-        assert data["success"] is False
-        assert "error" in data
+        assert data["success"] is True
+        assert data["status"] == "pending"
 
 
 class TestTMPProviderAuthFields:

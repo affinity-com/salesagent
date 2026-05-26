@@ -8,6 +8,8 @@ beads: salesagent-m44
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -138,6 +140,23 @@ class TMPProviderRepository:
         self._session.flush()
         return provider
 
+    def update_health_status(self, provider_id: str, status: str) -> TMPProvider | None:
+        """Write the result of a background health check.
+
+        Args:
+            provider_id: Provider to update.
+            status: One of "healthy", "unhealthy", or "error".
+
+        Returns the updated provider, or None if not found.
+        """
+        provider = self.get_by_id(provider_id)
+        if provider is None:
+            return None
+        provider.health_status = status
+        provider.last_health_checked_at = datetime.now(UTC)
+        self._session.flush()
+        return provider
+
     def deactivate(self, provider_id: str) -> TMPProvider | None:
         """Set status='inactive' on a provider. Returns None if not found."""
         provider = self.get_by_id(provider_id)
@@ -155,3 +174,22 @@ class TMPProviderRepository:
         self._session.delete(provider)
         self._session.flush()
         return True
+
+    # ------------------------------------------------------------------
+    # Cross-tenant queries (for system-level schedulers)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def get_all_active(session: Session) -> list[TMPProvider]:
+        """List all active/draining providers across all tenants.
+
+        This is a system-level query for the health-check scheduler.
+        Not tenant-scoped — callers must handle tenant context themselves.
+        """
+        return list(
+            session.scalars(
+                select(TMPProvider)
+                .where(TMPProvider.status.in_(["active", "draining"]))
+                .order_by(TMPProvider.tenant_id, TMPProvider.name)
+            ).all()
+        )

@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import logging
 
-import requests
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
 
 from src.admin.utils import require_tenant_access
@@ -377,13 +376,12 @@ def delete_tmp_provider(tenant_id, provider_id):
 @log_admin_action("health_check_tmp_provider")
 @require_tenant_access()
 def health_check_tmp_provider(tenant_id, provider_id):
-    """HTTP GET to provider.endpoint/health — returns JSON status.
+    """Return the last health-check result from the background scheduler.
 
-    .. warning:: Worker starvation risk
-
-       This performs a **synchronous** HTTP call in the request handler,
-       blocking the worker thread for up to 5 s.  If the provider is slow
-       or unreachable, this stalls the admin UI for the requesting user.
+    The TMP health scheduler polls each provider's ``/health`` endpoint
+    every 60 s and writes the result to ``health_status`` /
+    ``last_health_checked_at``.  This route reads from the DB — no live
+    HTTP call, no worker starvation risk.
     """
     try:
         with TMPProviderUoW(tenant_id) as uow:
@@ -392,20 +390,26 @@ def health_check_tmp_provider(tenant_id, provider_id):
             if not provider:
                 return jsonify({"error": "TMP provider not found"}), 404
 
-            health_url = provider.endpoint.rstrip("/") + "/health"
+            if provider.health_status is None:
+                return jsonify(
+                    {
+                        "success": True,
+                        "status": "pending",
+                        "provider": provider.name,
+                        "message": "Health check has not run yet",
+                    }
+                )
 
-            # SSRF validation was already applied when the endpoint was
-            # registered (add/edit routes). The stored URL is trusted.
-            # allow_redirects=False prevents SSRF via open-redirect even
-            # though the base URL was validated at registration time.
-            try:
-                resp = requests.get(health_url, timeout=5, allow_redirects=False)
-                if resp.status_code == 200:
-                    return jsonify({"success": True, "status": "healthy", "provider": provider.name})
-                else:
-                    return jsonify({"success": False, "status": f"HTTP {resp.status_code}", "provider": provider.name})
-            except requests.RequestException as req_err:
-                return jsonify({"success": False, "error": str(req_err), "provider": provider.name})
+            return jsonify(
+                {
+                    "success": provider.health_status == "healthy",
+                    "status": provider.health_status,
+                    "provider": provider.name,
+                    "last_checked": (
+                        provider.last_health_checked_at.isoformat() if provider.last_health_checked_at else None
+                    ),
+                }
+            )
 
     except Exception as e:
         logger.error("Error checking TMP provider health: %s", e, exc_info=True)

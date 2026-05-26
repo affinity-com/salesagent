@@ -16,12 +16,15 @@ Covers:
 - Fail-closed auth: unset/empty TMP_DISCOVERY_API_KEYS → 503
 - Explicit opt-out: TMP_DISCOVERY_API_KEYS=OPEN disables auth
 - uow.tenant_config is None → 500 (not an assert)
+- TMPProvider.to_dict() serializes both conditional paths correctly
 """
 
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+
+from src.core.database.models import TMPProvider
 
 
 def _make_provider(
@@ -32,12 +35,18 @@ def _make_provider(
     identity_match=True,
     countries=None,
     uid_types=None,
+    properties=None,
     timeout_ms=200,
     priority=0,
     status="active",
-):
-    """Create a mock TMPProvider ORM object with to_dict() support."""
-    p = MagicMock()
+) -> TMPProvider:
+    """Create a real TMPProvider ORM instance (no DB session required).
+
+    Uses the real model so that to_dict() is exercised against the production
+    implementation rather than a MagicMock reimplementation that can silently
+    diverge (e.g. the missing-properties regression that was caught in review).
+    """
+    p = TMPProvider()
     p.provider_id = provider_id
     p.name = name
     p.endpoint = endpoint
@@ -45,32 +54,10 @@ def _make_provider(
     p.identity_match = identity_match
     p.countries = countries
     p.uid_types = uid_types
+    p.properties = properties
     p.timeout_ms = timeout_ms
     p.priority = priority
     p.status = status
-
-    def _to_dict(*, include_conditional=True):
-        result = {
-            "provider_id": provider_id,
-            "name": name,
-            "endpoint": endpoint,
-            "context_match": context_match,
-            "identity_match": identity_match,
-            "timeout_ms": timeout_ms,
-            "priority": priority,
-            "status": status,
-        }
-        if include_conditional:
-            if countries:
-                result["countries"] = countries
-            if uid_types:
-                result["uid_types"] = uid_types
-        else:
-            result["countries"] = countries
-            result["uid_types"] = uid_types
-        return result
-
-    p.to_dict = _to_dict
     return p
 
 
@@ -448,3 +435,98 @@ class TestDiscoveryTenantConfigUnavailable:
         assert response.status_code == 500
         detail = response.json()["detail"]
         assert detail["code"] == "INTERNAL_ERROR"
+
+
+# ---------------------------------------------------------------------------
+# TMPProvider.to_dict() unit tests (no DB required)
+# ---------------------------------------------------------------------------
+
+
+class TestTMPProviderToDict:
+    """TMPProvider.to_dict() serializes both conditional paths correctly.
+
+    These tests use real TMPProvider instances (no DB session) to ensure the
+    production serialization contract is tested directly — not a MagicMock
+    reimplementation that can silently diverge.
+    """
+
+    def test_include_conditional_true_omits_none_fields(self):
+        """include_conditional=True (default) omits countries/uid_types/properties when None."""
+        p = _make_provider(countries=None, uid_types=None, properties=None)
+        result = p.to_dict(include_conditional=True)
+        assert "countries" not in result
+        assert "uid_types" not in result
+        assert "properties" not in result
+
+    def test_include_conditional_true_includes_non_none_fields(self):
+        """include_conditional=True includes countries/uid_types/properties when set."""
+        p = _make_provider(countries=["US", "GB"], uid_types=["uid2"], properties=["rid-1"])
+        result = p.to_dict(include_conditional=True)
+        assert result["countries"] == ["US", "GB"]
+        assert result["uid_types"] == ["uid2"]
+        assert result["properties"] == ["rid-1"]
+
+    def test_include_conditional_false_always_includes_fields(self):
+        """include_conditional=False always includes countries/uid_types/properties (even as None)."""
+        p = _make_provider(countries=None, uid_types=None, properties=None)
+        result = p.to_dict(include_conditional=False)
+        assert "countries" in result
+        assert result["countries"] is None
+        assert "uid_types" in result
+        assert result["uid_types"] is None
+        assert "properties" in result
+        assert result["properties"] is None
+
+    def test_include_conditional_false_with_values(self):
+        """include_conditional=False includes populated countries/uid_types/properties."""
+        p = _make_provider(countries=["DE"], uid_types=["id5"], properties=["rid-2", "rid-3"])
+        result = p.to_dict(include_conditional=False)
+        assert result["countries"] == ["DE"]
+        assert result["uid_types"] == ["id5"]
+        assert result["properties"] == ["rid-2", "rid-3"]
+
+    def test_core_fields_always_present(self):
+        """Core fields are always present regardless of include_conditional."""
+        p = _make_provider(
+            provider_id="test-uuid",
+            name="Test Provider",
+            endpoint="http://example.com",
+            context_match=False,
+            identity_match=True,
+            timeout_ms=300,
+            priority=2,
+            status="draining",
+        )
+        for include_conditional in (True, False):
+            result = p.to_dict(include_conditional=include_conditional)
+            assert result["provider_id"] == "test-uuid"
+            assert result["name"] == "Test Provider"
+            assert result["endpoint"] == "http://example.com"
+            assert result["context_match"] is False
+            assert result["identity_match"] is True
+            assert result["timeout_ms"] == 300
+            assert result["priority"] == 2
+            assert result["status"] == "draining"
+
+    def test_discovery_endpoint_uses_include_conditional_false(self, client):
+        """The discovery endpoint calls to_dict(include_conditional=False) so null fields are explicit."""
+        tenant = _make_tenant()
+        providers = [_make_provider(countries=None, uid_types=None, properties=None)]
+
+        mock_tenant_uow_cls = _make_tenant_uow(tenant)
+        mock_tmp_uow_cls = _make_tmp_uow(providers)
+
+        with patch("src.routes.tmp_providers.TenantConfigUoW", mock_tenant_uow_cls):
+            with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
+                with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
+                    response = client.get("/tenant/si-host/tmp-providers/discovery")
+
+        assert response.status_code == 200
+        entry = response.json()["providers"][0]
+        # include_conditional=False → null fields must be present (not omitted)
+        assert "countries" in entry
+        assert entry["countries"] is None
+        assert "uid_types" in entry
+        assert entry["uid_types"] is None
+        assert "properties" in entry
+        assert entry["properties"] is None
