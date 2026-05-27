@@ -9,12 +9,19 @@ which avoids blocking workers for up to 5 s per provider.
 The scheduler follows the same singleton + asyncio.create_task pattern used
 by :mod:`src.services.delivery_webhook_scheduler` and
 :mod:`src.services.media_buy_status_scheduler`.
+
+Design principles (matching tmp_provider_sync.py):
+- HTTP calls are made **after** the DB session is closed — no open transaction
+  during network I/O.
+- Provider metadata is read into memory, the session is closed, probes run
+  concurrently, then a short session writes the results.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 import requests
 
@@ -23,9 +30,9 @@ from src.core.database.repositories.tmp_provider import TMPProviderRepository
 
 logger = logging.getLogger(__name__)
 
-# Poll every 60 seconds — frequent enough for the admin UI to show
-# near-real-time status, infrequent enough to avoid hammering providers.
-HEALTH_CHECK_INTERVAL_SECONDS = 60
+# Configurable via env var — default 60 seconds.
+# Matches the pattern used by media_buy_status_scheduler.
+HEALTH_CHECK_INTERVAL_SECONDS = int(os.getenv("TMP_HEALTH_CHECK_INTERVAL") or "60")
 
 # Per-provider HTTP timeout.  Shorter than the old inline 5 s because
 # the scheduler can afford to mark a slow provider as unhealthy and
@@ -94,37 +101,48 @@ class TMPHealthScheduler:
         while self.is_running:
             try:
                 await self._check_all_providers()
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 logger.error("Error in TMP health scheduler: %s", e, exc_info=True)
             finally:
                 await asyncio.sleep(HEALTH_CHECK_INTERVAL_SECONDS)
 
     async def _check_all_providers(self) -> None:
-        """Poll every active/draining provider and persist the result."""
+        """Poll every active/draining provider and persist the result.
+
+        Follows the same pattern as tmp_provider_sync.py:
+        1. Read provider metadata into memory (short DB session).
+        2. Close the session — no open transaction during network I/O.
+        3. Run health probes concurrently in a thread pool.
+        4. Reopen a short session to write the results.
+        """
         loop = asyncio.get_running_loop()
 
+        # --- Step 1: read provider metadata, then close the session ---
         with get_db_session() as session:
             providers = TMPProviderRepository.get_all_active(session)
             if not providers:
                 return
+            # Materialise into plain tuples so we don't need detached ORM objects
+            provider_info = [(p.provider_id, p.tenant_id, p.endpoint) for p in providers]
 
-            for provider in providers:
-                # Run the blocking HTTP call in a thread so we don't stall
-                # the event loop.
-                status = await loop.run_in_executor(
-                    None,
-                    _check_provider_health,
-                    provider.endpoint,
-                )
+        # --- Step 2: probe all providers concurrently (no DB session held) ---
+        probe_futures = [
+            loop.run_in_executor(None, _check_provider_health, endpoint) for _, _, endpoint in provider_info
+        ]
+        statuses = await asyncio.gather(*probe_futures)
 
-                repo = TMPProviderRepository(session, provider.tenant_id)
-                repo.update_health_status(provider.provider_id, status)
-
+        # --- Step 3: write results in a short session ---
+        with get_db_session() as session:
+            for (provider_id, tenant_id, _endpoint), status in zip(provider_info, statuses, strict=True):
+                repo = TMPProviderRepository(session, tenant_id)
+                repo.update_health_status(provider_id, status)
             session.commit()
 
         logger.debug(
             "TMP health check complete: %d provider(s) checked",
-            len(providers),
+            len(provider_info),
         )
 
 

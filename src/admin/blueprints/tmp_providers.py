@@ -261,21 +261,14 @@ def edit_tmp_provider(tenant_id, provider_id):
                 flash("TMP provider not found", "error")
                 return redirect(url_for("tmp_providers.list_tmp_providers", tenant_id=tenant_id))
 
-            provider_dict = {
-                "provider_id": provider.provider_id,
-                "name": provider.name,
-                "endpoint": provider.endpoint,
-                "context_match": provider.context_match,
-                "identity_match": provider.identity_match,
-                "countries": ",".join(provider.countries or []),
-                "uid_types": ",".join(provider.uid_types or []),
-                "properties": ",".join(provider.properties or []),
-                "timeout_ms": provider.timeout_ms,
-                "priority": provider.priority,
-                "status": provider.status,
-                "auth_type": provider.auth_type,
-                "auth_credentials": provider.auth_credentials,
-            }
+            provider_dict = provider.to_dict(include_conditional=False)
+            # Form fields need comma-separated strings, not lists
+            provider_dict["countries"] = ",".join(provider.countries or [])
+            provider_dict["uid_types"] = ",".join(provider.uid_types or [])
+            provider_dict["properties"] = ",".join(provider.properties or [])
+            # Auth fields are not in to_dict() (sensitive / not part of TMP Router contract)
+            provider_dict["auth_type"] = provider.auth_type
+            provider_dict["auth_credentials"] = provider.auth_credentials
 
             return render_template(
                 "tmp_provider_form.html",
