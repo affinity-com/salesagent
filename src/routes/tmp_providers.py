@@ -129,7 +129,7 @@ async def tmp_providers_discovery(tenant_id: str, _: None = Depends(require_api_
         if uow.tenant_config.get_tenant() is None:
             raise HTTPException(
                 status_code=404,
-                detail=adcp_error("PACKAGE_NOT_FOUND", f"Tenant '{tenant_id}' not found", recovery="terminal"),
+                detail=adcp_error("ACCOUNT_NOT_FOUND", f"Tenant '{tenant_id}' not found", recovery="terminal"),
             )
 
     with TMPProviderUoW(tenant_id) as uow:

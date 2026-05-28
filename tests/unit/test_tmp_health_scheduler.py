@@ -374,7 +374,7 @@ class TestSchedulerLifecycle:
         async def instant_tick() -> None:
             tick_called.set()
 
-        # Use zero interval so the finally-sleep is instant and stop() returns quickly.
+        # Use zero interval so the inter-tick sleep is instant and stop() returns quickly.
         with (
             patch.object(scheduler, "tick", side_effect=instant_tick),
             patch.object(scheduler, "_interval_seconds", 0),

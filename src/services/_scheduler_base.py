@@ -38,7 +38,8 @@ class IntervalScheduler:
     - Exception isolation: an unhandled error in ``tick`` is logged but does
       not kill the loop.
     - The sleep always runs in ``finally`` so the cadence is maintained even
-      when ``tick`` raises.
+      when ``tick`` raises.  When the task is cancelled, ``asyncio.sleep``
+      raises ``CancelledError`` immediately so shutdown is not delayed.
 
     Args:
         interval_seconds: Seconds to sleep between ticks.
