@@ -186,6 +186,11 @@ def get_adapter(
         return Kevel(adapter_config, principal, dry_run, tenant_id=tenant_id)
     elif selected_adapter in ["triton", "triton_digital"]:
         return TritonDigital(adapter_config, principal, dry_run, tenant_id=tenant_id)
+    elif selected_adapter == "siteplug":
+        from src.adapters.siteplug import SiteplugAdapter
+
+        logger.info("[ADAPTER_SELECT] Instantiating SiteplugAdapter")
+        return SiteplugAdapter(adapter_config, principal, dry_run, tenant_id=tenant_id)
     else:
         # Default to mock for unsupported adapters
         return MockAdServerAdapter(

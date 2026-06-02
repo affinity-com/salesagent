@@ -1,0 +1,121 @@
+{# Siteplug adapter connection configuration template.
+   Included by tenant_settings.html when active_adapter == 'siteplug'.
+#}
+
+<div class="adapter-connection-config" data-adapter-type="siteplug">
+    <div class="form-section">
+        <h3>Siteplug SSP API Configuration</h3>
+        <p style="color: #6b7280; font-size: 0.875rem; margin-bottom: 1.5rem;">
+            Connect to the Siteplug SSP Tech API. You will need your API base URL and API key
+            from your Siteplug account.
+        </p>
+
+        <div class="form-group">
+            <label for="siteplug_base_url">SSP API Base URL *</label>
+            <input type="text" id="siteplug_base_url" name="siteplug_base_url"
+                   value="{{ adapter_config.get('base_url', 'https://api.siteplug.com/ssp/v1') if adapter_config else 'https://api.siteplug.com/ssp/v1' }}"
+                   placeholder="https://api.siteplug.com/ssp/v1"
+                   class="form-control">
+            <small style="color: #6b7280;">The base URL for the Siteplug SSP Tech API</small>
+        </div>
+
+        <div class="form-group">
+            <label for="siteplug_api_key">API Key *</label>
+            <input type="password" id="siteplug_api_key" name="siteplug_api_key"
+                   value="{{ adapter_config.get('api_key', '') if adapter_config else '' }}"
+                   placeholder="Your Siteplug X-API-Key"
+                   class="form-control">
+            <small style="color: #6b7280;">X-API-Key header value for SSP API authentication</small>
+        </div>
+
+        <div class="form-group">
+            <label for="siteplug_manual_approval_required">
+                <input type="checkbox" id="siteplug_manual_approval_required"
+                       name="siteplug_manual_approval_required"
+                       {% if adapter_config and adapter_config.get('manual_approval_required', True) %}checked{% endif %}>
+                Require manual approval for media buys
+            </label>
+            <small style="display: block; margin-top: 0.25rem; color: #6b7280;">
+                When enabled, media buys will require human approval before being activated in Siteplug
+            </small>
+        </div>
+
+        <div style="display: flex; gap: 1rem; margin-top: 1.5rem; align-items: center;">
+            <button type="button" onclick="saveSiteplugConfig()" class="btn btn-primary">
+                Save Configuration
+            </button>
+            <button type="button" onclick="testSiteplugConnection()" class="btn btn-secondary">
+                Test Connection
+            </button>
+            <span id="siteplug-connection-status" style="font-size: 0.875rem;"></span>
+        </div>
+    </div>
+</div>
+
+<script>
+const scriptRoot = window.scriptRoot || '';
+
+function saveSiteplugConfig() {
+    const tenantId = '{{ tenant_id }}';
+    const config = {
+        base_url: document.getElementById('siteplug_base_url').value,
+        api_key: document.getElementById('siteplug_api_key').value,
+        manual_approval_required: document.getElementById('siteplug_manual_approval_required').checked,
+    };
+
+    fetch(scriptRoot + '/api/tenant/' + tenantId + '/adapters/siteplug/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            adapter_type: 'siteplug',
+            config: config,
+        }),
+    })
+    .then(r => r.json())
+    .then(data => {
+        const el = document.getElementById('siteplug-connection-status');
+        if (data.success) {
+            el.textContent = '✅ Configuration saved';
+            el.style.color = '#10b981';
+        } else {
+            el.textContent = '❌ ' + (data.error || 'Save failed');
+            el.style.color = '#ef4444';
+        }
+    })
+    .catch(err => {
+        const el = document.getElementById('siteplug-connection-status');
+        el.textContent = '❌ Error: ' + err.message;
+        el.style.color = '#ef4444';
+    });
+}
+
+function testSiteplugConnection() {
+    const tenantId = '{{ tenant_id }}';
+    const statusEl = document.getElementById('siteplug-connection-status');
+    const baseUrl = document.getElementById('siteplug_base_url').value;
+    const apiKey = document.getElementById('siteplug_api_key').value;
+
+    statusEl.textContent = '⏳ Testing connection...';
+    statusEl.style.color = '#6b7280';
+
+    fetch(scriptRoot + '/api/tenant/' + tenantId + '/adapters/siteplug/test-connection', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ base_url: baseUrl, api_key: apiKey }),
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.success) {
+            statusEl.textContent = '✅ Connection successful';
+            statusEl.style.color = '#10b981';
+        } else {
+            statusEl.textContent = '❌ ' + (data.error || 'Connection failed');
+            statusEl.style.color = '#ef4444';
+        }
+    })
+    .catch(err => {
+        statusEl.textContent = '❌ Error: ' + err.message;
+        statusEl.style.color = '#ef4444';
+    });
+}
+</script>

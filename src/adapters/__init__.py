@@ -11,6 +11,7 @@ from .creative_engine import CreativeEngineAdapter
 from .google_ad_manager import GoogleAdManager as GAMAdapter
 from .kevel import Kevel as KevelAdapter
 from .mock_ad_server import MockAdServer as MockAdapter
+from .siteplug import SiteplugAdapter
 from .triton_digital import TritonDigital as TritonAdapter
 
 # Map of adapter type strings to adapter classes
@@ -20,6 +21,7 @@ ADAPTER_REGISTRY = {
     "broadstreet": BroadstreetAdapter,
     "kevel": KevelAdapter,
     "mock": MockAdapter,
+    "siteplug": SiteplugAdapter,
     "triton": TritonAdapter,
     "triton_digital": TritonAdapter,
     "creative_engine": CreativeEngineAdapter,
