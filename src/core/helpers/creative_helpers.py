@@ -680,7 +680,7 @@ def extract_media_url_and_dimensions(
         - Uses adcp.utils.get_individual_assets() for backward compatibility with assets_required
     """
     # Lazy import to avoid circular dependencies
-    from adcp.types.generated_poc.core.format import Assets
+    from adcp.types import ImageFormatAsset as Assets
     from adcp.utils import get_individual_assets, has_assets
 
     url = None
@@ -805,7 +805,7 @@ def extract_click_url(
         Click-through URL string (optionally with macros substituted), or None if not found.
     """
     # Lazy import to avoid circular dependencies
-    from adcp.types.generated_poc.core.format import Assets
+    from adcp.types import ImageFormatAsset as Assets
     from adcp.utils import get_individual_assets, has_assets
 
     click_url = None
@@ -872,7 +872,7 @@ def extract_impression_tracker_url(creative_data: dict[str, Any], format_spec: A
         Impression tracker URL string or None if not found.
     """
     # Lazy import to avoid circular dependencies
-    from adcp.types.generated_poc.core.format import Assets
+    from adcp.types import ImageFormatAsset as Assets
     from adcp.utils import get_individual_assets, has_assets
 
     tracker_url = None

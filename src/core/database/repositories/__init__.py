@@ -20,12 +20,14 @@ from src.core.database.repositories.adapter_config import AdapterConfigRepositor
 from src.core.database.repositories.currency_limit import CurrencyLimitRepository
 from src.core.database.repositories.media_buy import MediaBuyRepository
 from src.core.database.repositories.product import ProductRepository
+from src.core.database.repositories.push_notification_config import PushNotificationConfigRepository
 from src.core.database.repositories.tenant_config import TenantConfigRepository
 from src.core.database.repositories.tmp_provider import TMPProviderRepository
 from src.core.database.repositories.uow import (
     AccountUoW,
     MediaBuyUoW,
     ProductUoW,
+    PushNotificationConfigUoW,
     TenantConfigUoW,
     TMPProviderUoW,
     WorkflowUoW,
@@ -42,6 +44,8 @@ __all__ = [
     "MediaBuyUoW",
     "ProductRepository",
     "ProductUoW",
+    "PushNotificationConfigRepository",
+    "PushNotificationConfigUoW",
     "TMPProviderRepository",
     "TMPProviderUoW",
     "TenantConfigRepository",
