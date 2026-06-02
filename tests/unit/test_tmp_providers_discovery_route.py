@@ -1,4 +1,4 @@
-"""Unit tests for the FastAPI TMP provider discovery route.
+"""Unit tests for the FastAPI TMP provider discovery route and TMPProvider model.
 
 Tests the endpoint:
     GET /tenant/{tenant_id}/tmp-providers/discovery
@@ -16,12 +16,15 @@ Covers:
 - Fail-closed auth: unset/empty TMP_DISCOVERY_API_KEYS → 503
 - Explicit opt-out: TMP_DISCOVERY_API_KEYS=OPEN disables auth
 - uow.tenant_config is None → 500 (not an assert)
+- TMPProvider.to_dict() serializes both conditional paths correctly
 """
 
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+
+from src.core.database.models import TMPProvider
 
 
 def _make_provider(
@@ -32,12 +35,18 @@ def _make_provider(
     identity_match=True,
     countries=None,
     uid_types=None,
+    properties=None,
     timeout_ms=200,
     priority=0,
     status="active",
-):
-    """Create a mock TMPProvider ORM object with to_dict() support."""
-    p = MagicMock()
+) -> TMPProvider:
+    """Create a real TMPProvider ORM instance (no DB session required).
+
+    Uses the real model so that to_dict() is exercised against the production
+    implementation rather than a MagicMock reimplementation that can silently
+    diverge (e.g. the missing-properties regression that was caught in review).
+    """
+    p = TMPProvider()
     p.provider_id = provider_id
     p.name = name
     p.endpoint = endpoint
@@ -45,32 +54,10 @@ def _make_provider(
     p.identity_match = identity_match
     p.countries = countries
     p.uid_types = uid_types
+    p.properties = properties
     p.timeout_ms = timeout_ms
     p.priority = priority
     p.status = status
-
-    def _to_dict(*, include_conditional=True):
-        result = {
-            "provider_id": provider_id,
-            "name": name,
-            "endpoint": endpoint,
-            "context_match": context_match,
-            "identity_match": identity_match,
-            "timeout_ms": timeout_ms,
-            "priority": priority,
-            "status": status,
-        }
-        if include_conditional:
-            if countries:
-                result["countries"] = countries
-            if uid_types:
-                result["uid_types"] = uid_types
-        else:
-            result["countries"] = countries
-            result["uid_types"] = uid_types
-        return result
-
-    p.to_dict = _to_dict
     return p
 
 
@@ -105,14 +92,24 @@ def _make_tmp_uow(providers):
 
 @pytest.fixture
 def client():
-    """Create a FastAPI TestClient with the tmp_providers router mounted."""
-    from fastapi import FastAPI
+    """Create a FastAPI TestClient with the tmp_providers router and AdCPError handler mounted."""
+    from fastapi import FastAPI, Request
+    from fastapi.responses import JSONResponse
 
+    from src.core.exceptions import AdCPError, build_two_layer_error_envelope
     from src.routes.tmp_providers import router
 
     app = FastAPI()
     app.include_router(router)
-    return TestClient(app)
+
+    @app.exception_handler(AdCPError)
+    async def adcp_error_handler(request: Request, exc: AdCPError) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": build_two_layer_error_envelope(exc)},
+        )
+
+    return TestClient(app, raise_server_exceptions=False)
 
 
 class TestDiscoveryReturnsActiveProviders:
@@ -179,7 +176,8 @@ class TestDiscoveryTenantNotFound:
                 response = client.get("/tenant/nonexistent/tmp-providers/discovery")
 
         assert response.status_code == 404
-        assert "not found" in response.json()["detail"]["message"].lower()
+        error = response.json()["detail"]["errors"][0]
+        assert "not found" in error["message"].lower()
 
 
 class TestDiscoveryEmptyProviders:
@@ -296,26 +294,33 @@ class TestDiscoveryOrdering:
 class TestDiscoveryApiKeyAuth:
     """GET /tenant/{tenant_id}/tmp-providers/discovery enforces TMP_DISCOVERY_API_KEYS."""
 
-    def test_returns_503_when_tmp_discovery_api_keys_not_set(self, client):
-        """When TMP_DISCOVERY_API_KEYS is unset the endpoint returns 503 (fail-closed)."""
+    def test_returns_500_when_tmp_discovery_api_keys_not_set(self, client):
+        """When TMP_DISCOVERY_API_KEYS is unset the endpoint returns 500 (fail-closed, operator must act).
+
+        AdCPConfigurationError (500, correctable) is the right error here: the operator
+        has to configure the env var; the buyer cannot recover this themselves.
+        """
         import os
 
         with patch.dict("os.environ", {}, clear=False):
             os.environ.pop("TMP_DISCOVERY_API_KEYS", None)
             response = client.get("/tenant/si-host/tmp-providers/discovery")
 
-        assert response.status_code == 503
-        detail = response.json()["detail"]
-        assert detail["code"] == "ENDPOINT_NOT_CONFIGURED"
+        assert response.status_code == 500
+        error = response.json()["detail"]["errors"][0]
+        assert error["code"] == "SERVICE_UNAVAILABLE"  # CONFIGURATION_ERROR maps to SERVICE_UNAVAILABLE on wire
 
-    def test_returns_503_when_tmp_discovery_api_keys_is_empty_string(self, client):
-        """When TMP_DISCOVERY_API_KEYS is set to empty string the endpoint returns 503 (fail-closed)."""
+    def test_returns_500_when_tmp_discovery_api_keys_is_empty_string(self, client):
+        """When TMP_DISCOVERY_API_KEYS is set to empty string the endpoint returns 500 (fail-closed).
+
+        Same as unset: AdCPConfigurationError (500, correctable) — operator must act.
+        """
         with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": ""}):
             response = client.get("/tenant/si-host/tmp-providers/discovery")
 
-        assert response.status_code == 503
-        detail = response.json()["detail"]
-        assert detail["code"] == "ENDPOINT_NOT_CONFIGURED"
+        assert response.status_code == 500
+        error = response.json()["detail"]["errors"][0]
+        assert error["code"] == "SERVICE_UNAVAILABLE"  # CONFIGURATION_ERROR maps to SERVICE_UNAVAILABLE on wire
 
     def test_open_when_tmp_discovery_api_keys_is_open(self, client):
         """When TMP_DISCOVERY_API_KEYS=OPEN the endpoint is accessible without a key."""
@@ -433,8 +438,12 @@ class TestDiscoveryApiKeyAuth:
 class TestDiscoveryTenantConfigUnavailable:
     """GET /tenant/{tenant_id}/tmp-providers/discovery returns 500 when tenant_config repo is None."""
 
-    def test_returns_500_when_tenant_config_is_none(self, client):
-        """If TenantConfigUoW yields uow.tenant_config=None the endpoint returns 500, not AssertionError."""
+    def test_returns_503_when_tenant_config_is_none(self, client):
+        """If TenantConfigUoW yields uow.tenant_config=None the endpoint returns 503 (service unavailable).
+
+        AdCPServiceUnavailableError (503, transient) is the right error here: the
+        repository layer is temporarily unavailable; the buyer should retry.
+        """
         mock_uow = MagicMock()
         mock_uow.tenant_config = None  # simulate broken UoW
         mock_uow_cls = MagicMock()
@@ -445,6 +454,166 @@ class TestDiscoveryTenantConfigUnavailable:
             with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
                 response = client.get("/tenant/si-host/tmp-providers/discovery")
 
-        assert response.status_code == 500
-        detail = response.json()["detail"]
-        assert detail["code"] == "INTERNAL_ERROR"
+        assert response.status_code == 503
+        error = response.json()["detail"]["errors"][0]
+        assert error["code"] == "SERVICE_UNAVAILABLE"
+
+
+# ---------------------------------------------------------------------------
+# TMPProvider.to_dict() unit tests (no DB required)
+# ---------------------------------------------------------------------------
+
+
+class TestTMPProviderToDict:
+    """TMPProvider.to_dict() serializes both conditional paths correctly.
+
+    These tests use real TMPProvider instances (no DB session) to ensure the
+    production serialization contract is tested directly — not a MagicMock
+    reimplementation that can silently diverge.
+    """
+
+    def test_include_conditional_true_omits_none_fields(self):
+        """include_conditional=True (default) omits countries/uid_types/properties when None."""
+        p = _make_provider(countries=None, uid_types=None, properties=None)
+        result = p.to_dict(include_conditional=True)
+        assert "countries" not in result
+        assert "uid_types" not in result
+        assert "properties" not in result
+
+    def test_include_conditional_true_includes_non_none_fields(self):
+        """include_conditional=True includes countries/uid_types/properties when set."""
+        p = _make_provider(countries=["US", "GB"], uid_types=["uid2"], properties=["rid-1"])
+        result = p.to_dict(include_conditional=True)
+        assert result["countries"] == ["US", "GB"]
+        assert result["uid_types"] == ["uid2"]
+        assert result["properties"] == ["rid-1"]
+
+    def test_include_conditional_false_always_includes_fields(self):
+        """include_conditional=False always includes countries/uid_types/properties (even as None)."""
+        p = _make_provider(countries=None, uid_types=None, properties=None)
+        result = p.to_dict(include_conditional=False)
+        assert "countries" in result
+        assert result["countries"] is None
+        assert "uid_types" in result
+        assert result["uid_types"] is None
+        assert "properties" in result
+        assert result["properties"] is None
+
+    def test_include_conditional_false_with_values(self):
+        """include_conditional=False includes populated countries/uid_types/properties."""
+        p = _make_provider(countries=["DE"], uid_types=["id5"], properties=["rid-2", "rid-3"])
+        result = p.to_dict(include_conditional=False)
+        assert result["countries"] == ["DE"]
+        assert result["uid_types"] == ["id5"]
+        assert result["properties"] == ["rid-2", "rid-3"]
+
+    def test_core_fields_always_present(self):
+        """Core fields are always present regardless of include_conditional."""
+        p = _make_provider(
+            provider_id="test-uuid",
+            name="Test Provider",
+            endpoint="http://example.com",
+            context_match=False,
+            identity_match=True,
+            timeout_ms=300,
+            priority=2,
+            status="draining",
+        )
+        for include_conditional in (True, False):
+            result = p.to_dict(include_conditional=include_conditional)
+            assert result["provider_id"] == "test-uuid"
+            assert result["name"] == "Test Provider"
+            assert result["endpoint"] == "http://example.com"
+            assert result["context_match"] is False
+            assert result["identity_match"] is True
+            assert result["timeout_ms"] == 300
+            assert result["priority"] == 2
+            assert result["status"] == "draining"
+
+    def test_discovery_endpoint_uses_include_conditional_false(self, client):
+        """The discovery endpoint calls to_dict(include_conditional=False) so null fields are explicit."""
+        tenant = _make_tenant()
+        providers = [_make_provider(countries=None, uid_types=None, properties=None)]
+
+        mock_tenant_uow_cls = _make_tenant_uow(tenant)
+        mock_tmp_uow_cls = _make_tmp_uow(providers)
+
+        with patch("src.routes.tmp_providers.TenantConfigUoW", mock_tenant_uow_cls):
+            with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
+                with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
+                    response = client.get("/tenant/si-host/tmp-providers/discovery")
+
+        assert response.status_code == 200
+        entry = response.json()["providers"][0]
+        # include_conditional=False → null fields must be present (not omitted)
+        assert "countries" in entry
+        assert entry["countries"] is None
+        assert "uid_types" in entry
+        assert entry["uid_types"] is None
+        assert "properties" in entry
+        assert entry["properties"] is None
+
+
+# ---------------------------------------------------------------------------
+# TMPProvider.auth_credentials encryption round-trip and error contract
+# ---------------------------------------------------------------------------
+
+
+class TestTMPProviderAuthCredentials:
+    """TMPProvider.auth_credentials encrypts on write and decrypts on read.
+
+    The property must raise AdCPConfigurationError (not silently return
+    plaintext) when decryption fails — a corrupted ciphertext, a key rotation,
+    or a tampered row must surface as a hard error so the admin can act.
+    """
+
+    def test_round_trip_encrypt_decrypt(self):
+        """Setting auth_credentials encrypts; reading it back decrypts to the original value."""
+        from cryptography.fernet import Fernet
+
+        key = Fernet.generate_key().decode()
+        with patch.dict("os.environ", {"ENCRYPTION_KEY": key}):
+            p = TMPProvider()
+            p.provider_id = "test-provider-id"
+            p.auth_credentials = "super-secret-token"
+
+            # The raw column must NOT be the plaintext value
+            assert p._auth_credentials != "super-secret-token"
+            assert p._auth_credentials is not None
+
+            # Reading back through the property must return the original value
+            assert p.auth_credentials == "super-secret-token"
+
+    def test_none_value_returns_none(self):
+        """Setting auth_credentials to None stores None and reads back as None."""
+        p = TMPProvider()
+        p.provider_id = "test-provider-id"
+        p.auth_credentials = None
+        assert p._auth_credentials is None
+        assert p.auth_credentials is None
+
+    def test_corrupted_ciphertext_raises_adcp_configuration_error(self):
+        """A corrupted ciphertext raises AdCPConfigurationError, not a silent plaintext fallback."""
+        from cryptography.fernet import Fernet
+
+        from src.core.exceptions import AdCPConfigurationError
+
+        key = Fernet.generate_key().decode()
+        with patch.dict("os.environ", {"ENCRYPTION_KEY": key}):
+            p = TMPProvider()
+            p.provider_id = "test-provider-id"
+            # Inject a corrupted ciphertext directly into the backing column
+            p._auth_credentials = "not-a-valid-fernet-token"
+
+            with pytest.raises(AdCPConfigurationError) as exc_info:
+                _ = p.auth_credentials
+
+        assert "test-provider-id" in str(exc_info.value)
+
+    def test_empty_string_stores_none(self):
+        """Setting auth_credentials to empty string stores None (treated as absent)."""
+        p = TMPProvider()
+        p.provider_id = "test-provider-id"
+        p.auth_credentials = ""
+        assert p._auth_credentials is None
+        assert p.auth_credentials is None

@@ -35,6 +35,7 @@ import httpx
 
 from src.core.database.models import MediaPackage
 from src.core.database.repositories.uow import MediaBuyUoW, TenantConfigUoW, TMPProviderUoW
+from src.services._provider_http import bearer_headers, provider_url
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +122,12 @@ def _build_package_payload(
     }
 
 
+# Module-level aliases kept for backward-compat with tests that import them directly.
+# The canonical implementations live in src/services/_provider_http.py.
+_provider_url = provider_url
+_bearer_headers = bearer_headers
+
+
 def _post_packages_sync(endpoint: str, payloads: list[dict[str, Any]], auth_credentials: str = "") -> None:
     """POST /packages/sync to a single TMP Provider endpoint.
 
@@ -131,14 +138,15 @@ def _post_packages_sync(endpoint: str, payloads: list[dict[str, Any]], auth_cred
     ``Authorization: Bearer <credentials>``.  The TMP Provider resolves
     the tenant server-side from the credential.
 
+    ``follow_redirects=False`` prevents SSRF via open-redirect on the POST
+    side (matching the GET-side guard in the health probe).
+
     Raises httpx.HTTPError on non-2xx responses so the caller can log and
     continue to the next provider.
     """
-    url = endpoint.rstrip("/") + "/packages/sync"
-    headers: dict[str, str] = {}
-    if auth_credentials:
-        headers["Authorization"] = f"Bearer {auth_credentials}"
-    with httpx.Client(timeout=_SYNC_TIMEOUT_S) as client:
+    url = _provider_url(endpoint, "/packages/sync")
+    headers = _bearer_headers(auth_credentials)
+    with httpx.Client(timeout=_SYNC_TIMEOUT_S, follow_redirects=False) as client:
         resp = client.post(url, json=payloads, headers=headers)
         resp.raise_for_status()
     logger.info(

@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import logging
 
-import requests
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
 
 from src.admin.utils import require_tenant_access
@@ -262,21 +261,17 @@ def edit_tmp_provider(tenant_id, provider_id):
                 flash("TMP provider not found", "error")
                 return redirect(url_for("tmp_providers.list_tmp_providers", tenant_id=tenant_id))
 
-            provider_dict = {
-                "provider_id": provider.provider_id,
-                "name": provider.name,
-                "endpoint": provider.endpoint,
-                "context_match": provider.context_match,
-                "identity_match": provider.identity_match,
-                "countries": ",".join(provider.countries or []),
-                "uid_types": ",".join(provider.uid_types or []),
-                "properties": ",".join(provider.properties or []),
-                "timeout_ms": provider.timeout_ms,
-                "priority": provider.priority,
-                "status": provider.status,
-                "auth_type": provider.auth_type,
-                "auth_credentials": provider.auth_credentials,
-            }
+            provider_dict = provider.to_dict(include_conditional=False)
+            # Form fields need comma-separated strings, not lists
+            provider_dict["countries"] = ",".join(provider.countries or [])
+            provider_dict["uid_types"] = ",".join(provider.uid_types or [])
+            provider_dict["properties"] = ",".join(provider.properties or [])
+            # Auth fields are not in to_dict() (sensitive / not part of TMP Router contract).
+            # Render a placeholder instead of the plaintext credential so it is never
+            # echoed back to the browser — the POST side preserves the existing value
+            # when the field is left empty.
+            provider_dict["auth_type"] = provider.auth_type
+            provider_dict["auth_credentials"] = "••••••••" if provider.auth_credentials else ""
 
             return render_template(
                 "tmp_provider_form.html",
@@ -303,24 +298,25 @@ def edit_tmp_provider(tenant_id, provider_id):
                     url_for("tmp_providers.edit_tmp_provider", tenant_id=tenant_id, provider_id=provider_id)
                 )
 
-            uow.tmp_providers.update_fields(
-                provider_id,
-                name=data["name"],
-                endpoint=data["endpoint"],
-                context_match=data["context_match"],
-                identity_match=data["identity_match"],
-                countries=data["countries"],
-                uid_types=data["uid_types"],
-                properties=data["properties"],
-                timeout_ms=data["timeout_ms"],
-                priority=data["priority"],
-                status=data["status"],
-                auth_type=data["auth_type"],
-            )
-
-            # Only update credentials if a new non-empty value was provided
+            # Build kwargs — only include auth_credentials when a new non-empty
+            # value was submitted (preserves existing encrypted value otherwise).
+            update_kwargs: dict = {
+                "name": data["name"],
+                "endpoint": data["endpoint"],
+                "context_match": data["context_match"],
+                "identity_match": data["identity_match"],
+                "countries": data["countries"],
+                "uid_types": data["uid_types"],
+                "properties": data["properties"],
+                "timeout_ms": data["timeout_ms"],
+                "priority": data["priority"],
+                "status": data["status"],
+                "auth_type": data["auth_type"],
+            }
             if data["auth_credentials"]:
-                provider.auth_credentials = data["auth_credentials"]
+                update_kwargs["auth_credentials"] = data["auth_credentials"]
+
+            uow.tmp_providers.update_fields(provider_id, **update_kwargs)
 
             flash(f"TMP provider '{data['name']}' updated successfully", "success")
             return redirect(url_for("tmp_providers.list_tmp_providers", tenant_id=tenant_id))
@@ -377,13 +373,12 @@ def delete_tmp_provider(tenant_id, provider_id):
 @log_admin_action("health_check_tmp_provider")
 @require_tenant_access()
 def health_check_tmp_provider(tenant_id, provider_id):
-    """HTTP GET to provider.endpoint/health — returns JSON status.
+    """Return the last health-check result from the background scheduler.
 
-    .. warning:: Worker starvation risk
-
-       This performs a **synchronous** HTTP call in the request handler,
-       blocking the worker thread for up to 5 s.  If the provider is slow
-       or unreachable, this stalls the admin UI for the requesting user.
+    The TMP health scheduler polls each provider's ``/health`` endpoint
+    every 60 s and writes the result to ``health_status`` /
+    ``last_health_checked_at``.  This route reads from the DB — no live
+    HTTP call, no worker starvation risk.
     """
     try:
         with TMPProviderUoW(tenant_id) as uow:
@@ -392,20 +387,26 @@ def health_check_tmp_provider(tenant_id, provider_id):
             if not provider:
                 return jsonify({"error": "TMP provider not found"}), 404
 
-            health_url = provider.endpoint.rstrip("/") + "/health"
+            if provider.health_status is None:
+                return jsonify(
+                    {
+                        "success": True,
+                        "status": "pending",
+                        "provider": provider.name,
+                        "message": "Health check has not run yet",
+                    }
+                )
 
-            # SSRF validation was already applied when the endpoint was
-            # registered (add/edit routes). The stored URL is trusted.
-            # allow_redirects=False prevents SSRF via open-redirect even
-            # though the base URL was validated at registration time.
-            try:
-                resp = requests.get(health_url, timeout=5, allow_redirects=False)
-                if resp.status_code == 200:
-                    return jsonify({"success": True, "status": "healthy", "provider": provider.name})
-                else:
-                    return jsonify({"success": False, "status": f"HTTP {resp.status_code}", "provider": provider.name})
-            except requests.RequestException as req_err:
-                return jsonify({"success": False, "error": str(req_err), "provider": provider.name})
+            return jsonify(
+                {
+                    "success": provider.health_status == "healthy",
+                    "status": provider.health_status,
+                    "provider": provider.name,
+                    "last_checked": (
+                        provider.last_health_checked_at.isoformat() if provider.last_health_checked_at else None
+                    ),
+                }
+            )
 
     except Exception as e:
         logger.error("Error checking TMP provider health: %s", e, exc_info=True)

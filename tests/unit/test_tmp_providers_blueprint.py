@@ -481,16 +481,17 @@ class TestTMPProviderDelete:
 
 
 class TestTMPProviderHealthCheck:
-    """Health check endpoint calls provider.endpoint/health."""
+    """Health check endpoint reads from DB (background scheduler writes health_status)."""
 
-    def test_health_check_returns_healthy(self):
-        """GET /tmp-providers/<id>/health returns healthy when endpoint responds 200."""
+    def test_health_check_returns_healthy_from_db(self):
+        """GET /tmp-providers/<id>/health returns healthy when health_status='healthy'."""
+        from datetime import UTC, datetime
+
         client = _make_tmp_provider_client()
 
         existing_provider = _make_mock_provider()
-
-        mock_response = MagicMock()
-        mock_response.status_code = 200
+        existing_provider.health_status = "healthy"
+        existing_provider.last_health_checked_at = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
 
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW") as mock_uow_cls:
             mock_uow = MagicMock()
@@ -498,26 +499,26 @@ class TestTMPProviderHealthCheck:
             mock_uow.tmp_providers.get_by_id.return_value = existing_provider
             mock_uow_cls.return_value.__enter__ = MagicMock(return_value=mock_uow)
             mock_uow_cls.return_value.__exit__ = MagicMock(return_value=False)
-            with patch("src.admin.blueprints.tmp_providers.requests.get", return_value=mock_response) as mock_get:
-                with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                    response = client.get(
-                        "/tenant/default/tmp-providers/test-uuid-1234/health",
-                    )
+            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
+                response = client.get(
+                    "/tenant/default/tmp-providers/test-uuid-1234/health",
+                )
 
         assert response.status_code == 200
         data = response.get_json()
         assert data["success"] is True
         assert data["status"] == "healthy"
-        mock_get.assert_called_once_with("https://provider.example.com/tmp/health", timeout=5, allow_redirects=False)
+        assert data["last_checked"] is not None
 
-    def test_health_check_returns_unhealthy_on_non_200(self):
-        """GET /tmp-providers/<id>/health returns unhealthy when endpoint responds non-200."""
+    def test_health_check_returns_unhealthy_from_db(self):
+        """GET /tmp-providers/<id>/health returns unhealthy when health_status='unhealthy'."""
+        from datetime import UTC, datetime
+
         client = _make_tmp_provider_client()
 
         existing_provider = _make_mock_provider()
-
-        mock_response = MagicMock()
-        mock_response.status_code = 503
+        existing_provider.health_status = "unhealthy"
+        existing_provider.last_health_checked_at = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
 
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW") as mock_uow_cls:
             mock_uow = MagicMock()
@@ -525,24 +526,23 @@ class TestTMPProviderHealthCheck:
             mock_uow.tmp_providers.get_by_id.return_value = existing_provider
             mock_uow_cls.return_value.__enter__ = MagicMock(return_value=mock_uow)
             mock_uow_cls.return_value.__exit__ = MagicMock(return_value=False)
-            with patch("src.admin.blueprints.tmp_providers.requests.get", return_value=mock_response):
-                with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                    response = client.get(
-                        "/tenant/default/tmp-providers/test-uuid-1234/health",
-                    )
+            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
+                response = client.get(
+                    "/tenant/default/tmp-providers/test-uuid-1234/health",
+                )
 
         assert response.status_code == 200
         data = response.get_json()
         assert data["success"] is False
-        assert "503" in data["status"]
+        assert data["status"] == "unhealthy"
 
-    def test_health_check_returns_error_on_connection_failure(self):
-        """GET /tmp-providers/<id>/health returns error when endpoint is unreachable."""
-        import requests as req_lib
-
+    def test_health_check_returns_pending_when_never_checked(self):
+        """GET /tmp-providers/<id>/health returns pending when health_status is None."""
         client = _make_tmp_provider_client()
 
         existing_provider = _make_mock_provider()
+        existing_provider.health_status = None
+        existing_provider.last_health_checked_at = None
 
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW") as mock_uow_cls:
             mock_uow = MagicMock()
@@ -550,19 +550,15 @@ class TestTMPProviderHealthCheck:
             mock_uow.tmp_providers.get_by_id.return_value = existing_provider
             mock_uow_cls.return_value.__enter__ = MagicMock(return_value=mock_uow)
             mock_uow_cls.return_value.__exit__ = MagicMock(return_value=False)
-            with patch(
-                "src.admin.blueprints.tmp_providers.requests.get",
-                side_effect=req_lib.ConnectionError("Connection refused"),
-            ):
-                with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                    response = client.get(
-                        "/tenant/default/tmp-providers/test-uuid-1234/health",
-                    )
+            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
+                response = client.get(
+                    "/tenant/default/tmp-providers/test-uuid-1234/health",
+                )
 
         assert response.status_code == 200
         data = response.get_json()
-        assert data["success"] is False
-        assert "error" in data
+        assert data["success"] is True
+        assert data["status"] == "pending"
 
 
 class TestTMPProviderAuthFields:
@@ -620,6 +616,21 @@ class TestTMPProviderAuthFields:
         existing_provider = _make_mock_provider()
         existing_provider.auth_type = "bearer"
         existing_provider.auth_credentials = "stored-token"
+        # Production calls provider.to_dict(include_conditional=False) which must
+        # return a real dict — wire the mock accordingly.
+        existing_provider.to_dict.return_value = {
+            "provider_id": existing_provider.provider_id,
+            "name": existing_provider.name,
+            "endpoint": existing_provider.endpoint,
+            "context_match": existing_provider.context_match,
+            "identity_match": existing_provider.identity_match,
+            "countries": ["US", "GB"],
+            "uid_types": ["uid2", "id5"],
+            "properties": None,
+            "timeout_ms": existing_provider.timeout_ms,
+            "priority": existing_provider.priority,
+            "status": existing_provider.status,
+        }
 
         mock_tenant = MagicMock()
         mock_tenant.tenant_id = "default"
@@ -641,6 +652,10 @@ class TestTMPProviderAuthFields:
                     )
 
         assert response.status_code == 200
+        # Production calls to_dict(include_conditional=False) then overwrites
+        # list fields with comma-separated strings and adds auth fields with
+        # placeholder masking (credentials are never echoed back to the browser).
+        existing_provider.to_dict.assert_called_once_with(include_conditional=False)
         mock_render.assert_called_once_with(
             "tmp_provider_form.html",
             tenant=mock_tenant,
@@ -652,14 +667,14 @@ class TestTMPProviderAuthFields:
                 "endpoint": existing_provider.endpoint,
                 "context_match": existing_provider.context_match,
                 "identity_match": existing_provider.identity_match,
-                "countries": ",".join(existing_provider.countries or []),
-                "uid_types": ",".join(existing_provider.uid_types or []),
-                "properties": ",".join(existing_provider.properties or []),
+                "countries": "US,GB",
+                "uid_types": "uid2,id5",
+                "properties": "",
                 "timeout_ms": existing_provider.timeout_ms,
                 "priority": existing_provider.priority,
                 "status": existing_provider.status,
                 "auth_type": "bearer",
-                "auth_credentials": "stored-token",
+                "auth_credentials": "••••••••",
             },
             script_name="",
         )
@@ -698,8 +713,23 @@ class TestTMPProviderAuthFields:
                     )
 
         assert response.status_code == 302
-        # auth_credentials must NOT have been overwritten on the provider object
-        assert existing_provider.auth_credentials == "existing-secret"
+        # Production uses update_fields() — verify auth_credentials was NOT
+        # included in the kwargs (empty submission preserves existing value).
+        mock_uow.tmp_providers.update_fields.assert_called_once_with(
+            "test-uuid-1234",
+            name="Existing Provider",
+            endpoint="https://provider.example.com/tmp",
+            context_match=True,
+            identity_match=True,
+            countries=["US"],
+            uid_types=["uid2"],
+            properties=None,
+            timeout_ms=50,
+            priority=0,
+            status="active",
+            auth_type="bearer",
+            # auth_credentials intentionally absent — empty submission preserves existing value
+        )
 
     def test_edit_post_updates_credentials_when_new_value_submitted(self):
         """POST /tmp-providers/<id>/edit with non-empty auth_credentials updates the value."""
@@ -735,7 +765,23 @@ class TestTMPProviderAuthFields:
                     )
 
         assert response.status_code == 302
-        assert existing_provider.auth_credentials == "new-secret"
+        # Production uses update_fields() — verify auth_credentials IS included
+        # with the new value when a non-empty credential is submitted.
+        mock_uow.tmp_providers.update_fields.assert_called_once_with(
+            "test-uuid-1234",
+            name="Existing Provider",
+            endpoint="https://provider.example.com/tmp",
+            context_match=True,
+            identity_match=True,
+            countries=["US"],
+            uid_types=["uid2"],
+            properties=None,
+            timeout_ms=50,
+            priority=0,
+            status="active",
+            auth_type="bearer",
+            auth_credentials="new-secret",
+        )
 
 
 class TestTMPProviderToDict:
