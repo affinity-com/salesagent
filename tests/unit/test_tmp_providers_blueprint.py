@@ -715,10 +715,20 @@ class TestTMPProviderAuthFields:
         assert response.status_code == 302
         # Production uses update_fields() — verify auth_credentials was NOT
         # included in the kwargs (empty submission preserves existing value).
-        mock_uow.tmp_providers.update_fields.assert_called_once()
-        call_kwargs = mock_uow.tmp_providers.update_fields.call_args
-        assert "auth_credentials" not in call_kwargs.kwargs, (
-            "Empty auth_credentials should not be passed to update_fields"
+        mock_uow.tmp_providers.update_fields.assert_called_once_with(
+            "test-uuid-1234",
+            name="Existing Provider",
+            endpoint="https://provider.example.com/tmp",
+            context_match=True,
+            identity_match=True,
+            countries=["US"],
+            uid_types=["uid2"],
+            properties=None,
+            timeout_ms=50,
+            priority=0,
+            status="active",
+            auth_type="bearer",
+            # auth_credentials intentionally absent — empty submission preserves existing value
         )
 
     def test_edit_post_updates_credentials_when_new_value_submitted(self):

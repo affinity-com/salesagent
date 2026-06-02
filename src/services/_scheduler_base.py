@@ -9,37 +9,59 @@ This base extracts that scaffold so each concrete scheduler only overrides ``tic
 Usage::
 
     class MyScheduler(IntervalScheduler):
+        _env_var = "MY_INTERVAL_SECONDS"
+        _default_interval = 60
+        _scheduler_name = "my"
+
         async def tick(self) -> None:
             await do_work()
 
     _scheduler: MyScheduler | None = None
 
     def get_my_scheduler() -> MyScheduler:
-        global _scheduler
-        if _scheduler is None:
-            _scheduler = MyScheduler(interval_seconds=60, name="my")
-        return _scheduler
+        return MyScheduler.get_singleton()
 """
 
 from __future__ import annotations
 
+import abc
 import asyncio
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
 
-class IntervalScheduler:
+def _parse_interval_env(env_var: str, default: int) -> int:
+    """Parse an integer interval from an environment variable.
+
+    Wraps the conversion in try/except so a bad value (e.g. ``"sixty"``) does
+    not crash the process at import time before lifespan startup can report the
+    error.  Returns *default* and logs a warning on bad input.
+    """
+    try:
+        return int(os.getenv(env_var) or str(default))
+    except (ValueError, TypeError):
+        logger.warning(
+            "%s is not a valid integer — defaulting to %ds",
+            env_var,
+            default,
+        )
+        return default
+
+
+class IntervalScheduler(abc.ABC):
     """Background scheduler that calls ``tick()`` on a fixed cadence.
 
     Subclasses must implement :meth:`tick`.  The scaffold handles:
     - Singleton-safe ``start`` / ``stop`` with an asyncio lock.
-    - ``CancelledError`` propagation so shutdown is clean.
+    - ``CancelledError`` propagation so shutdown is clean and fast.
     - Exception isolation: an unhandled error in ``tick`` is logged but does
       not kill the loop.
-    - The sleep always runs in ``finally`` so the cadence is maintained even
-      when ``tick`` raises.  When the task is cancelled, ``asyncio.sleep``
-      raises ``CancelledError`` immediately so shutdown is not delayed.
+    - The sleep runs *after* the try/except block (not in ``finally``) so that
+      a pending cancellation is not delayed by a full interval sleep.  When the
+      task is cancelled, ``asyncio.sleep`` raises ``CancelledError`` immediately
+      and the loop exits without waiting for the next tick.
 
     Args:
         interval_seconds: Seconds to sleep between ticks.
@@ -82,12 +104,28 @@ class IntervalScheduler:
             logger.info("%s scheduler stopped", self._name)
 
     async def _run_scheduler(self) -> None:
-        """Main scheduler loop — runs on a fixed cadence."""
+        """Main scheduler loop — runs on a fixed cadence.
+
+        The sleep is placed *after* the try/except block, not in ``finally``.
+        This means:
+        - A ``CancelledError`` raised inside ``tick()`` propagates immediately
+          (re-raised after ``break``), so the task exits without sleeping.
+        - A ``CancelledError`` raised inside ``asyncio.sleep`` also propagates
+          immediately — the task exits without waiting for the next interval.
+        - An unhandled exception in ``tick()`` is logged and the loop continues
+          after the normal inter-tick sleep.
+
+        Contrast with the ``finally: sleep`` pattern: that pattern clears the
+        pending cancellation when ``CancelledError`` is caught in the ``except``
+        clause, then runs the full sleep before the task can exit — causing
+        shutdown lag equal to the interval (up to 3600 s for the webhook
+        scheduler).
+        """
         while self.is_running:
             try:
                 await self.tick()
             except asyncio.CancelledError:
-                break
+                raise
             except Exception as exc:
                 logger.error(
                     "Error in %s scheduler: %s",
@@ -95,9 +133,8 @@ class IntervalScheduler:
                     exc,
                     exc_info=True,
                 )
-            finally:
-                await asyncio.sleep(self._interval_seconds)
+            await asyncio.sleep(self._interval_seconds)
 
+    @abc.abstractmethod
     async def tick(self) -> None:
         """Override in subclasses to perform one unit of work."""
-        raise NotImplementedError

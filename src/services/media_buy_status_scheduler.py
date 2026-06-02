@@ -11,7 +11,6 @@ before their start date.
 """
 
 import logging
-import os
 from datetime import UTC, datetime
 
 from sqlalchemy import select
@@ -19,16 +18,12 @@ from sqlalchemy import select
 from src.core.database.database_session import get_db_session
 from src.core.database.models import Creative, CreativeAssignment, MediaBuy
 from src.core.database.repositories import MediaBuyRepository
-from src.services._scheduler_base import IntervalScheduler
+from src.services._scheduler_base import IntervalScheduler, _parse_interval_env
 
 logger = logging.getLogger(__name__)
 
 # Configurable via env var - default 60 seconds
-try:
-    STATUS_CHECK_INTERVAL_SECONDS: int = int(os.getenv("MEDIA_BUY_STATUS_CHECK_INTERVAL") or "60")
-except (ValueError, TypeError):
-    logger.warning("MEDIA_BUY_STATUS_CHECK_INTERVAL is not a valid integer — defaulting to 60s")
-    STATUS_CHECK_INTERVAL_SECONDS = 60
+STATUS_CHECK_INTERVAL_SECONDS: int = _parse_interval_env("MEDIA_BUY_STATUS_CHECK_INTERVAL", 60)
 
 
 class MediaBuyStatusScheduler(IntervalScheduler):

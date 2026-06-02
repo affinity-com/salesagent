@@ -35,6 +35,7 @@ import httpx
 
 from src.core.database.models import MediaPackage
 from src.core.database.repositories.uow import MediaBuyUoW, TenantConfigUoW, TMPProviderUoW
+from src.services._provider_http import bearer_headers, provider_url
 
 logger = logging.getLogger(__name__)
 
@@ -121,29 +122,10 @@ def _build_package_payload(
     }
 
 
-def _provider_url(endpoint: str, path: str) -> str:
-    """Build a full URL for a TMP Provider path.
-
-    Strips any trailing slash from *endpoint* before joining so callers
-    don't need to remember to normalise the stored value.
-
-    Args:
-        endpoint: Base endpoint URL as stored in the DB (e.g. ``"http://tmp:3000/"``).
-        path: Path to append (e.g. ``"/packages/sync"``).
-    """
-    return endpoint.rstrip("/") + path
-
-
-def _bearer_headers(auth_credentials: str) -> dict[str, str]:
-    """Build HTTP headers for a TMP Provider request.
-
-    Returns an ``Authorization: Bearer`` header when *auth_credentials* is
-    non-empty, otherwise an empty dict.  Centralising this ensures every
-    outbound call inherits the same auth shape — no per-call copy-paste.
-    """
-    if auth_credentials:
-        return {"Authorization": f"Bearer {auth_credentials}"}
-    return {}
+# Module-level aliases kept for backward-compat with tests that import them directly.
+# The canonical implementations live in src/services/_provider_http.py.
+_provider_url = provider_url
+_bearer_headers = bearer_headers
 
 
 def _post_packages_sync(endpoint: str, payloads: list[dict[str, Any]], auth_credentials: str = "") -> None:

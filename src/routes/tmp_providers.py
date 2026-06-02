@@ -47,11 +47,16 @@ from __future__ import annotations
 import logging
 import os
 
-from adcp.server.helpers import adcp_error
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
 from src.core.database.repositories.uow import TenantConfigUoW, TMPProviderUoW
+from src.core.exceptions import (
+    AdCPAccountNotFoundError,
+    AdCPAuthRequiredError,
+    AdCPConfigurationError,
+    AdCPServiceUnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +72,9 @@ async def require_api_key(request: Request) -> None:
     - ``TMP_DISCOVERY_API_KEYS=key1,key2`` — accept those keys only.
     - ``TMP_DISCOVERY_API_KEYS=OPEN`` — disable auth (internal-network-only
       deployments where the operator has made a deliberate choice).
-    - Unset or empty — return HTTP 503 so misconfigured deployments fail loudly
-      instead of silently exposing tenant topology.
+    - Unset or empty — raise ``AdCPConfigurationError`` (500, correctable) so
+      misconfigured deployments fail loudly instead of silently exposing tenant
+      topology.  The operator must act; the buyer cannot recover this.
 
     Accepted headers (first non-empty value wins):
       - ``x-adcp-auth``
@@ -83,17 +89,10 @@ async def require_api_key(request: Request) -> None:
 
     allowed = {k.strip() for k in raw.split(",") if k.strip()}
     if not allowed:
-        raise HTTPException(
-            status_code=503,
-            detail=adcp_error(
-                "SERVICE_UNAVAILABLE",
-                (
-                    "TMP_DISCOVERY_API_KEYS is not configured. "
-                    "Set it to a comma-separated list of API keys, "
-                    "or to 'OPEN' to disable authentication."
-                ),
-                recovery="terminal",
-            ),
+        raise AdCPConfigurationError(
+            "TMP_DISCOVERY_API_KEYS is not configured. "
+            "Set it to a comma-separated list of API keys, "
+            "or to 'OPEN' to disable authentication."
         )
 
     api_key = (
@@ -102,10 +101,7 @@ async def require_api_key(request: Request) -> None:
         or request.headers.get("authorization", "").removeprefix("Bearer ").strip()
     )
     if api_key not in allowed:
-        raise HTTPException(
-            status_code=401,
-            detail=adcp_error("AUTH_REQUIRED", "Authentication required", recovery="correctable"),
-        )
+        raise AdCPAuthRequiredError("Authentication required")
 
 
 @router.get("/tenant/{tenant_id}/tmp-providers/discovery")
@@ -122,15 +118,9 @@ async def tmp_providers_discovery(tenant_id: str, _: None = Depends(require_api_
     """
     with TenantConfigUoW(tenant_id) as uow:
         if uow.tenant_config is None:
-            raise HTTPException(
-                status_code=500,
-                detail=adcp_error("SERVICE_UNAVAILABLE", "Tenant config repository unavailable", recovery="transient"),
-            )
+            raise AdCPServiceUnavailableError("Tenant config repository unavailable")
         if uow.tenant_config.get_tenant() is None:
-            raise HTTPException(
-                status_code=404,
-                detail=adcp_error("ACCOUNT_NOT_FOUND", f"Tenant '{tenant_id}' not found", recovery="terminal"),
-            )
+            raise AdCPAccountNotFoundError(f"Tenant '{tenant_id}' not found")
 
     with TMPProviderUoW(tenant_id) as uow:
         assert uow.tmp_providers is not None

@@ -23,24 +23,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 
 import httpx
 
 from src.core.database.database_session import get_db_session
 from src.core.database.repositories.tmp_provider import TMPProviderRepository
-from src.services._scheduler_base import IntervalScheduler
+from src.services._provider_http import provider_url
+from src.services._scheduler_base import IntervalScheduler, _parse_interval_env
 
 logger = logging.getLogger(__name__)
 
 # Configurable via env var — default 60 seconds.
-# Wrapped in try/except so a bad value (e.g. "sixty") doesn't crash the
-# process at import time before lifespan startup can report the error.
-try:
-    HEALTH_CHECK_INTERVAL_SECONDS: int = int(os.getenv("TMP_HEALTH_CHECK_INTERVAL") or "60")
-except (ValueError, TypeError):
-    logger.warning("TMP_HEALTH_CHECK_INTERVAL is not a valid integer — defaulting to 60s")
-    HEALTH_CHECK_INTERVAL_SECONDS = 60
+HEALTH_CHECK_INTERVAL_SECONDS: int = _parse_interval_env("TMP_HEALTH_CHECK_INTERVAL", 60)
 
 # Per-provider HTTP timeout.  Shorter than the old inline 5 s because
 # the scheduler can afford to mark a slow provider as unhealthy and
@@ -61,7 +55,7 @@ async def _check_provider_health(endpoint: str) -> str:
     ``"error"`` so the caller's ``gather(return_exceptions=True)`` loop never
     sees a raw exception from this coroutine.
     """
-    health_url = endpoint.rstrip("/") + "/health"
+    health_url = provider_url(endpoint, "/health")
     try:
         async with httpx.AsyncClient(
             timeout=HEALTH_CHECK_TIMEOUT_SECONDS,

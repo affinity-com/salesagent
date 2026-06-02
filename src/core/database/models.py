@@ -1362,9 +1362,12 @@ class TMPProvider(Base):
 
         try:
             return decrypt_api_key(self._auth_credentials)
-        except ValueError:
-            # Value may be plaintext from before encryption was added — return as-is.
-            return self._auth_credentials
+        except ValueError as exc:
+            from src.core.exceptions import AdCPConfigurationError
+
+            raise AdCPConfigurationError(
+                f"Failed to decrypt auth credentials for TMP provider {self.provider_id}"
+            ) from exc
 
     @auth_credentials.setter
     def auth_credentials(self, value: str | None) -> None:

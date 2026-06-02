@@ -6,7 +6,6 @@ This runs as a background task and sends reports when GAM data is fresh (after 4
 """
 
 import logging
-import os
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -24,18 +23,14 @@ from src.core.database.models import WebhookDeliveryLog
 from src.core.database.repositories import MediaBuyRepository
 from src.core.schemas import GetMediaBuyDeliveryRequest, GetMediaBuyDeliveryResponse
 from src.core.tools.media_buy_delivery import _get_media_buy_delivery_impl
-from src.services._scheduler_base import IntervalScheduler
+from src.services._scheduler_base import IntervalScheduler, _parse_interval_env
 from src.services.protocol_webhook_service import get_protocol_webhook_service
 
 logger = logging.getLogger(__name__)
 
 # 1 hour because AdCP protocol has frequency options hourly, daily and monthly
 # Configurable via env var for testing
-try:
-    SLEEP_INTERVAL_SECONDS: int = int(os.getenv("DELIVERY_WEBHOOK_INTERVAL") or "3600")
-except (ValueError, TypeError):
-    logger.warning("DELIVERY_WEBHOOK_INTERVAL is not a valid integer — defaulting to 3600s")
-    SLEEP_INTERVAL_SECONDS = 3600
+SLEEP_INTERVAL_SECONDS: int = _parse_interval_env("DELIVERY_WEBHOOK_INTERVAL", 3600)
 
 
 class DeliveryWebhookScheduler(IntervalScheduler):

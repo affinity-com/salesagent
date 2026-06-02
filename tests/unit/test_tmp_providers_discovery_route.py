@@ -1,4 +1,4 @@
-"""Unit tests for the FastAPI TMP provider discovery route.
+"""Unit tests for the FastAPI TMP provider discovery route and TMPProvider model.
 
 Tests the endpoint:
     GET /tenant/{tenant_id}/tmp-providers/discovery
@@ -92,14 +92,24 @@ def _make_tmp_uow(providers):
 
 @pytest.fixture
 def client():
-    """Create a FastAPI TestClient with the tmp_providers router mounted."""
-    from fastapi import FastAPI
+    """Create a FastAPI TestClient with the tmp_providers router and AdCPError handler mounted."""
+    from fastapi import FastAPI, Request
+    from fastapi.responses import JSONResponse
 
+    from src.core.exceptions import AdCPError, build_two_layer_error_envelope
     from src.routes.tmp_providers import router
 
     app = FastAPI()
     app.include_router(router)
-    return TestClient(app)
+
+    @app.exception_handler(AdCPError)
+    async def adcp_error_handler(request: Request, exc: AdCPError) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": build_two_layer_error_envelope(exc)},
+        )
+
+    return TestClient(app, raise_server_exceptions=False)
 
 
 class TestDiscoveryReturnsActiveProviders:
@@ -284,26 +294,33 @@ class TestDiscoveryOrdering:
 class TestDiscoveryApiKeyAuth:
     """GET /tenant/{tenant_id}/tmp-providers/discovery enforces TMP_DISCOVERY_API_KEYS."""
 
-    def test_returns_503_when_tmp_discovery_api_keys_not_set(self, client):
-        """When TMP_DISCOVERY_API_KEYS is unset the endpoint returns 503 (fail-closed)."""
+    def test_returns_500_when_tmp_discovery_api_keys_not_set(self, client):
+        """When TMP_DISCOVERY_API_KEYS is unset the endpoint returns 500 (fail-closed, operator must act).
+
+        AdCPConfigurationError (500, correctable) is the right error here: the operator
+        has to configure the env var; the buyer cannot recover this themselves.
+        """
         import os
 
         with patch.dict("os.environ", {}, clear=False):
             os.environ.pop("TMP_DISCOVERY_API_KEYS", None)
             response = client.get("/tenant/si-host/tmp-providers/discovery")
 
-        assert response.status_code == 503
+        assert response.status_code == 500
         error = response.json()["detail"]["errors"][0]
-        assert error["code"] == "SERVICE_UNAVAILABLE"
+        assert error["code"] == "SERVICE_UNAVAILABLE"  # CONFIGURATION_ERROR maps to SERVICE_UNAVAILABLE on wire
 
-    def test_returns_503_when_tmp_discovery_api_keys_is_empty_string(self, client):
-        """When TMP_DISCOVERY_API_KEYS is set to empty string the endpoint returns 503 (fail-closed)."""
+    def test_returns_500_when_tmp_discovery_api_keys_is_empty_string(self, client):
+        """When TMP_DISCOVERY_API_KEYS is set to empty string the endpoint returns 500 (fail-closed).
+
+        Same as unset: AdCPConfigurationError (500, correctable) — operator must act.
+        """
         with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": ""}):
             response = client.get("/tenant/si-host/tmp-providers/discovery")
 
-        assert response.status_code == 503
+        assert response.status_code == 500
         error = response.json()["detail"]["errors"][0]
-        assert error["code"] == "SERVICE_UNAVAILABLE"
+        assert error["code"] == "SERVICE_UNAVAILABLE"  # CONFIGURATION_ERROR maps to SERVICE_UNAVAILABLE on wire
 
     def test_open_when_tmp_discovery_api_keys_is_open(self, client):
         """When TMP_DISCOVERY_API_KEYS=OPEN the endpoint is accessible without a key."""
@@ -421,8 +438,12 @@ class TestDiscoveryApiKeyAuth:
 class TestDiscoveryTenantConfigUnavailable:
     """GET /tenant/{tenant_id}/tmp-providers/discovery returns 500 when tenant_config repo is None."""
 
-    def test_returns_500_when_tenant_config_is_none(self, client):
-        """If TenantConfigUoW yields uow.tenant_config=None the endpoint returns 500, not AssertionError."""
+    def test_returns_503_when_tenant_config_is_none(self, client):
+        """If TenantConfigUoW yields uow.tenant_config=None the endpoint returns 503 (service unavailable).
+
+        AdCPServiceUnavailableError (503, transient) is the right error here: the
+        repository layer is temporarily unavailable; the buyer should retry.
+        """
         mock_uow = MagicMock()
         mock_uow.tenant_config = None  # simulate broken UoW
         mock_uow_cls = MagicMock()
@@ -433,7 +454,7 @@ class TestDiscoveryTenantConfigUnavailable:
             with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
                 response = client.get("/tenant/si-host/tmp-providers/discovery")
 
-        assert response.status_code == 500
+        assert response.status_code == 503
         error = response.json()["detail"]["errors"][0]
         assert error["code"] == "SERVICE_UNAVAILABLE"
 
@@ -531,3 +552,68 @@ class TestTMPProviderToDict:
         assert entry["uid_types"] is None
         assert "properties" in entry
         assert entry["properties"] is None
+
+
+# ---------------------------------------------------------------------------
+# TMPProvider.auth_credentials encryption round-trip and error contract
+# ---------------------------------------------------------------------------
+
+
+class TestTMPProviderAuthCredentials:
+    """TMPProvider.auth_credentials encrypts on write and decrypts on read.
+
+    The property must raise AdCPConfigurationError (not silently return
+    plaintext) when decryption fails — a corrupted ciphertext, a key rotation,
+    or a tampered row must surface as a hard error so the admin can act.
+    """
+
+    def test_round_trip_encrypt_decrypt(self):
+        """Setting auth_credentials encrypts; reading it back decrypts to the original value."""
+        from cryptography.fernet import Fernet
+
+        key = Fernet.generate_key().decode()
+        with patch.dict("os.environ", {"ENCRYPTION_KEY": key}):
+            p = TMPProvider()
+            p.provider_id = "test-provider-id"
+            p.auth_credentials = "super-secret-token"
+
+            # The raw column must NOT be the plaintext value
+            assert p._auth_credentials != "super-secret-token"
+            assert p._auth_credentials is not None
+
+            # Reading back through the property must return the original value
+            assert p.auth_credentials == "super-secret-token"
+
+    def test_none_value_returns_none(self):
+        """Setting auth_credentials to None stores None and reads back as None."""
+        p = TMPProvider()
+        p.provider_id = "test-provider-id"
+        p.auth_credentials = None
+        assert p._auth_credentials is None
+        assert p.auth_credentials is None
+
+    def test_corrupted_ciphertext_raises_adcp_configuration_error(self):
+        """A corrupted ciphertext raises AdCPConfigurationError, not a silent plaintext fallback."""
+        from cryptography.fernet import Fernet
+
+        from src.core.exceptions import AdCPConfigurationError
+
+        key = Fernet.generate_key().decode()
+        with patch.dict("os.environ", {"ENCRYPTION_KEY": key}):
+            p = TMPProvider()
+            p.provider_id = "test-provider-id"
+            # Inject a corrupted ciphertext directly into the backing column
+            p._auth_credentials = "not-a-valid-fernet-token"
+
+            with pytest.raises(AdCPConfigurationError) as exc_info:
+                _ = p.auth_credentials
+
+        assert "test-provider-id" in str(exc_info.value)
+
+    def test_empty_string_stores_none(self):
+        """Setting auth_credentials to empty string stores None (treated as absent)."""
+        p = TMPProvider()
+        p.provider_id = "test-provider-id"
+        p.auth_credentials = ""
+        assert p._auth_credentials is None
+        assert p.auth_credentials is None
