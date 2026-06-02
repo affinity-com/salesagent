@@ -25,6 +25,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.core.database.models import TMPProvider
+from tests.helpers.envelope_assertions import assert_envelope_shape
 
 
 def _make_provider(
@@ -92,7 +93,13 @@ def _make_tmp_uow(providers):
 
 @pytest.fixture
 def client():
-    """Create a FastAPI TestClient with the tmp_providers router and AdCPError handler mounted."""
+    """Create a FastAPI TestClient with the tmp_providers router and AdCPError handler mounted.
+
+    The handler mirrors the production handler in src/app.py exactly:
+    ``build_two_layer_error_envelope(exc)`` is returned at the top level (no
+    ``"detail"`` wrapper).  Tests assert via ``assert_envelope_shape()`` so
+    that deleting this handler from the production app would break the tests.
+    """
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse
 
@@ -104,9 +111,10 @@ def client():
 
     @app.exception_handler(AdCPError)
     async def adcp_error_handler(request: Request, exc: AdCPError) -> JSONResponse:
+        # Matches src/app.py adcp_error_handler exactly — envelope at top level.
         return JSONResponse(
             status_code=exc.status_code,
-            content={"detail": build_two_layer_error_envelope(exc)},
+            content=build_two_layer_error_envelope(exc),
         )
 
     return TestClient(app, raise_server_exceptions=False)
@@ -176,9 +184,9 @@ class TestDiscoveryTenantNotFound:
                 response = client.get("/tenant/nonexistent/tmp-providers/discovery")
 
         assert response.status_code == 404
-        error = response.json()["detail"]["errors"][0]
-        assert "not found" in error["message"].lower()
-        assert error["details"]["suggestion"] == "Provide a valid tenant ID."
+        envelope = response.json()
+        assert_envelope_shape(envelope, "ACCOUNT_NOT_FOUND", recovery="terminal", message_substr="not found")
+        assert envelope["errors"][0]["details"]["suggestion"] == "Provide a valid tenant ID."
 
 
 class TestDiscoveryEmptyProviders:
@@ -308,8 +316,8 @@ class TestDiscoveryApiKeyAuth:
             response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 500
-        error = response.json()["detail"]["errors"][0]
-        assert error["code"] == "SERVICE_UNAVAILABLE"  # CONFIGURATION_ERROR maps to SERVICE_UNAVAILABLE on wire
+        # CONFIGURATION_ERROR maps to SERVICE_UNAVAILABLE on wire; recovery=correctable (operator must act)
+        assert_envelope_shape(response.json(), "SERVICE_UNAVAILABLE", recovery="correctable")
 
     def test_returns_500_when_tmp_discovery_api_keys_is_empty_string(self, client):
         """When TMP_DISCOVERY_API_KEYS is set to empty string the endpoint returns 500 (fail-closed).
@@ -320,8 +328,8 @@ class TestDiscoveryApiKeyAuth:
             response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 500
-        error = response.json()["detail"]["errors"][0]
-        assert error["code"] == "SERVICE_UNAVAILABLE"  # CONFIGURATION_ERROR maps to SERVICE_UNAVAILABLE on wire
+        # CONFIGURATION_ERROR maps to SERVICE_UNAVAILABLE on wire; recovery=correctable (operator must act)
+        assert_envelope_shape(response.json(), "SERVICE_UNAVAILABLE", recovery="correctable")
 
     def test_open_when_tmp_discovery_api_keys_is_open(self, client):
         """When TMP_DISCOVERY_API_KEYS=OPEN the endpoint is accessible without a key."""
@@ -355,9 +363,10 @@ class TestDiscoveryApiKeyAuth:
             response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 401
-        error = response.json()["detail"]["errors"][0]
+        envelope = response.json()
+        assert_envelope_shape(envelope, "AUTH_TOKEN_INVALID", recovery="terminal")
         assert (
-            error["details"]["suggestion"]
+            envelope["errors"][0]["details"]["suggestion"]
             == "Provide a valid API key via x-adcp-auth, X-API-Key, or Authorization: Bearer <key>."
         )
 
@@ -370,9 +379,10 @@ class TestDiscoveryApiKeyAuth:
             )
 
         assert response.status_code == 401
-        error = response.json()["detail"]["errors"][0]
+        envelope = response.json()
+        assert_envelope_shape(envelope, "AUTH_TOKEN_INVALID", recovery="terminal")
         assert (
-            error["details"]["suggestion"]
+            envelope["errors"][0]["details"]["suggestion"]
             == "Provide a valid API key via x-adcp-auth, X-API-Key, or Authorization: Bearer <key>."
         )
 
@@ -466,8 +476,8 @@ class TestDiscoveryTenantConfigUnavailable:
                 response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 503
-        error = response.json()["detail"]["errors"][0]
-        assert error["code"] == "SERVICE_UNAVAILABLE"
+        # AdCPServiceUnavailableError: recovery=transient (buyer should retry)
+        assert_envelope_shape(response.json(), "SERVICE_UNAVAILABLE", recovery="transient")
 
 
 # ---------------------------------------------------------------------------
