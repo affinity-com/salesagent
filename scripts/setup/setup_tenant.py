@@ -92,6 +92,12 @@ def create_tenant(args):
                 kevel_manual_approval_required=args.manual_approval,
             )
             session.add(adapter_config)
+        elif args.adapter == "siteplug":
+            adapter_config = AdapterConfig(
+                tenant_id=tenant_id,
+                adapter_type="siteplug",
+            )
+            session.add(adapter_config)
         elif args.adapter == "mock":
             adapter_config = AdapterConfig(tenant_id=tenant_id, adapter_type="mock", mock_dry_run=False)
             session.add(adapter_config)
@@ -136,6 +142,8 @@ def create_tenant(args):
             platform_mappings = {"google_ad_manager": {"advertiser_id": ""}}
         elif args.adapter == "kevel":
             platform_mappings = {"kevel": {"advertiser_id": ""}}
+        elif args.adapter == "siteplug":
+            platform_mappings = {"siteplug": {"advertiser_id": f"siteplug_{tenant_id}"}}
         else:
             platform_mappings = {}
 
@@ -216,7 +224,7 @@ def main():
     parser.add_argument("--tenant-id", help="Tenant ID (default: generated from name)")
     parser.add_argument("--subdomain", help="Subdomain (default: same as tenant ID)")
     parser.add_argument(
-        "--adapter", choices=["mock", "google_ad_manager", "kevel"], default="mock", help="Primary ad server adapter"
+        "--adapter", choices=["mock", "google_ad_manager", "kevel", "siteplug"], default="mock", help="Primary ad server adapter"
     )
 
     # Adapter-specific options

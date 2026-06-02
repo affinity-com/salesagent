@@ -363,8 +363,8 @@ class SetupChecklistService:
                 else:
                     ad_server_fully_configured = False
                     config_details = "Mock adapter - Configure a real ad server for production"
-            elif tenant.ad_server in ["kevel", "triton"]:
-                # Other adapters (Kevel, Triton) - assume configured once selected
+            elif tenant.ad_server in ["kevel", "triton", "siteplug"]:
+                # Other adapters (Kevel, Triton, Siteplug) - assume configured once selected
                 ad_server_fully_configured = True
                 config_details = f"{tenant.ad_server} adapter configured"
             else:
@@ -483,8 +483,8 @@ class SetupChecklistService:
                         details=inventory_details,
                     )
                 )
-            elif tenant.ad_server in ["kevel", "triton"]:
-                # Kevel and Triton adapters - mark as complete (inventory configured per product)
+            elif tenant.ad_server in ["kevel", "triton", "siteplug"]:
+                # Kevel, Triton, and Siteplug adapters - mark as complete (inventory configured per product)
                 tasks.append(
                     SetupTask(
                         key="inventory_synced",
@@ -793,7 +793,7 @@ class SetupChecklistService:
                 else:
                     ad_server_fully_configured = False
                     config_details = "Mock adapter - Configure a real ad server for production"
-            elif tenant.ad_server in ["kevel", "triton"]:
+            elif tenant.ad_server in ["kevel", "triton", "siteplug"]:
                 ad_server_fully_configured = True
                 config_details = f"{tenant.ad_server} adapter configured"
             else:
@@ -889,7 +889,7 @@ class SetupChecklistService:
                         ),
                     )
                 )
-            elif tenant.ad_server in ["kevel", "triton"]:
+            elif tenant.ad_server in ["kevel", "triton", "siteplug"]:
                 tasks.append(
                     SetupTask(
                         key="inventory_synced",

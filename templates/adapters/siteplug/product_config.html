@@ -1,0 +1,70 @@
+{# Siteplug adapter product configuration template.
+   Included when configuring a product for the Siteplug adapter.
+#}
+
+<div class="adapter-product-config" data-adapter-type="siteplug">
+    <div class="form-section">
+        <h3>Siteplug Campaign Configuration</h3>
+        <p style="color: #6b7280; font-size: 0.875rem; margin-bottom: 1.5rem;">
+            Configure how campaigns are created in Siteplug when a media buy is executed for this product.
+        </p>
+
+        <div class="form-group">
+            <label for="siteplug_platform_id">Platform ID *</label>
+            <input type="number" id="siteplug_platform_id" name="siteplug_platform_id"
+                   value="{{ product_config.get('platform_id', '') if product_config else '' }}"
+                   placeholder="e.g. 1"
+                   class="form-control">
+            <small style="color: #6b7280;">Siteplug platform ID for this product</small>
+        </div>
+
+        <div class="form-group">
+            <label for="siteplug_brand_id">Brand ID *</label>
+            <input type="number" id="siteplug_brand_id" name="siteplug_brand_id"
+                   value="{{ product_config.get('brand_id', '') if product_config else '' }}"
+                   placeholder="e.g. 42"
+                   class="form-control">
+            <small style="color: #6b7280;">Siteplug brand ID for this product</small>
+        </div>
+
+        <div class="form-group">
+            <label for="siteplug_campaign_type">Campaign Type</label>
+            <select id="siteplug_campaign_type" name="siteplug_campaign_type" class="form-control">
+                {% set ct = product_config.get('campaign_type', 1) if product_config else 1 %}
+                <option value="1" {% if ct == 1 %}selected{% endif %}>1 — Keyword (KW)</option>
+                <option value="2" {% if ct == 2 %}selected{% endif %}>2 — Run of Network (RON)</option>
+                <option value="3" {% if ct == 3 %}selected{% endif %}>3 — Category (CAT)</option>
+                <option value="4" {% if ct == 4 %}selected{% endif %}>4 — Hybrid</option>
+                <option value="5" {% if ct == 5 %}selected{% endif %}>5 — Product Listing Ads (PLA)</option>
+            </select>
+        </div>
+
+        <div class="form-group">
+            <label for="siteplug_pricing_model">Pricing Model</label>
+            <select id="siteplug_pricing_model" name="siteplug_pricing_model" class="form-control">
+                {% set pm = product_config.get('pricing_model', 'cpc') if product_config else 'cpc' %}
+                <option value="cpc" {% if pm == 'cpc' %}selected{% endif %}>CPC — Cost per Click</option>
+                <option value="cpm" {% if pm == 'cpm' %}selected{% endif %}>CPM — Cost per Mille</option>
+                <option value="flat_rate" {% if pm == 'flat_rate' %}selected{% endif %}>Flat Rate</option>
+            </select>
+        </div>
+
+        <div class="form-group">
+            <label for="siteplug_default_bid">Default Bid</label>
+            <input type="number" id="siteplug_default_bid" name="siteplug_default_bid"
+                   value="{{ product_config.get('default_bid', 0.10) if product_config else 0.10 }}"
+                   step="0.01" min="0.01"
+                   class="form-control">
+            <small style="color: #6b7280;">Default CPC/CPM bid amount</small>
+        </div>
+
+        <div class="form-group">
+            <label for="siteplug_default_budget">Default Budget</label>
+            <input type="number" id="siteplug_default_budget" name="siteplug_default_budget"
+                   value="{{ product_config.get('default_budget', 1000.0) if product_config else 1000.0 }}"
+                   step="1" min="1"
+                   class="form-control">
+            <small style="color: #6b7280;">Default campaign budget</small>
+        </div>
+    </div>
+</div>

@@ -851,6 +851,15 @@
                         <h4>Triton Digital</h4>
                         <p>Audio and podcast advertising platform</p>
                     </div>
+
+                    <div class="adapter-card {% if active_adapter == 'siteplug' %}current{% endif %}"
+                         onclick="selectAdapter('siteplug')">
+                        {% if active_adapter == 'siteplug' %}
+                        <span class="adapter-badge">Current</span>
+                        {% endif %}
+                        <h4>Siteplug</h4>
+                        <p>Search, native and display advertising platform</p>
+                    </div>
                 </div>
             </div>
 
