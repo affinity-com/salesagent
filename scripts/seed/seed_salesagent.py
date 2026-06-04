@@ -374,6 +374,84 @@ def seed_authorized_properties(conn, tenant_id, label):
         """, f"{label} publisher_partners seeded")
 
 
+def seed_siteplug_extra_products(conn):
+    """Seed siteplug-specific extra products not covered by the generic seed_products().
+
+    Adds:
+      - siteplug_survey_ad   — Opinary interactive poll widget (survey_ad format)
+      - siteplug_text_ad_search — Sponsored text ads in search/knowledge graph (text_ad_search format)
+
+    Also appends the format IDs to tenants.auto_approve_format_ids so they are
+    auto-approved without human review.
+
+    Idempotent: ON CONFLICT DO NOTHING / WHERE NOT EXISTS guards throughout.
+    Previously these were standalone .sql files piped into psql from the Makefile.
+    """
+    EXTRA_PRODUCTS = [
+        (
+            "siteplug_survey_ad",
+            "SitePlug Survey Ad",
+            "Opinary first-party interactive poll widget for addressable audiences",
+            '[{"id": "survey_ad", "agent_url": "http://creative-agent.localhost:8080"}]',
+            "survey_ad",
+        ),
+        (
+            "siteplug_text_ad_search",
+            "SitePlug Text Ad Search",
+            "Sponsored text ads shown in search autofill and knowledge graph placements",
+            '[{"id": "text_ad_search", "agent_url": "http://creative-agent.localhost:8080"}]',
+            "text_ad_search",
+        ),
+    ]
+
+    for product_id, name, description, format_ids, format_id in EXTRA_PRODUCTS:
+        n = count(conn, f"SELECT COUNT(*) FROM products WHERE tenant_id='siteplug' AND product_id='{product_id}'")
+        if n > 0:
+            print(f"  ✓ siteplug product '{product_id}' already exists — skipping")
+        else:
+            print(f"  Seeding siteplug product '{product_id}'...")
+            run_sql(conn, f"""
+                INSERT INTO products (
+                    tenant_id, product_id, name, description,
+                    format_ids, targeting_template, delivery_type,
+                    delivery_measurement, property_tags
+                ) VALUES (
+                    'siteplug',
+                    '{product_id}',
+                    '{name}',
+                    '{description}',
+                    '{format_ids}'::jsonb,
+                    '{{"geo": {{}}, "audience": {{}}}}'::jsonb,
+                    'non_guaranteed',
+                    '{{"provider": "publisher"}}'::jsonb,
+                    '["all_inventory"]'::jsonb
+                ) ON CONFLICT (tenant_id, product_id) DO NOTHING
+            """, f"siteplug product '{product_id}' seeded")
+
+        po_n = count(conn, f"SELECT COUNT(*) FROM pricing_options WHERE tenant_id='siteplug' AND product_id='{product_id}'")
+        if po_n > 0:
+            print(f"  ✓ siteplug pricing for '{product_id}' already exists — skipping")
+        else:
+            run_sql(conn, f"""
+                INSERT INTO pricing_options (
+                    tenant_id, product_id, pricing_model, rate, currency, is_fixed
+                )
+                SELECT 'siteplug', '{product_id}', 'cpm', 5.00, 'USD', true
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM pricing_options
+                    WHERE tenant_id='siteplug' AND product_id='{product_id}'
+                )
+            """, f"siteplug pricing for '{product_id}' seeded (CPM $5.00)")
+
+        # Append format_id to auto_approve_format_ids if not already present
+        run_sql(conn, f"""
+            UPDATE tenants
+            SET auto_approve_format_ids = COALESCE(auto_approve_format_ids, '[]'::jsonb) || '["{format_id}"]'::jsonb
+            WHERE tenant_id = 'siteplug'
+              AND NOT (COALESCE(auto_approve_format_ids, '[]'::jsonb) @> '["{format_id}"]'::jsonb)
+        """, f"siteplug auto_approve_format_ids updated with '{format_id}'")
+
+
 def seed_tmp_provider(conn):
     n = count(conn, "SELECT COUNT(*) FROM tmp_providers WHERE tenant_id='siteplug'")
     if n > 0:
@@ -706,28 +784,32 @@ def main():
         seed_currency_limits(conn, tenant_id, name)
     print()
 
-    print("Step 6: Seeding tmp_providers for siteplug...")
+    print("Step 6: Seeding siteplug extra products (survey_ad, text_ad_search)...")
+    seed_siteplug_extra_products(conn)
+    print()
+
+    print("Step 7: Seeding tmp_providers for siteplug...")
     seed_tmp_provider(conn)
     print()
 
-    print("Step 7: Registering salesagent as seller-agent on tmp-provider (T7)...")
+    print("Step 8: Registering salesagent as seller-agent on tmp-provider (T7)...")
     api_key = register_seller_agent()
     print()
 
-    print("Step 8: Seeding tmp_providers for acme-outdoor...")
+    print("Step 9: Seeding tmp_providers for acme-outdoor...")
     seed_tmp_provider_acme_outdoor(conn, api_key)
     print()
 
-    print("Step 9: Seeding demo media buy + 10 catalog packages for acme-outdoor...")
+    print("Step 10: Seeding demo media buy + 10 catalog packages for acme-outdoor...")
     seed_media_buy_and_packages(conn)
     print()
 
-    print("Step 10: Syncing acme-outdoor packages to tmp-provider...")
+    print("Step 11: Syncing acme-outdoor packages to tmp-provider...")
     sync_packages_to_tmp_provider(conn)
     conn.close()
     print()
 
-    print("Step 11: Verification...")
+    print("Step 12: Verification...")
     conn2 = get_conn()
     for tenant_id, name, *_ in TENANTS:
         prod_n     = count(conn2, f"SELECT COUNT(*) FROM products WHERE tenant_id='{tenant_id}'")

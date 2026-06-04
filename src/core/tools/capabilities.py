@@ -15,6 +15,7 @@ from adcp.types.generated_poc.enums.channels import MediaChannel
 from adcp.types.generated_poc.enums.specialism import AdcpSpecialism
 from adcp.types.generated_poc.protocol.get_adcp_capabilities_response import (
     Adcp,
+    Creative,
     Execution,
     GeoMetros,
     GeoPostalAreas,
@@ -91,7 +92,7 @@ def _get_adcp_capabilities_impl(
                 major_versions=[MajorVersion(root=3)],
                 idempotency=Idempotency(supported=True, replay_ttl_seconds=86400),
             ),
-            supported_protocols=[SupportedProtocol.media_buy],
+            supported_protocols=[SupportedProtocol.media_buy, SupportedProtocol.creative],
             specialisms=[AdcpSpecialism.sales_non_guaranteed],
         )
 
@@ -264,9 +265,22 @@ def _get_adcp_capabilities_impl(
             major_versions=[MajorVersion(root=3)],
             idempotency=Idempotency(supported=True, replay_ttl_seconds=86400),
         ),
-        supported_protocols=[SupportedProtocol.media_buy],
+        supported_protocols=[SupportedProtocol.media_buy, SupportedProtocol.creative],
         specialisms=[AdcpSpecialism.sales_non_guaranteed],
         media_buy=media_buy,
+        # Creative Protocol capabilities (AdCP 3.0 + 3.1-ready):
+        # - has_creative_library: salesagent hosts list_creatives + sync_creatives so
+        #   buyers can browse and push assets to the library.
+        # - supports_generation: False — salesagent does not generate creatives from
+        #   briefs via build_creative; it manages a pre-built library.
+        # - supports_transformation: False — no format-conversion / resize pipeline.
+        # inline_creative_management (MediaBuyFeatures above) is independent: it
+        # allows attaching creative_id references in create_media_buy / update_media_buy.
+        creative=Creative(
+            has_creative_library=True,
+            supports_generation=False,
+            supports_transformation=False,
+        ),
         last_updated=datetime.now(UTC),
     )
 
