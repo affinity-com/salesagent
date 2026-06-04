@@ -364,25 +364,38 @@ class TestSchedulerLifecycle:
 
     @pytest.mark.asyncio
     async def test_cancelled_error_exits_loop_cleanly(self):
-        """Cancelling the scheduler task exits the loop promptly without waiting a full interval.
+        """Cancellation arriving *inside* tick() must not delay shutdown by the inter-tick interval.
 
-        Drives ``_run_scheduler`` directly with a real asyncio task and a
-        non-zero interval (10 s) so the test would hang for 10 s if the
-        cancellation were swallowed by the loop.  The task must complete
-        (``task.done() and not task.cancelled()``) within a short timeout,
-        proving that ``CancelledError`` is re-raised rather than caught and
-        cleared.
+        ``_scheduler_base.py`` places ``asyncio.sleep`` *outside* the
+        try/except block so that a ``CancelledError`` raised inside ``tick()``
+        is re-raised immediately rather than being absorbed and then followed
+        by a full inter-tick sleep.
+
+        This test pins that contract by making ``tick()`` block on a long
+        ``await asyncio.sleep(60)`` — so the cancel always lands inside
+        ``tick()``, not in the inter-tick sleep.  Under the correct
+        implementation the task exits in ~0 s.  Under the broken shape
+        (``finally: sleep(interval)``), the cancel would be absorbed by the
+        ``except`` clause and the task would sleep for the full 10-second
+        interval before exiting, causing ``elapsed ≈ 10`` and failing the
+        ``< 1.0`` assertion.
         """
+        import contextlib
+
         from src.services._scheduler_base import IntervalScheduler
 
         class _TestScheduler(IntervalScheduler):
             def __init__(self) -> None:
-                # Use a long interval so the test hangs if cancellation is swallowed.
+                # Long inter-tick interval: if cancellation is swallowed the
+                # task sleeps 10 s before exiting, making elapsed ≈ 10.
                 super().__init__(interval_seconds=10, name="test-cancel")
-                self.tick_event = asyncio.Event()
+                self.tick_started = asyncio.Event()
 
             async def tick(self) -> None:
-                self.tick_event.set()
+                self.tick_started.set()
+                # Long await so the cancel always lands inside tick(), not in
+                # the inter-tick sleep.
+                await asyncio.sleep(60)
 
         sched = _TestScheduler()
         sched.is_running = True
@@ -390,22 +403,21 @@ class TestSchedulerLifecycle:
         # Start the loop as a real task (not via start() to avoid the lock).
         task = asyncio.create_task(sched._run_scheduler())
 
-        # Wait until tick has run at least once so the loop is inside asyncio.sleep.
-        await asyncio.wait_for(sched.tick_event.wait(), timeout=2.0)
+        # Wait until tick() has started (and is blocked on its inner sleep).
+        await asyncio.wait_for(sched.tick_started.wait(), timeout=2.0)
 
-        # Cancel the task — with the fixed implementation this should resolve
-        # almost immediately (the sleep raises CancelledError and the loop exits).
+        # Cancel while tick() is awaiting — cancel lands inside tick(), not in the inter-tick sleep.
+        t0 = asyncio.get_event_loop().time()
         task.cancel()
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
-        except (asyncio.CancelledError, TimeoutError):
-            pass
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        elapsed = asyncio.get_event_loop().time() - t0
 
-        # The task must be done and must NOT still be in a cancelled-pending state.
         assert task.done(), "scheduler task did not exit after cancellation"
-        # The task should have exited via CancelledError propagation (cancelled())
-        # or by returning normally — either is acceptable; what is NOT acceptable
-        # is the task still running (done() is False).
+        assert elapsed < 1.0, (
+            f"cancellation took {elapsed:.2f}s — CancelledError inside tick() "
+            "was absorbed and the inter-tick sleep ran to completion"
+        )
 
     @pytest.mark.asyncio
     async def test_exception_in_tick_does_not_kill_loop(self):
