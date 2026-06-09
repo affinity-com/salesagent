@@ -610,69 +610,77 @@ class TestTMPProviderAuthFields:
         )
 
     def test_edit_get_includes_auth_fields_in_provider_dict(self):
-        """GET /tmp-providers/<id>/edit includes auth_type and auth_credentials in template context."""
+        """GET /tmp-providers/<id>/edit includes auth_type and auth_credentials in template context.
+
+        Uses a real TMPProvider instance (not a MagicMock) so that to_dict() is
+        exercised against the production implementation — avoids the missing-properties
+        regression that was caught in review (same pattern as test_tmp_providers_discovery_route.py).
+        """
         client = _make_tmp_provider_client()
 
-        existing_provider = _make_mock_provider()
-        existing_provider.auth_type = "bearer"
-        existing_provider.auth_credentials = "stored-token"
-        # Production calls provider.to_dict(include_conditional=False) which must
-        # return a real dict — wire the mock accordingly.
-        existing_provider.to_dict.return_value = {
-            "provider_id": existing_provider.provider_id,
-            "name": existing_provider.name,
-            "endpoint": existing_provider.endpoint,
-            "context_match": existing_provider.context_match,
-            "identity_match": existing_provider.identity_match,
-            "countries": ["US", "GB"],
-            "uid_types": ["uid2", "id5"],
-            "properties": None,
-            "timeout_ms": existing_provider.timeout_ms,
-            "priority": existing_provider.priority,
-            "status": existing_provider.status,
-        }
+        # Real TMPProvider instance — to_dict() is the production implementation.
+        existing_provider = TMPProvider(
+            provider_id="test-uuid-1234",
+            tenant_id="default",
+            name="Test Provider",
+            endpoint="https://provider.example.com/tmp",
+            context_match=True,
+            identity_match=True,
+            countries=["US", "GB"],
+            uid_types=["uid2", "id5"],
+            properties=None,
+            timeout_ms=50,
+            priority=0,
+            status="active",
+            auth_type="bearer",
+        )
+        # Set auth_credentials via the property so the encryption path is exercised.
+        from cryptography.fernet import Fernet
 
-        mock_tenant = MagicMock()
-        mock_tenant.tenant_id = "default"
-        mock_tenant.name = "Default Tenant"
+        _key = Fernet.generate_key().decode()
+        with patch.dict(os.environ, {"ENCRYPTION_KEY": _key}):
+            existing_provider.auth_credentials = "stored-token"
 
-        with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW") as mock_uow_cls:
-            mock_uow = MagicMock()
-            mock_uow.tenant_config = MagicMock()
-            mock_uow.tenant_config.get_tenant.return_value = mock_tenant
-            mock_uow.tmp_providers = MagicMock()
-            mock_uow.tmp_providers.get_by_id.return_value = existing_provider
-            mock_uow_cls.return_value.__enter__ = MagicMock(return_value=mock_uow)
-            mock_uow_cls.return_value.__exit__ = MagicMock(return_value=False)
-            with patch("src.admin.blueprints.tmp_providers.render_template") as mock_render:
-                mock_render.return_value = "<html/>"
-                with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                    response = client.get(
-                        "/tenant/default/tmp-providers/test-uuid-1234/edit",
-                    )
+            mock_tenant = MagicMock()
+            mock_tenant.tenant_id = "default"
+            mock_tenant.name = "Default Tenant"
+
+            with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW") as mock_uow_cls:
+                mock_uow = MagicMock()
+                mock_uow.tenant_config = MagicMock()
+                mock_uow.tenant_config.get_tenant.return_value = mock_tenant
+                mock_uow.tmp_providers = MagicMock()
+                mock_uow.tmp_providers.get_by_id.return_value = existing_provider
+                mock_uow_cls.return_value.__enter__ = MagicMock(return_value=mock_uow)
+                mock_uow_cls.return_value.__exit__ = MagicMock(return_value=False)
+                with patch("src.admin.blueprints.tmp_providers.render_template") as mock_render:
+                    mock_render.return_value = "<html/>"
+                    with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
+                        response = client.get(
+                            "/tenant/default/tmp-providers/test-uuid-1234/edit",
+                        )
 
         assert response.status_code == 200
         # Production calls to_dict(include_conditional=False) then overwrites
         # list fields with comma-separated strings and adds auth fields with
         # placeholder masking (credentials are never echoed back to the browser).
-        existing_provider.to_dict.assert_called_once_with(include_conditional=False)
         mock_render.assert_called_once_with(
             "tmp_provider_form.html",
             tenant=mock_tenant,
             tenant_id="default",
             tenant_name="Default Tenant",
             provider={
-                "provider_id": existing_provider.provider_id,
-                "name": existing_provider.name,
-                "endpoint": existing_provider.endpoint,
-                "context_match": existing_provider.context_match,
-                "identity_match": existing_provider.identity_match,
+                "provider_id": "test-uuid-1234",
+                "name": "Test Provider",
+                "endpoint": "https://provider.example.com/tmp",
+                "context_match": True,
+                "identity_match": True,
                 "countries": "US,GB",
                 "uid_types": "uid2,id5",
                 "properties": "",
-                "timeout_ms": existing_provider.timeout_ms,
-                "priority": existing_provider.priority,
-                "status": existing_provider.status,
+                "timeout_ms": 50,
+                "priority": 0,
+                "status": "active",
                 "auth_type": "bearer",
                 "auth_credentials": "••••••••",
             },

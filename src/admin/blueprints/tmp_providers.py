@@ -170,7 +170,6 @@ def list_tmp_providers(tenant_id):
                 tenant_id=tenant_id,
                 tenant_name=tenant.name,
                 providers=providers_list,
-                script_name=request.environ.get("SCRIPT_NAME", ""),
             )
 
     except Exception as e:

@@ -26,40 +26,7 @@ from fastapi.testclient import TestClient
 
 from src.core.database.models import TMPProvider
 from tests.helpers.envelope_assertions import assert_envelope_shape
-
-
-def _make_provider(
-    provider_id="uuid-1",
-    name="Provider A",
-    endpoint="http://si-agent.localhost:3003",
-    context_match=True,
-    identity_match=True,
-    countries=None,
-    uid_types=None,
-    properties=None,
-    timeout_ms=200,
-    priority=0,
-    status="active",
-) -> TMPProvider:
-    """Create a real TMPProvider ORM instance (no DB session required).
-
-    Uses the real model so that to_dict() is exercised against the production
-    implementation rather than a MagicMock reimplementation that can silently
-    diverge (e.g. the missing-properties regression that was caught in review).
-    """
-    p = TMPProvider()
-    p.provider_id = provider_id
-    p.name = name
-    p.endpoint = endpoint
-    p.context_match = context_match
-    p.identity_match = identity_match
-    p.countries = countries
-    p.uid_types = uid_types
-    p.properties = properties
-    p.timeout_ms = timeout_ms
-    p.priority = priority
-    p.status = status
-    return p
+from tests.unit._tmp_helpers import _make_provider, _make_tenant_uow, _make_tmp_uow
 
 
 def _make_tenant(tenant_id="si-host"):
@@ -67,28 +34,6 @@ def _make_tenant(tenant_id="si-host"):
     t.tenant_id = tenant_id
     t.name = "SI Host Tenant"
     return t
-
-
-def _make_tenant_uow(tenant):
-    """Return a mock TenantConfigUoW context manager whose .tenant_config.get_tenant() returns tenant."""
-    mock_uow = MagicMock()
-    mock_uow.tenant_config = MagicMock()
-    mock_uow.tenant_config.get_tenant.return_value = tenant
-    mock_uow_cls = MagicMock()
-    mock_uow_cls.return_value.__enter__ = MagicMock(return_value=mock_uow)
-    mock_uow_cls.return_value.__exit__ = MagicMock(return_value=False)
-    return mock_uow_cls
-
-
-def _make_tmp_uow(providers):
-    """Return a mock TMPProviderUoW context manager whose .tmp_providers.list_syncable() returns providers."""
-    mock_uow = MagicMock()
-    mock_uow.tmp_providers = MagicMock()
-    mock_uow.tmp_providers.list_syncable.return_value = providers
-    mock_uow_cls = MagicMock()
-    mock_uow_cls.return_value.__enter__ = MagicMock(return_value=mock_uow)
-    mock_uow_cls.return_value.__exit__ = MagicMock(return_value=False)
-    return mock_uow_cls
 
 
 @pytest.fixture

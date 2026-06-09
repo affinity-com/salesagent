@@ -11,7 +11,7 @@ Authentication is **fail-closed**: the endpoint is locked by default.
 Set ``TMP_DISCOVERY_API_KEYS`` to a comma-separated list of accepted keys to
 grant access.  To explicitly disable authentication for internal-network-only
 deployments, set ``TMP_DISCOVERY_API_KEYS=OPEN``.  Leaving the variable unset
-or empty returns HTTP 503 so that misconfigured deployments fail loudly rather
+or empty returns HTTP 500 so that misconfigured deployments fail loudly rather
 than silently exposing tenant topology.
 
 Accepted auth headers (any one is sufficient):
@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
@@ -87,7 +88,7 @@ async def require_api_key(request: Request) -> None:
         logger.warning("[TMP discovery] API key auth disabled — TMP_DISCOVERY_API_KEYS=OPEN")
         return
 
-    allowed = {k.strip() for k in raw.split(",") if k.strip()}
+    allowed = [k.strip() for k in raw.split(",") if k.strip()]
     if not allowed:
         raise AdCPConfigurationError(
             "TMP_DISCOVERY_API_KEYS is not configured. "
@@ -100,7 +101,7 @@ async def require_api_key(request: Request) -> None:
         or request.headers.get("X-API-Key", "")
         or request.headers.get("authorization", "").removeprefix("Bearer ").strip()
     )
-    if api_key not in allowed:
+    if not any(secrets.compare_digest(api_key, k) for k in allowed):
         raise AdCPAuthRequiredError(
             "Authentication required.",
             details={
@@ -123,7 +124,7 @@ async def tmp_providers_discovery(tenant_id: str, _: None = Depends(require_api_
     """
     with TenantConfigUoW(tenant_id) as uow:
         if uow.tenant_config is None:
-            raise AdCPServiceUnavailableError("Tenant config repository unavailable")
+            raise AdCPServiceUnavailableError("Tenant config repository unavailable.")
         if uow.tenant_config.get_tenant() is None:
             raise AdCPAccountNotFoundError(
                 f"Tenant '{tenant_id}' not found.",

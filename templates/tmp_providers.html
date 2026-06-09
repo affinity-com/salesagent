@@ -163,7 +163,7 @@ Sales Agent Admin{% endblock %} {% block content %}
 </div>
 
 <script>
-  const scriptRoot = '{{ script_name }}' || '';
+  const scriptRoot = '{{ request.script_root }}' || '';
   const tenantId = '{{ tenant_id }}';
   const providerBase = `${scriptRoot}/tenant/${tenantId}/tmp-providers/`;
 
