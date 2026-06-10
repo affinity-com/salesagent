@@ -1940,6 +1940,19 @@ Exclude any products that don't match the brand's tone.</pre>
                     </div>
                 </div>
             </div>
+            {% elif active_adapter == 'siteplug' %}
+            <div class="form-section">
+                <h3>Siteplug Inventory Zones</h3>
+                <p style="color: #6b7280; font-size: 0.875rem; margin-bottom: 1.5rem;">
+                    Browse and sync traffic-source zones from the Siteplug SSP API into the local database
+                    for use in product targeting.
+                </p>
+                <div style="display: flex; gap: 1rem;">
+                    <a href="{{ url_for('adapters.siteplug_inventory_page', tenant_id=tenant_id) }}" class="btn btn-primary">
+                        📊 Browse Inventory
+                    </a>
+                </div>
+            </div>
             {% else %}
             <div class="alert alert-warning">
                 <strong>Ad Server Required</strong>

@@ -1,0 +1,596 @@
+{% extends "base.html" %}
+{#
+  Siteplug Inventory Management Page
+
+  Route: GET /tenant/<tenant_id>/adapters/siteplug/inventory
+  Blueprint: adapters_bp (adapters.py → siteplug_inventory_page)
+
+  API endpoints used:
+    GET  /api/tenant/<tenant_id>/adapters/siteplug/inventory              → list_siteplug_inventory
+    GET  /api/tenant/<tenant_id>/adapters/siteplug/inventory/<zone_id>    → get_siteplug_zone
+    POST /api/tenant/<tenant_id>/adapters/siteplug/inventory/sync         → sync_siteplug_inventory
+
+  Zone fields returned by the SSP API (via SiteplugClient.list_inventory):
+    zone_id, zone_name, domain, implementation_type,
+    transparency, publisher_type, status
+
+  Zone detail (via SiteplugClient.get_inventory_zone) additionally includes:
+    stats: { impressions_7d, clicks_7d, ctr_7d, avg_daily_impressions, last_updated }
+#}
+
+{% block title %}Siteplug Inventory — {{ tenant_id }}{% endblock %}
+
+{% block content %}
+<div class="container-fluid mt-4">
+
+  {# ── Breadcrumb ─────────────────────────────────────────────────────────── #}
+  <nav aria-label="breadcrumb">
+    <ol class="breadcrumb">
+      <li class="breadcrumb-item"><a href="{{ url_for('core.index') }}">Dashboard</a></li>
+      <li class="breadcrumb-item">
+        <a href="{{ url_for('tenants.tenant_settings', tenant_id=tenant_id) }}">{{ tenant_id }}</a>
+      </li>
+      <li class="breadcrumb-item active" aria-current="page">Siteplug Inventory</li>
+    </ol>
+  </nav>
+
+  {# ── Page header ────────────────────────────────────────────────────────── #}
+  <div class="row mb-3">
+    <div class="col">
+      <h2 class="mb-0">
+        <i class="fas fa-layer-group me-2 text-primary"></i>Siteplug Inventory Zones
+      </h2>
+      <p class="text-muted mt-1 mb-0">
+        Live view of traffic-source zones from the Siteplug SSP API.
+        Click any row to see full details and delivery stats.
+        Use <strong>Sync to DB</strong> to persist zones for product targeting.
+      </p>
+    </div>
+    <div class="col-auto d-flex align-items-center gap-2">
+      <button class="btn btn-outline-secondary btn-sm" onclick="loadInventory(currentPage)" id="refreshBtn">
+        <i class="fas fa-rotate-right me-1"></i>Refresh
+      </button>
+      <button class="btn btn-primary btn-sm" onclick="syncInventory()" id="syncBtn">
+        <i class="fas fa-database me-1"></i>Sync to DB
+      </button>
+    </div>
+  </div>
+
+  {# ── Status banner ──────────────────────────────────────────────────────── #}
+  <div id="statusBanner" class="alert d-none mb-3" role="alert"></div>
+
+  {# ── Stats row ──────────────────────────────────────────────────────────── #}
+  <div class="row g-3 mb-4">
+    <div class="col-6 col-md-3">
+      <div class="card text-center h-100">
+        <div class="card-body py-3">
+          <div class="fs-3 fw-bold text-primary" id="statTotal">—</div>
+          <div class="text-muted small">Zones (this page)</div>
+        </div>
+      </div>
+    </div>
+    <div class="col-6 col-md-3">
+      <div class="card text-center h-100">
+        <div class="card-body py-3">
+          <div class="fs-3 fw-bold text-success" id="statActive">—</div>
+          <div class="text-muted small">Active</div>
+        </div>
+      </div>
+    </div>
+    <div class="col-6 col-md-3">
+      <div class="card text-center h-100">
+        <div class="card-body py-3">
+          <div class="fs-3 fw-bold text-secondary" id="statPages">—</div>
+          <div class="text-muted small">Total Pages</div>
+        </div>
+      </div>
+    </div>
+    <div class="col-6 col-md-3">
+      <div class="card text-center h-100">
+        <div class="card-body py-3">
+          <div class="fs-3 fw-bold text-info" id="statTotalZones">—</div>
+          <div class="text-muted small">Total Zones (API)</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  {# ── Filter bar ─────────────────────────────────────────────────────────── #}
+  <div class="card mb-3">
+    <div class="card-body py-2">
+      <div class="row g-2 align-items-center">
+        <div class="col-md-4">
+          <input type="text" id="filterSearch" class="form-control form-control-sm"
+                 placeholder="Filter by zone name or domain…"
+                 oninput="applyFilter()">
+        </div>
+        <div class="col-md-3">
+          <select id="filterStatus" class="form-select form-select-sm" onchange="applyFilter()">
+            <option value="">All statuses</option>
+            <option value="1">Active (1)</option>
+            <option value="0">Inactive (0)</option>
+          </select>
+        </div>
+        <div class="col-md-3">
+          <select id="filterType" class="form-select form-select-sm" onchange="applyFilter()">
+            <option value="">All implementation types</option>
+          </select>
+        </div>
+        <div class="col-md-2 text-end">
+          <span class="text-muted small" id="filterCount"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  {# ── Zones table ────────────────────────────────────────────────────────── #}
+  <div class="card">
+    <div class="card-body p-0">
+      <div id="loadingSpinner" class="text-center py-5">
+        <div class="spinner-border text-primary" role="status">
+          <span class="visually-hidden">Loading…</span>
+        </div>
+        <p class="text-muted mt-2 mb-0">Fetching zones from Siteplug SSP API…</p>
+      </div>
+
+      <div id="tableWrapper" class="d-none">
+        <div class="table-responsive">
+          <table class="table table-hover table-sm mb-0" id="zonesTable">
+            <thead class="table-light">
+              <tr>
+                <th style="width:80px">Zone ID</th>
+                <th>Zone Name</th>
+                <th>Domain</th>
+                <th style="width:140px">Implementation</th>
+                <th style="width:110px">Transparency</th>
+                <th style="width:110px">Publisher Type</th>
+                <th style="width:80px" class="text-center">Status</th>
+              </tr>
+            </thead>
+            <tbody id="zonesBody">
+              {# Populated by JS #}
+            </tbody>
+          </table>
+        </div>
+        <div class="px-3 py-2 border-top">
+          <small class="text-muted"><i class="fas fa-hand-pointer me-1"></i>Click any row to view full zone details and delivery stats.</small>
+        </div>
+      </div>
+
+      <div id="emptyState" class="d-none text-center py-5">
+        <i class="fas fa-inbox fa-3x text-muted mb-3"></i>
+        <p class="text-muted mb-1">No zones found.</p>
+        <p class="text-muted small">Check your Siteplug SSP API configuration in
+          <a href="{{ url_for('tenants.tenant_settings', tenant_id=tenant_id) }}">Settings</a>.
+        </p>
+      </div>
+
+      <div id="errorState" class="d-none p-4">
+        <div class="alert alert-danger mb-0">
+          <i class="fas fa-triangle-exclamation me-2"></i>
+          <strong>Failed to load inventory.</strong>
+          <span id="errorMessage"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  {# ── Pagination ─────────────────────────────────────────────────────────── #}
+  <div class="d-flex justify-content-between align-items-center mt-3" id="paginationRow">
+    <div class="text-muted small" id="paginationInfo"></div>
+    <nav>
+      <ul class="pagination pagination-sm mb-0" id="paginationControls"></ul>
+    </nav>
+  </div>
+
+</div>{# /container-fluid #}
+
+{# ── Zone Detail Modal ──────────────────────────────────────────────────────── #}
+<div class="modal fade" id="zoneDetailModal" tabindex="-1" aria-labelledby="zoneDetailModalLabel" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="zoneDetailModalLabel">
+          <i class="fas fa-layer-group me-2 text-primary"></i>Zone Details
+        </h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body" id="zoneDetailBody">
+        <div class="text-center py-4">
+          <div class="spinner-border text-primary" role="status">
+            <span class="visually-hidden">Loading…</span>
+          </div>
+          <p class="text-muted mt-2">Fetching zone details…</p>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  'use strict';
+
+  const TENANT_ID   = {{ tenant_id | tojson }};
+  const SCRIPT_ROOT = (window.scriptRoot || '').replace(/\/$/, '');
+  const PAGE_SIZE   = 50;
+
+  let allZones      = [];   // zones on the current page (from API)
+  let filteredZones = [];   // after client-side filter
+  let currentPage   = 1;
+  let totalPages    = 1;
+  let totalZones    = 0;
+
+  window.currentPage = 1;
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  function apiBase() {
+    return SCRIPT_ROOT + '/api/tenant/' + TENANT_ID;
+  }
+
+  function showBanner(msg, type) {
+    const el = document.getElementById('statusBanner');
+    el.className = 'alert alert-' + type + ' mb-3';
+    el.innerHTML = msg;
+    el.classList.remove('d-none');
+    if (type === 'success') {
+      setTimeout(() => el.classList.add('d-none'), 5000);
+    }
+  }
+
+  function hideBanner() {
+    document.getElementById('statusBanner').classList.add('d-none');
+  }
+
+  function statusBadge(status) {
+    if (status === 1 || status === '1') {
+      return '<span class="badge bg-success">Active</span>';
+    }
+    return '<span class="badge bg-secondary">Inactive</span>';
+  }
+
+  function truncate(str, n) {
+    if (!str) return '—';
+    return str.length > n ? str.slice(0, n) + '…' : str;
+  }
+
+  function escHtml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function fmt(val, fallback) {
+    if (val == null || val === '') return fallback || '—';
+    return val;
+  }
+
+  function fmtNum(val) {
+    if (val == null) return '—';
+    return Number(val).toLocaleString();
+  }
+
+  function fmtPct(val) {
+    if (val == null) return '—';
+    return (Number(val) * 100).toFixed(2) + '%';
+  }
+
+  // ── Load inventory list ───────────────────────────────────────────────────
+
+  window.loadInventory = function (page) {
+    page = page || 1;
+    currentPage = page;
+    window.currentPage = page;
+
+    document.getElementById('loadingSpinner').classList.remove('d-none');
+    document.getElementById('tableWrapper').classList.add('d-none');
+    document.getElementById('emptyState').classList.add('d-none');
+    document.getElementById('errorState').classList.add('d-none');
+    hideBanner();
+
+    const url = apiBase() + '/adapters/siteplug/inventory?page=' + page + '&limit=' + PAGE_SIZE;
+
+    fetch(url, { credentials: 'same-origin' })
+      .then(r => {
+        if (!r.ok) return r.json().then(d => Promise.reject(d.error || r.statusText));
+        return r.json();
+      })
+      .then(data => {
+        allZones = data.zones || [];
+        const pagination = data.pagination || {};
+        totalPages = pagination.total_pages || 1;
+        totalZones = pagination.total_count || allZones.length;
+
+        const activeCount = allZones.filter(z => z.status === 1 || z.status === '1').length;
+        document.getElementById('statTotal').textContent      = allZones.length;
+        document.getElementById('statActive').textContent     = activeCount;
+        document.getElementById('statPages').textContent      = totalPages;
+        document.getElementById('statTotalZones').textContent = totalZones;
+
+        populateTypeFilter(allZones);
+        applyFilter();
+        renderPagination(page, totalPages);
+
+        document.getElementById('loadingSpinner').classList.add('d-none');
+
+        if (allZones.length === 0) {
+          document.getElementById('emptyState').classList.remove('d-none');
+        } else {
+          document.getElementById('tableWrapper').classList.remove('d-none');
+        }
+      })
+      .catch(err => {
+        document.getElementById('loadingSpinner').classList.add('d-none');
+        document.getElementById('errorState').classList.remove('d-none');
+        document.getElementById('errorMessage').textContent = ' ' + (err || 'Unknown error');
+      });
+  };
+
+  // ── Populate implementation-type <select> ─────────────────────────────────
+
+  function populateTypeFilter(zones) {
+    const sel = document.getElementById('filterType');
+    const existing = new Set(Array.from(sel.options).map(o => o.value));
+    const types = [...new Set(zones.map(z => z.implementation_type).filter(Boolean))].sort();
+    types.forEach(t => {
+      if (!existing.has(t)) {
+        const opt = document.createElement('option');
+        opt.value = t;
+        opt.textContent = t;
+        sel.appendChild(opt);
+      }
+    });
+  }
+
+  // ── Client-side filter ────────────────────────────────────────────────────
+
+  window.applyFilter = function () {
+    const search = document.getElementById('filterSearch').value.toLowerCase();
+    const status = document.getElementById('filterStatus').value;
+    const type   = document.getElementById('filterType').value;
+
+    filteredZones = allZones.filter(z => {
+      const matchSearch = !search ||
+        (z.zone_name  || '').toLowerCase().includes(search) ||
+        (z.domain     || '').toLowerCase().includes(search);
+      const matchStatus = !status || String(z.status) === status;
+      const matchType   = !type   || z.implementation_type === type;
+      return matchSearch && matchStatus && matchType;
+    });
+
+    renderTable(filteredZones);
+    document.getElementById('filterCount').textContent =
+      filteredZones.length + ' of ' + allZones.length + ' zones';
+  };
+
+  // ── Render table rows ─────────────────────────────────────────────────────
+
+  function renderTable(zones) {
+    const tbody = document.getElementById('zonesBody');
+    if (zones.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-4">No zones match the current filter.</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = zones.map(z => `
+      <tr style="cursor:pointer;" onclick="openZoneDetail(${z.zone_id})" title="Click to view details">
+        <td class="font-monospace text-muted small">${escHtml(String(z.zone_id ?? '—'))}</td>
+        <td title="${escHtml(z.zone_name || '')}">${escHtml(truncate(z.zone_name, 60))}</td>
+        <td class="small text-muted">${escHtml(z.domain || '—')}</td>
+        <td class="small">${escHtml(z.implementation_type || '—')}</td>
+        <td class="small">${escHtml(String(z.transparency ?? '—'))}</td>
+        <td class="small">${escHtml(z.publisher_type || '—')}</td>
+        <td class="text-center">${statusBadge(z.status)}</td>
+      </tr>
+    `).join('');
+  }
+
+  // ── Pagination controls ───────────────────────────────────────────────────
+
+  function renderPagination(page, total) {
+    const info = document.getElementById('paginationInfo');
+    const ul   = document.getElementById('paginationControls');
+
+    info.textContent = 'Page ' + page + ' of ' + total;
+
+    if (total <= 1) { ul.innerHTML = ''; return; }
+
+    const WIN = 2;
+    const pages = [];
+    for (let p = 1; p <= total; p++) {
+      if (p === 1 || p === total || (p >= page - WIN && p <= page + WIN)) pages.push(p);
+    }
+
+    let html = '';
+    let prev = null;
+    pages.forEach(p => {
+      if (prev !== null && p - prev > 1) {
+        html += '<li class="page-item disabled"><span class="page-link">…</span></li>';
+      }
+      html += `<li class="page-item ${p === page ? 'active' : ''}">
+        <a class="page-link" href="#" onclick="loadInventory(${p}); return false;">${p}</a>
+      </li>`;
+      prev = p;
+    });
+
+    ul.innerHTML =
+      `<li class="page-item ${page <= 1 ? 'disabled' : ''}">
+         <a class="page-link" href="#" onclick="loadInventory(${page - 1}); return false;">‹</a>
+       </li>` + html +
+      `<li class="page-item ${page >= total ? 'disabled' : ''}">
+         <a class="page-link" href="#" onclick="loadInventory(${page + 1}); return false;">›</a>
+       </li>`;
+  }
+
+  // ── Zone detail modal ─────────────────────────────────────────────────────
+
+  window.openZoneDetail = function (zoneId) {
+    const body  = document.getElementById('zoneDetailBody');
+    const label = document.getElementById('zoneDetailModalLabel');
+
+    // Reset to loading state
+    label.innerHTML = '<i class="fas fa-layer-group me-2 text-primary"></i>Zone Details';
+    body.innerHTML  = `
+      <div class="text-center py-4">
+        <div class="spinner-border text-primary" role="status">
+          <span class="visually-hidden">Loading…</span>
+        </div>
+        <p class="text-muted mt-2">Fetching zone ${zoneId}…</p>
+      </div>`;
+
+    // Show modal immediately (Bootstrap 5)
+    const modal = bootstrap.Modal.getOrCreateInstance(document.getElementById('zoneDetailModal'));
+    modal.show();
+
+    fetch(apiBase() + '/adapters/siteplug/inventory/' + zoneId, { credentials: 'same-origin' })
+      .then(r => {
+        if (!r.ok) return r.json().then(d => Promise.reject(d.error || r.statusText));
+        return r.json();
+      })
+      .then(data => {
+        const z = data.zone || {};
+        const s = z.stats || {};
+        label.innerHTML =
+          `<i class="fas fa-layer-group me-2 text-primary"></i>Zone #${escHtml(String(z.zone_id ?? zoneId))} — ${escHtml(truncate(z.zone_name, 50))}`;
+
+        body.innerHTML = `
+          <div class="row g-3">
+
+            {# ── Identity ── #}
+            <div class="col-12">
+              <h6 class="text-uppercase text-muted fw-semibold mb-2" style="font-size:0.75rem;letter-spacing:.05em;">Identity</h6>
+              <table class="table table-sm table-bordered mb-0">
+                <tbody>
+                  <tr><th style="width:35%">Zone ID</th><td class="font-monospace">${escHtml(String(fmt(z.zone_id)))}</td></tr>
+                  <tr><th>Zone Name</th><td>${escHtml(fmt(z.zone_name))}</td></tr>
+                  <tr><th>Domain</th><td>${escHtml(fmt(z.domain))}</td></tr>
+                  <tr><th>Publisher Type</th><td>${escHtml(fmt(z.publisher_type))}</td></tr>
+                  <tr><th>Status</th><td>${statusBadge(z.status)}</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            {# ── Configuration ── #}
+            <div class="col-12">
+              <h6 class="text-uppercase text-muted fw-semibold mb-2" style="font-size:0.75rem;letter-spacing:.05em;">Configuration</h6>
+              <table class="table table-sm table-bordered mb-0">
+                <tbody>
+                  <tr><th style="width:35%">Implementation Type</th><td>${escHtml(fmt(z.implementation_type))}</td></tr>
+                  <tr><th>Transparency</th><td>${escHtml(fmt(z.transparency))}</td></tr>
+                  <tr><th>Source Type</th><td>${escHtml(fmt(z.source_type))}</td></tr>
+                  <tr><th>Customer Type</th><td>${escHtml(fmt(z.customer_type))}</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            {# ── Delivery Stats ── #}
+            <div class="col-12">
+              <h6 class="text-uppercase text-muted fw-semibold mb-2" style="font-size:0.75rem;letter-spacing:.05em;">
+                Delivery Stats
+                ${s.last_updated ? '<small class="text-muted fw-normal ms-2">Updated: ' + escHtml(s.last_updated) + '</small>' : ''}
+              </h6>
+              ${Object.keys(s).length === 0
+                ? '<p class="text-muted small mb-0">No delivery stats available for this zone.</p>'
+                : `<div class="row g-2">
+                    <div class="col-6 col-md-3">
+                      <div class="card text-center border-0 bg-light">
+                        <div class="card-body py-2 px-1">
+                          <div class="fs-5 fw-bold text-primary">${fmtNum(s.impressions_7d)}</div>
+                          <div class="text-muted" style="font-size:0.7rem;">Impressions (7d)</div>
+                        </div>
+                      </div>
+                    </div>
+                    <div class="col-6 col-md-3">
+                      <div class="card text-center border-0 bg-light">
+                        <div class="card-body py-2 px-1">
+                          <div class="fs-5 fw-bold text-success">${fmtNum(s.clicks_7d)}</div>
+                          <div class="text-muted" style="font-size:0.7rem;">Clicks (7d)</div>
+                        </div>
+                      </div>
+                    </div>
+                    <div class="col-6 col-md-3">
+                      <div class="card text-center border-0 bg-light">
+                        <div class="card-body py-2 px-1">
+                          <div class="fs-5 fw-bold text-info">${fmtPct(s.ctr_7d)}</div>
+                          <div class="text-muted" style="font-size:0.7rem;">CTR (7d)</div>
+                        </div>
+                      </div>
+                    </div>
+                    <div class="col-6 col-md-3">
+                      <div class="card text-center border-0 bg-light">
+                        <div class="card-body py-2 px-1">
+                          <div class="fs-5 fw-bold text-secondary">${fmtNum(s.avg_daily_impressions)}</div>
+                          <div class="text-muted" style="font-size:0.7rem;">Avg Daily Impr.</div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>`
+              }
+            </div>
+
+          </div>`;
+      })
+      .catch(err => {
+        body.innerHTML = `
+          <div class="alert alert-danger mb-0">
+            <i class="fas fa-triangle-exclamation me-2"></i>
+            <strong>Failed to load zone details.</strong> ${escHtml(String(err))}
+          </div>`;
+      });
+  };
+
+  // ── Sync to DB ────────────────────────────────────────────────────────────
+
+  window.syncInventory = function () {
+    const btn = document.getElementById('syncBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Syncing…';
+    hideBanner();
+
+    fetch(apiBase() + '/adapters/siteplug/inventory/sync', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+    })
+      .then(r => r.json())
+      .then(data => {
+        if (data.success) {
+          const r = data.result || {};
+          const msg = [
+            '<i class="fas fa-check-circle me-1"></i><strong>Sync complete.</strong>',
+            r.zones_synced      != null ? ' Zones synced: <strong>'      + r.zones_synced      + '</strong>.' : '',
+            r.zones_created     != null ? ' Created: <strong>'           + r.zones_created     + '</strong>.' : '',
+            r.zones_updated     != null ? ' Updated: <strong>'           + r.zones_updated     + '</strong>.' : '',
+            r.zones_deactivated != null ? ' Deactivated: <strong>'       + r.zones_deactivated + '</strong>.' : '',
+          ].join('');
+          showBanner(msg, 'success');
+          loadInventory(currentPage);
+        } else {
+          showBanner('<i class="fas fa-triangle-exclamation me-1"></i><strong>Sync failed.</strong> ' +
+            escHtml(data.error || 'Unknown error'), 'danger');
+        }
+      })
+      .catch(err => {
+        showBanner('<i class="fas fa-triangle-exclamation me-1"></i><strong>Sync error.</strong> ' +
+          escHtml(err.message || String(err)), 'danger');
+      })
+      .finally(() => {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fas fa-database me-1"></i>Sync to DB';
+      });
+  };
+
+  // ── Boot ──────────────────────────────────────────────────────────────────
+  document.addEventListener('DOMContentLoaded', () => loadInventory(1));
+
+}());
+</script>
+{% endblock %}

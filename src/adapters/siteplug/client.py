@@ -222,16 +222,77 @@ class SiteplugClient:
         return {"results": []}
 
     # =========================================================================
-    # Inventory Operations  (wired in Task 03)
+    # Inventory Operations  (Task 03)
     # =========================================================================
 
-    async def list_inventory(self, **filters: Any) -> list[dict[str, Any]]:
-        """List available inventory zones. Stub — wired in Task 03."""
-        return []
+    async def list_inventory(
+        self,
+        page: int = 1,
+        limit: int = 200,
+        status: int | None = None,
+        publisher_id: int | None = None,
+        implementation_type: str | None = None,
+        source_type: str | None = None,
+        transparency: str | None = None,
+        search: str | None = None,
+        **_extra: Any,
+    ) -> dict[str, Any]:
+        """List available inventory zones from GET /ssp/v1/inventory.
+
+        Queries IC only (no AX cross-join). Returns the full paginated
+        response envelope so the caller can iterate pages.
+
+        Args:
+            page: Page number (1-based).
+            limit: Records per page (max 200 per SSP API contract).
+            status: Filter by zone status — 0=inactive, 1=active. Omit for all.
+            publisher_id: Filter by publisher/customer ID.
+            implementation_type: Exact match on implementation type name.
+            source_type: Exact match on source type name.
+            transparency: ``transparent`` or ``non_transparent``.
+            search: LIKE search on zone name and domain.
+
+        Returns:
+            Parsed response body containing ``data`` (list of zone dicts) and
+            ``pagination`` metadata.
+
+        Raises:
+            SiteplugAPIError: On HTTP 4xx/5xx responses.
+        """
+        params: dict[str, Any] = {"page": page, "limit": limit}
+        if status is not None:
+            params["status"] = status
+        if publisher_id is not None:
+            params["publisher_id"] = publisher_id
+        if implementation_type is not None:
+            params["implementation_type"] = implementation_type
+        if source_type is not None:
+            params["source_type"] = source_type
+        if transparency is not None:
+            params["transparency"] = transparency
+        if search is not None:
+            params["search"] = search
+
+        return await self._request("GET", "/inventory", params=params)
 
     async def get_inventory_zone(self, zone_id: int) -> dict[str, Any]:
-        """Get a specific inventory zone. Stub — wired in Task 03."""
-        return {}
+        """Get a single inventory zone with delivery stats from GET /ssp/v1/inventory/{id}.
+
+        Queries IC for zone metadata and AX for 7-day / 30-day delivery stats.
+
+        Args:
+            zone_id: Positive integer zone ID (IC ``site_id``).
+
+        Returns:
+            Parsed response body containing the zone object with a nested
+            ``stats`` dict (impressions_7d, clicks_7d, ctr_7d,
+            avg_daily_impressions, last_updated).
+
+        Raises:
+            SiteplugAPIError: On HTTP 4xx/5xx responses (including 404 when
+                the zone does not exist in IC).
+        """
+        return await self._request("GET", f"/inventory/{zone_id}")
 
     # =========================================================================
     # Delivery / Reporting Operations  (wired in Task 05)
