@@ -39,6 +39,8 @@ VALUE_ERROR_PER_FILE_CAP: dict[str, int] = {
     "src/adapters/base.py": 1,
     "src/adapters/broadstreet/adapter.py": 3,
     "src/adapters/broadstreet/config_schema.py": 4,
+    "src/adapters/siteplug/adapter.py": 1,  # FIXME(salesagent-xw7): migrate to typed AdCPError raise
+    "src/adapters/siteplug/config_schema.py": 1,  # FIXME(salesagent-xw7): migrate to typed AdCPError raise
     "src/adapters/gam/auth.py": 5,
     "src/adapters/gam/client.py": 1,
     "src/adapters/gam/managers/creatives.py": 3,

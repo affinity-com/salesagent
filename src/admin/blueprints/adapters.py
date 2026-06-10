@@ -1,5 +1,6 @@
 """Adapters management blueprint."""
 
+import asyncio
 import logging
 
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
@@ -305,3 +306,234 @@ def list_broadstreet_zones(tenant_id, **kwargs):
     except Exception as e:
         logger.error(f"Error fetching Broadstreet zones: {e}", exc_info=True)
         return jsonify({"zones": [], "error": str(e)}), 500
+
+
+# Siteplug-specific endpoints
+
+
+@adapters_bp.route("/api/tenant/<tenant_id>/adapters/siteplug/config", methods=["POST"])
+@require_tenant_access()
+def save_siteplug_config(tenant_id, **kwargs):
+    """Save Siteplug SSP API connection configuration.
+
+    Accepts JSON body:
+        {
+            "adapter_type": "siteplug",
+            "config": {
+                "base_url": "https://...",
+                "api_key": "...",
+                "manual_approval_required": true
+            }
+        }
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"success": False, "error": "No JSON data provided"}), 400
+
+        config = data.get("config", {})
+        if not config:
+            return jsonify({"success": False, "error": "No config provided"}), 400
+
+        from src.adapters.siteplug.config_schema import SiteplugConnectionConfig
+        from pydantic import ValidationError as PydanticValidationError
+
+        try:
+            SiteplugConnectionConfig(
+                base_url=config.get("base_url", ""),
+                api_key=config.get("api_key", ""),
+            )
+        except PydanticValidationError as e:
+            return jsonify({"success": False, "error": str(e)}), 400
+
+        with get_db_session() as session:
+            stmt = select(AdapterConfig).filter_by(tenant_id=tenant_id)
+            adapter_config = session.scalars(stmt).first()
+
+            if not adapter_config:
+                adapter_config = AdapterConfig(
+                    tenant_id=tenant_id,
+                    adapter_type="siteplug",
+                    config_json=config,
+                )
+                session.add(adapter_config)
+            else:
+                adapter_config.adapter_type = "siteplug"
+                adapter_config.config_json = config
+                attributes.flag_modified(adapter_config, "config_json")
+
+            session.commit()
+            logger.info(f"Saved Siteplug adapter config for tenant {tenant_id}")
+
+        return jsonify({"success": True, "message": "Configuration saved"})
+
+    except Exception as e:
+        logger.error(f"Error saving Siteplug adapter config: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+
+@adapters_bp.route("/api/tenant/<tenant_id>/adapters/siteplug/test-connection", methods=["POST"])
+@require_tenant_access()
+def test_siteplug_connection(tenant_id, **kwargs):
+    """Test Siteplug SSP API connection with provided credentials."""
+    import asyncio
+
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"success": False, "error": "No JSON data provided"}), 400
+
+        base_url = data.get("base_url", "").strip()
+        api_key = data.get("api_key", "").strip()
+
+        if not base_url or not api_key:
+            return jsonify({"success": False, "error": "base_url and api_key are required"}), 400
+
+        from src.adapters.siteplug.client import SiteplugAPIError, SiteplugClient
+        from src.adapters.siteplug.config_schema import SiteplugConnectionConfig
+
+        config = SiteplugConnectionConfig(base_url=base_url, api_key=api_key)
+        client = SiteplugClient(config)
+
+        # Probe the inventory endpoint with page=1, limit=1 — lightweight connectivity check
+        result = asyncio.run(client.list_inventory(page=1, limit=1, status=1))
+        total = result.get("pagination", {}).get("total", 0) if isinstance(result, dict) else 0
+
+        return jsonify(
+            {
+                "success": True,
+                "message": f"Connected successfully. {total} active zone(s) available.",
+            }
+        )
+
+    except SiteplugAPIError as e:
+        logger.warning(f"Siteplug connection test failed (API error): {e}")
+        return jsonify({"success": False, "error": str(e)}), 200
+    except Exception as e:
+        logger.error(f"Siteplug connection test failed: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@adapters_bp.route("/tenant/<tenant_id>/adapters/siteplug/inventory", methods=["GET"])
+@require_tenant_access()
+def siteplug_inventory_page(tenant_id, **kwargs):
+    """Render the Siteplug inventory management page."""
+    return render_template(
+        "adapters/siteplug/inventory.html",
+        tenant_id=tenant_id,
+    )
+
+
+@adapters_bp.route("/api/tenant/<tenant_id>/adapters/siteplug/inventory", methods=["GET"])
+@require_tenant_access()
+def list_siteplug_inventory(tenant_id, **kwargs):
+    """List Siteplug inventory zones from the SSP API (live fetch, page 1)."""
+    try:
+        page = int(request.args.get("page", 1))
+        limit = min(int(request.args.get("limit", 50)), 200)
+
+        with get_db_session() as session:
+            stmt = select(AdapterConfig).filter_by(tenant_id=tenant_id)
+            adapter_config = session.scalars(stmt).first()
+
+            if not adapter_config or adapter_config.adapter_type != "siteplug":
+                return jsonify({"error": "Siteplug adapter not configured"}), 400
+
+            config = adapter_config.config_json or {}
+
+        from src.adapters.siteplug.client import SiteplugAPIError, SiteplugClient
+        from src.adapters.siteplug.config_schema import SiteplugConnectionConfig
+
+        sp_config = SiteplugConnectionConfig(
+            base_url=config.get("base_url", ""),
+            api_key=config.get("api_key", ""),
+        )
+        client = SiteplugClient(sp_config)
+        result = asyncio.run(client.list_inventory(page=page, limit=limit, status=1))
+
+        zones = result.get("data", [])
+        pagination = result.get("pagination", {})
+
+        return jsonify({"zones": zones, "pagination": pagination, "total": len(zones)})
+
+    except Exception as e:
+        logger.error(f"Error fetching Siteplug inventory: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@adapters_bp.route("/api/tenant/<tenant_id>/adapters/siteplug/inventory/<int:zone_id>", methods=["GET"])
+@require_tenant_access()
+def get_siteplug_zone(tenant_id, zone_id, **kwargs):
+    """Fetch a single Siteplug zone with delivery stats from GET /ssp/v1/inventory/{id}."""
+    try:
+        with get_db_session() as session:
+            stmt = select(AdapterConfig).filter_by(tenant_id=tenant_id)
+            adapter_config = session.scalars(stmt).first()
+
+            if not adapter_config or adapter_config.adapter_type != "siteplug":
+                return jsonify({"error": "Siteplug adapter not configured"}), 400
+
+            config = adapter_config.config_json or {}
+
+        from src.adapters.siteplug.client import SiteplugAPIError, SiteplugClient
+        from src.adapters.siteplug.config_schema import SiteplugConnectionConfig
+
+        sp_config = SiteplugConnectionConfig(
+            base_url=config.get("base_url", ""),
+            api_key=config.get("api_key", ""),
+        )
+        client = SiteplugClient(sp_config)
+        response = asyncio.run(client.get_inventory_zone(zone_id))
+        # SSP API envelope: {"status": "success", "data": {...zone...}, "meta": {...}}
+        # Unwrap "data" so the frontend receives the zone object directly.
+        zone = response.get("data", response) if isinstance(response, dict) else response
+        return jsonify({"zone": zone})
+
+    except Exception as e:
+        logger.error(f"Error fetching Siteplug zone {zone_id}: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@adapters_bp.route("/api/tenant/<tenant_id>/adapters/siteplug/inventory/sync", methods=["POST"])
+@require_tenant_access()
+def sync_siteplug_inventory(tenant_id, **kwargs):
+    """Trigger a full Siteplug inventory sync (fetches all pages, upserts DB)."""
+    try:
+        with get_db_session() as session:
+            stmt = select(AdapterConfig).filter_by(tenant_id=tenant_id)
+            adapter_config = session.scalars(stmt).first()
+
+            if not adapter_config or adapter_config.adapter_type != "siteplug":
+                return jsonify({"error": "Siteplug adapter not configured"}), 400
+
+            config = adapter_config.config_json or {}
+
+        from src.adapters.siteplug.client import SiteplugClient
+        from src.adapters.siteplug.config_schema import SiteplugConnectionConfig
+        from src.adapters.siteplug.managers.inventory import SiteplugInventoryManager
+        from src.core.database.models import Principal
+        from sqlalchemy import select as sa_select
+
+        sp_config = SiteplugConnectionConfig(
+            base_url=config.get("base_url", ""),
+            api_key=config.get("api_key", ""),
+        )
+        client = SiteplugClient(sp_config)
+
+        with get_db_session() as session:
+            principal = session.scalars(
+                sa_select(Principal).filter_by(tenant_id=tenant_id)
+            ).first()
+
+            manager = SiteplugInventoryManager(
+                client=client,
+                tenant_id=tenant_id,
+            )
+            result = asyncio.run(manager.sync_inventory(db_session=session, principal=principal))
+
+        return jsonify({"success": True, "result": result})
+
+    except Exception as e:
+        logger.error(f"Error syncing Siteplug inventory: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500

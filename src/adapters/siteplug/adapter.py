@@ -146,6 +146,7 @@ class SiteplugAdapter(AdServerAdapter):
         self.inventory_manager = SiteplugInventoryManager(
             client=self.client,
             log_func=self.log,
+            tenant_id=tenant_id or "",
         )
         self.reporting_manager = SiteplugReportingManager(
             client=self.client,
@@ -461,10 +462,15 @@ class SiteplugAdapter(AdServerAdapter):
     async def get_available_inventory(self) -> dict[str, Any]:
         """Fetch available inventory zones from Siteplug.
 
-        Stub — wired in Task 03.
+        Delegates to :class:`~src.adapters.siteplug.managers.inventory.SiteplugInventoryManager`
+        which warms its in-memory cache from ``GET /ssp/v1/inventory`` (IC-only,
+        active zones, paginated) and returns the full zone list.
 
         Returns:
-            Empty inventory dict
+            Dict with ``zones`` list and ``properties`` metadata.
         """
-        self.log("Siteplug.get_available_inventory [STUB]", dry_run_prefix=False)
-        return {"zones": []}
+        self.log("Siteplug.get_available_inventory", dry_run_prefix=False)
+        # Warm the cache if empty (single-page fast path)
+        if not self.inventory_manager._zone_cache:
+            await self.inventory_manager._warm_cache()
+        return self.inventory_manager.build_inventory_response()
