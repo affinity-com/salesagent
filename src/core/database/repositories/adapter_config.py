@@ -195,6 +195,9 @@ class AdapterConfigRepository:
             "enabled": True,
             "base_url": base_url,
             "api_key": api_key,
+            # Default True — matches the admin UI checkbox default so that
+            # tenants who saved config before this field existed stay safe.
+            "manual_approval_required": raw.get("manual_approval_required", True),
         }
         if "timeout" in raw:
             result["timeout"] = raw["timeout"]

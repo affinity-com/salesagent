@@ -216,6 +216,40 @@ class TestGetAdapterSiteplugBranch:
 
         MockSiteplug.assert_not_called()
 
+    def test_siteplug_adapter_not_called_with_empty_config_dry_run(self):
+        """ValueError from get_siteplug_config() fires before dry-run bypass in SiteplugAdapter.
+
+        SiteplugAdapter.__init__() uses placeholder credentials when dry_run=True,
+        but get_siteplug_config() is called first (in get_adapter()) and raises
+        ValueError for missing credentials — so the adapter is never instantiated.
+        """
+        from src.core.helpers.adapter_helpers import get_adapter
+
+        config_row = _make_adapter_config(config_json={})  # missing credentials
+
+        with (
+            patch("src.core.helpers.adapter_helpers.get_db_session") as mock_session_ctx,
+            patch(
+                "src.core.database.repositories.adapter_config.AdapterConfigRepository"
+            ) as MockRepo,
+            patch("src.adapters.siteplug.adapter.SiteplugAdapter") as MockSiteplug,
+        ):
+            mock_session = MagicMock()
+            mock_session_ctx.return_value.__enter__ = MagicMock(return_value=mock_session)
+            mock_session_ctx.return_value.__exit__ = MagicMock(return_value=False)
+
+            repo_instance = MagicMock()
+            MockRepo.return_value = repo_instance
+            repo_instance.find_by_tenant.return_value = config_row
+            # Simulate the repo raising ValueError for missing credentials
+            repo_instance.get_siteplug_config.side_effect = ValueError("missing base_url or api_key")
+
+            with pytest.raises(ValueError, match="base_url"):
+                get_adapter(self._make_principal(), dry_run=True, tenant=self._make_tenant())
+
+        # The adapter's dry-run bypass must never be reached
+        MockSiteplug.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # 3. tenant_status — siteplug readiness checks
