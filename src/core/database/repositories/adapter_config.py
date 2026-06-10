@@ -159,6 +159,49 @@ class AdapterConfigRepository:
         """
         return (config.gam_order_name_template, config.gam_line_item_name_template)
 
+    @staticmethod
+    def get_siteplug_config(config: AdapterConfig) -> dict[str, Any]:
+        """Build Siteplug config dict suitable for SiteplugAdapter.
+
+        Reads ``config_json`` (written by the ``save_siteplug_config`` admin
+        endpoint) and returns a flat dict with at least ``base_url`` and
+        ``api_key``.  Optional keys ``timeout`` and ``max_retries`` are
+        forwarded when present.
+
+        Pure logic — no DB access. Caller must pass a pre-loaded AdapterConfig.
+
+        Raises:
+            ValueError: If the config is not a Siteplug adapter or the stored
+                ``config_json`` is missing the required credentials.
+        """
+        if config.adapter_type != "siteplug":
+            raise ValueError(
+                f"Tenant {config.tenant_id!r} is not a Siteplug adapter "
+                f"(adapter_type={config.adapter_type!r})"
+            )
+
+        raw: dict[str, Any] = config.config_json or {}
+        base_url: str = raw.get("base_url", "")
+        api_key: str = raw.get("api_key", "")
+
+        if not base_url or not api_key:
+            raise ValueError(
+                f"Siteplug adapter config for tenant {config.tenant_id!r} is "
+                "missing 'base_url' or 'api_key' in config_json. "
+                "Save the connection config via the admin UI first."
+            )
+
+        result: dict[str, Any] = {
+            "enabled": True,
+            "base_url": base_url,
+            "api_key": api_key,
+        }
+        if "timeout" in raw:
+            result["timeout"] = raw["timeout"]
+        if "max_retries" in raw:
+            result["max_retries"] = raw["max_retries"]
+        return result
+
     # ------------------------------------------------------------------
     # Write methods
     # ------------------------------------------------------------------

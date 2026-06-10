@@ -147,6 +147,8 @@ def get_adapter(
             elif adapter_type == "triton":
                 adapter_config["station_id"] = config_row.triton_station_id or ""
                 adapter_config["api_key"] = config_row.triton_api_key or ""
+            elif adapter_type == "siteplug":
+                adapter_config = repo.get_siteplug_config(config_row)
 
     if not selected_adapter:
         # Default to mock if no adapter specified

@@ -86,6 +86,14 @@ def is_tenant_ad_server_configured(tenant_id: str) -> bool:
                     logger.info(f"Tenant {tenant_id} Triton adapter missing API key")
                 return has_key
 
+            elif adapter_type == "siteplug":
+                # Siteplug requires base_url and api_key stored in config_json
+                raw = adapter_config.config_json or {}
+                has_credentials = bool(raw.get("base_url") and raw.get("api_key"))
+                if not has_credentials:
+                    logger.info(f"Tenant {tenant_id} Siteplug adapter missing base_url or api_key in config_json")
+                return has_credentials
+
             else:
                 # Unknown adapter type - consider it configured if it has a type
                 logger.warning(f"Unknown adapter type '{adapter_type}' for tenant {tenant_id}")
@@ -167,6 +175,13 @@ def get_tenant_status(tenant_id: str) -> dict:
             elif adapter_type == "triton":
                 if not adapter_config.triton_api_key:
                     missing_config.append("Triton API key not set")
+
+            elif adapter_type == "siteplug":
+                raw = adapter_config.config_json or {}
+                if not raw.get("base_url"):
+                    missing_config.append("Siteplug base_url not set")
+                if not raw.get("api_key"):
+                    missing_config.append("Siteplug api_key not set")
 
             # Mock adapter doesn't need additional config
             status["is_configured"] = len(missing_config) == 0
