@@ -419,22 +419,23 @@ class SiteplugAdapter(AdServerAdapter):
         """Return targeting capabilities.
 
         Siteplug supports keyword targeting with broad/phrase/exact match types,
-        plus geographic targeting.
+        plus geographic targeting at country and region level.
+
+        Keyword capabilities (K2 + K3 — AdCP 3.0 rc.3 compliance):
+        - keyword_targets: broad/phrase/exact match types supported via adgroup_kw_mapping
+        - negative_keywords: broad/exact match types supported (no negative phrase in Siteplug)
+        Both are declared as list[str] here and serialized to KeywordTargets/NegativeKeywords
+        objects with supported_match_types arrays in capabilities.py (not booleans).
         """
         return TargetingCapabilities(
             geo_countries=True,
             geo_regions=True,
-            nielsen_dma=False,
-            eurostat_nuts2=False,
-            us_zip=False,
-            us_zip_plus_four=False,
-            ca_fsa=False,
-            ca_full=False,
-            gb_outward=False,
-            gb_full=False,
-            de_plz=False,
-            fr_code_postal=False,
-            au_postcode=False,
+            # Keyword targeting: all three match types supported
+            # Maps to AdCP KeywordTargets.supported_match_types in get_adcp_capabilities()
+            keyword_targets=["broad", "phrase", "exact"],
+            # Negative keywords: broad and exact only (Siteplug type IDs 4 and 7; no phrase)
+            # Maps to AdCP NegativeKeywords.supported_match_types in get_adcp_capabilities()
+            negative_keywords=["broad", "exact"],
         )
 
     def get_adcp_capabilities(self) -> AdapterCapabilities:
