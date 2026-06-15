@@ -13,6 +13,7 @@ from adcp.types import GetAdcpCapabilitiesRequest, GetAdcpCapabilitiesResponse
 from adcp.types.generated_poc.core.media_buy_features import MediaBuyFeatures
 from adcp.types.generated_poc.enums.channels import MediaChannel
 from adcp.types.generated_poc.enums.specialism import AdcpSpecialism
+from adcp.types.generated_poc.enums.match_type import MatchType
 from adcp.types.generated_poc.protocol.get_adcp_capabilities_response import (
     Adcp,
     Creative,
@@ -20,8 +21,10 @@ from adcp.types.generated_poc.protocol.get_adcp_capabilities_response import (
     GeoMetros,
     GeoPostalAreas,
     Idempotency,
+    KeywordTargets,
     MajorVersion,
     MediaBuy,
+    NegativeKeywords,
     Portfolio,
     PublisherDomain,
     SupportedProtocol,
@@ -230,11 +233,27 @@ def _get_adcp_capabilities_impl(
             au_postcode=targeting_caps.au_postcode or None,
         )
 
+    # Build KeywordTargets if adapter declares supported match types
+    keyword_targets_cap = None
+    if targeting_caps and targeting_caps.keyword_targets:
+        keyword_targets_cap = KeywordTargets(
+            supported_match_types=[MatchType(mt) for mt in targeting_caps.keyword_targets]
+        )
+
+    # Build NegativeKeywords if adapter declares supported match types
+    negative_keywords_cap = None
+    if targeting_caps and targeting_caps.negative_keywords:
+        negative_keywords_cap = NegativeKeywords(
+            supported_match_types=[MatchType(mt) for mt in targeting_caps.negative_keywords]
+        )
+
     targeting = Targeting(
         geo_countries=targeting_caps.geo_countries if targeting_caps else True,
         geo_regions=targeting_caps.geo_regions if targeting_caps else True,
         geo_metros=geo_metros,
         geo_postal_areas=geo_postal_areas,
+        keyword_targets=keyword_targets_cap,
+        negative_keywords=negative_keywords_cap,
     )
 
     # Build execution capabilities

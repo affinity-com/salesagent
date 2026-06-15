@@ -56,6 +56,13 @@ class TargetingCapabilities:
     fr_code_postal: bool = False  # French postal code
     au_postcode: bool = False  # Australian postcode
 
+    # Keyword targeting — list of supported match type strings (e.g. ["broad", "phrase", "exact"])
+    # or None when the adapter does not support keyword targeting.
+    # Maps to AdCP KeywordTargets / NegativeKeywords objects with supported_match_types arrays
+    # in get_adcp_capabilities() (per get-adcp-capabilities-response.json schema, not booleans).
+    keyword_targets: list[str] | None = None
+    negative_keywords: list[str] | None = None
+
     # Maps from AdCP enum value → dataclass field name.
     _METRO_FIELDS: ClassVar[tuple[str, ...]] = (
         "nielsen_dma",
