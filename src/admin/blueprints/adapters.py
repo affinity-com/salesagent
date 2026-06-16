@@ -331,9 +331,36 @@ def save_siteplug_config(tenant_id, **kwargs):
         if not data:
             return jsonify({"success": False, "error": "No JSON data provided"}), 400
 
-        config = data.get("config", {})
-        if not config:
+        config_data = data.get("config", {})
+        if not config_data:
             return jsonify({"success": False, "error": "No config provided"}), 400
+
+        # Load existing config to preserve keys when submitted blank
+        existing_config: dict = {}
+        with get_db_session() as session:
+            stmt = select(AdapterConfig).filter_by(tenant_id=tenant_id)
+            existing = session.scalars(stmt).first()
+            if existing:
+                existing_config = existing.config_json or {}
+
+        # Preserve existing SSP api_key if new value is empty or placeholder
+        new_api_key = config_data.get("api_key", "").strip()
+        if not new_api_key or new_api_key == "••••••••":
+            config_data["api_key"] = existing_config.get("api_key", "")
+
+        # Preserve existing affilizz_api_key if new value is empty or placeholder
+        new_affilizz_api_key = config_data.get("affilizz_api_key", "").strip()
+        if not new_affilizz_api_key or new_affilizz_api_key == "••••••••":
+            config_data["affilizz_api_key"] = existing_config.get("affilizz_api_key", "")
+
+        # Build validated config dict
+        config = {
+            "base_url": config_data.get("base_url", ""),
+            "api_key": config_data.get("api_key", ""),
+            "manual_approval_required": config_data.get("manual_approval_required", True),
+            "affilizz_internal_url": config_data.get("affilizz_internal_url", ""),
+            "affilizz_api_key": config_data.get("affilizz_api_key", ""),
+        }
 
         from src.adapters.siteplug.config_schema import SiteplugConnectionConfig
         from pydantic import ValidationError as PydanticValidationError
@@ -342,6 +369,8 @@ def save_siteplug_config(tenant_id, **kwargs):
             SiteplugConnectionConfig(
                 base_url=config.get("base_url", ""),
                 api_key=config.get("api_key", ""),
+                affilizz_internal_url=config.get("affilizz_internal_url", ""),
+                affilizz_api_key=config.get("affilizz_api_key", ""),
             )
         except PydanticValidationError as e:
             return jsonify({"success": False, "error": str(e)}), 400
@@ -372,20 +401,24 @@ def save_siteplug_config(tenant_id, **kwargs):
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-
 @adapters_bp.route("/api/tenant/<tenant_id>/adapters/siteplug/test-connection", methods=["POST"])
 @require_tenant_access()
 def test_siteplug_connection(tenant_id, **kwargs):
-    """Test Siteplug SSP API connection with provided credentials."""
-    import asyncio
-
+    """Test Siteplug SSP API connection. Falls back to stored credentials when form fields are blank."""
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"success": False, "error": "No JSON data provided"}), 400
+        data = request.get_json() or {}
 
-        base_url = data.get("base_url", "").strip()
-        api_key = data.get("api_key", "").strip()
+        # Load stored config to resolve effective credentials
+        stored_config = {}
+        with get_db_session() as session:
+            stmt = select(AdapterConfig).filter_by(tenant_id=tenant_id)
+            existing = session.scalars(stmt).first()
+            if existing and existing.adapter_type == "siteplug":
+                stored_config = existing.config_json or {}
+
+        # Effective credentials: form field value takes precedence; fall back to stored
+        base_url = (data.get("base_url") or "").strip() or stored_config.get("base_url", "")
+        api_key = (data.get("api_key") or "").strip() or stored_config.get("api_key", "")
 
         if not base_url or not api_key:
             return jsonify({"success": False, "error": "base_url and api_key are required"}), 400
@@ -412,6 +445,49 @@ def test_siteplug_connection(tenant_id, **kwargs):
         return jsonify({"success": False, "error": str(e)}), 200
     except Exception as e:
         logger.error(f"Siteplug connection test failed: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@adapters_bp.route("/api/tenant/<tenant_id>/adapters/siteplug/test-affilizz-connection", methods=["POST"])
+@require_tenant_access()
+def test_affilizz_connection(tenant_id, **kwargs):
+    """Test Affilizz Internal Text Ads API connectivity. Falls back to stored credentials when blank."""
+    try:
+        data = request.get_json() or {}
+
+        # Load stored config to resolve effective credentials
+        stored_config = {}
+        with get_db_session() as session:
+            stmt = select(AdapterConfig).filter_by(tenant_id=tenant_id)
+            existing = session.scalars(stmt).first()
+            if existing and existing.adapter_type == "siteplug":
+                stored_config = existing.config_json or {}
+
+        # Effective credentials: form field value takes precedence; fall back to stored
+        affilizz_url = (data.get("affilizz_internal_url") or "").strip() or stored_config.get("affilizz_internal_url", "")
+        affilizz_key = (data.get("affilizz_api_key") or "").strip() or stored_config.get("affilizz_api_key", "")
+
+        if not affilizz_url or not affilizz_key:
+            return jsonify({"success": False, "error": "affilizz_internal_url and affilizz_api_key are required"}), 400
+
+        from src.adapters.siteplug.affilizz_client import AffilizzAPIError, AffilizzClient
+
+        client = AffilizzClient(base_url=affilizz_url, api_key=affilizz_key)
+        # Lightweight probe: validate-shop with a known domain (404 = auth OK, shop not found)
+        try:
+            asyncio.run(client.validate_shop(domain="walmart.com"))
+            return jsonify({"success": True, "message": "Affilizz API reachable and authenticated."})
+        except AffilizzAPIError as e:
+            if e.status_code == 404:
+                # 404 means auth succeeded — shop just doesn't exist, which is expected
+                return jsonify({"success": True, "message": "Affilizz API reachable and authenticated."})
+            raise
+
+    except AffilizzAPIError as e:
+        logger.warning(f"Affilizz connection test failed (API error): {e}")
+        return jsonify({"success": False, "error": str(e)}), 200
+    except Exception as e:
+        logger.error(f"Affilizz connection test failed: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -522,9 +598,7 @@ def sync_siteplug_inventory(tenant_id, **kwargs):
         client = SiteplugClient(sp_config)
 
         with get_db_session() as session:
-            principal = session.scalars(
-                sa_select(Principal).filter_by(tenant_id=tenant_id)
-            ).first()
+            principal = session.scalars(sa_select(Principal).filter_by(tenant_id=tenant_id)).first()
 
             manager = SiteplugInventoryManager(
                 client=client,

@@ -176,8 +176,7 @@ class AdapterConfigRepository:
         """
         if config.adapter_type != "siteplug":
             raise ValueError(
-                f"Tenant {config.tenant_id!r} is not a Siteplug adapter "
-                f"(adapter_type={config.adapter_type!r})"
+                f"Tenant {config.tenant_id!r} is not a Siteplug adapter (adapter_type={config.adapter_type!r})"
             )
 
         raw: dict[str, Any] = config.config_json or {}
@@ -198,6 +197,10 @@ class AdapterConfigRepository:
             # Default True — matches the admin UI checkbox default so that
             # tenants who saved config before this field existed stay safe.
             "manual_approval_required": raw.get("manual_approval_required", True),
+            # Affilizz Internal Text Ads API — optional, empty string if not configured.
+            # Used by SiteplugCreativeManager to sync siteplug_text_ad_search creatives.
+            "affilizz_internal_url": raw.get("affilizz_internal_url", ""),
+            "affilizz_api_key": raw.get("affilizz_api_key", ""),
         }
         if "timeout" in raw:
             result["timeout"] = raw["timeout"]

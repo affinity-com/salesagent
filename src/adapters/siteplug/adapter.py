@@ -126,14 +126,14 @@ class SiteplugAdapter(AdServerAdapter):
             base_url = config.get("base_url", "")
             api_key = config.get("api_key", "")
             if not base_url or not api_key:
-                raise ValueError(
-                    "Siteplug adapter config is missing 'base_url' or 'api_key'"
-                )
+                raise ValueError("Siteplug adapter config is missing 'base_url' or 'api_key'")
             self.connection_config = SiteplugConnectionConfig(
                 base_url=base_url,
                 api_key=api_key,
                 timeout=config.get("timeout", 30),
                 max_retries=config.get("max_retries", 3),
+                affilizz_internal_url=config.get("affilizz_internal_url", ""),
+                affilizz_api_key=config.get("affilizz_api_key", ""),
             )
 
         # Initialize HTTP client
@@ -145,8 +145,8 @@ class SiteplugAdapter(AdServerAdapter):
             log_func=self.log,
         )
         self.creative_manager = SiteplugCreativeManager(
-            client=self.client,
-            log_func=self.log,
+            config=self.connection_config,
+            siteplug_client=self.client,
         )
         self.inventory_manager = SiteplugInventoryManager(
             client=self.client,
@@ -408,16 +408,23 @@ class SiteplugAdapter(AdServerAdapter):
     ) -> list[AssetStatus]:
         """Add creative assets to a media buy.
 
-        Stub — wired in Task 06.
+        Delegates to :class:`~src.adapters.siteplug.managers.creative.SiteplugCreativeManager`
+        which routes ``siteplug_text_ad_search`` creatives to the Affilizz
+        Internal Text Ads API and stubs all other formats.
+
+        Args:
+            media_buy_id: Media buy identifier.
+            assets: List of AdCP creative asset dicts.
+            today: Current date.
 
         Returns:
-            Empty list of asset statuses
+            List of asset statuses from the creative manager.
         """
         self.log(
-            f"Siteplug.add_creative_assets [STUB] for '{media_buy_id}'",
+            f"Siteplug.add_creative_assets for '{media_buy_id}' ({len(assets)} asset(s))",
             dry_run_prefix=False,
         )
-        return []
+        return self.creative_manager.add_creative_assets(media_buy_id, assets, today)
 
     def associate_creatives(
         self,
@@ -446,7 +453,7 @@ class SiteplugAdapter(AdServerAdapter):
         agent_url = f"siteplug://{self.tenant_id or 'default'}"
         return [
             {
-                "format_id": {"id": "siteplug_text_ad_search", "agent_url": agent_url},
+                "format_id": {"id": "text_ad_search", "agent_url": agent_url},
                 "name": "Siteplug Text Ad (Search)",
                 "type": "search",
                 "description": "Text ad for Siteplug search placements (title + description + click URL)",
