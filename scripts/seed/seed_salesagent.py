@@ -415,14 +415,15 @@ def seed_siteplug_extra_products(conn):
         n = count(conn, f"SELECT COUNT(*) FROM products WHERE tenant_id='siteplug' AND product_id='{old_id}'")
         if n > 0:
             print(f"  Removing superseded siteplug product '{old_id}'...")
-            run_sql(conn, f"""
-                DELETE FROM pricing_options
-                WHERE tenant_id='siteplug' AND product_id='{old_id}'
-            """, f"siteplug pricing for '{old_id}' removed")
+            # Delete the product only — pricing_options are removed automatically via
+            # ON DELETE CASCADE. Do NOT delete pricing_options first: the
+            # prevent_empty_pricing_options trigger fires BEFORE the product row is
+            # gone and raises an exception when it sees the last option being removed
+            # while the product still exists.
             run_sql(conn, f"""
                 DELETE FROM products
                 WHERE tenant_id='siteplug' AND product_id='{old_id}'
-            """, f"siteplug product '{old_id}' removed")
+            """, f"siteplug product '{old_id}' removed (pricing_options cascade-deleted)")
         else:
             print(f"  ✓ superseded product '{old_id}' not present — skipping cleanup")
 
