@@ -511,9 +511,10 @@ def seed_siteplug_extra_products(conn):
             for pricing_model, rate in SSS_PRICING:
                 run_sql(conn, f"""
                     INSERT INTO pricing_options (
-                        tenant_id, product_id, pricing_model, rate, currency, is_fixed
+                        tenant_id, product_id, pricing_model, rate, currency, is_fixed, price_guidance
                     )
-                    SELECT 'siteplug', '{product_id}', '{pricing_model}', {rate}, 'USD', false
+                    SELECT 'siteplug', '{product_id}', '{pricing_model}', {rate}, 'USD', false,
+                           jsonb_build_object('floor', {rate}::numeric)
                     WHERE NOT EXISTS (
                         SELECT 1 FROM pricing_options
                         WHERE tenant_id='siteplug'
