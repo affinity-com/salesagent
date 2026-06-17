@@ -10,6 +10,7 @@ Real SSP creative upload (Task 06) will extend this manager.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import os
 from typing import Any
@@ -19,6 +20,7 @@ from src.adapters.siteplug.affilizz_client import (
     AffilizzClient,
     build_text_ad_payload,
 )
+from src.core.schemas._base import AssetStatus
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +62,7 @@ class SiteplugCreativeManager:
         media_buy_id: str,
         assets: list[dict[str, Any]],
         today: Any,
-    ) -> list[dict[str, Any]]:
+    ) -> list[AssetStatus]:
         """Route each asset to the appropriate handler based on ``format_id``.
 
         Args:
@@ -69,9 +71,9 @@ class SiteplugCreativeManager:
             today: Current date (unused here; forwarded for interface compatibility).
 
         Returns:
-            List of result dicts, one per asset.
+            List of :class:`AssetStatus` objects, one per asset.
         """
-        results: list[dict[str, Any]] = []
+        results: list[AssetStatus] = []
 
         for asset in assets:
             format_id = self._get_format_id(asset)
@@ -79,7 +81,18 @@ class SiteplugCreativeManager:
 
             if format_id == TEXT_AD_FORMAT_ID:
                 try:
-                    result = asyncio.run(self._sync_text_ad_to_affilizz(asset))
+                    # asyncio.run() cannot be called from a running event loop (MCP server
+                    # is already async). Run the coroutine in a fresh thread that owns its
+                    # own event loop instead.
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                        raw = pool.submit(asyncio.run, self._sync_text_ad_to_affilizz(asset)).result()
+                    results.append(
+                        AssetStatus(
+                            creative_id=creative_id,
+                            status=raw.get("status", "active"),
+                            message=raw.get("error") or raw.get("reason"),
+                        )
+                    )
                 except Exception as exc:
                     logger.error(
                         "Failed to sync text ad %s to Affilizz: %s",
@@ -87,24 +100,26 @@ class SiteplugCreativeManager:
                         exc,
                         exc_info=True,
                     )
-                    result = {
-                        "status": "error",
-                        "creative_id": creative_id,
-                        "error": str(exc),
-                    }
+                    results.append(
+                        AssetStatus(
+                            creative_id=creative_id,
+                            status="failed",
+                            message=str(exc),
+                        )
+                    )
             else:
                 logger.debug(
                     "add_creative_assets: format '%s' not yet implemented (creative_id=%s)",
                     format_id,
                     creative_id,
                 )
-                result = {
-                    "status": "not_implemented",
-                    "creative_id": creative_id,
-                    "format_id": format_id,
-                }
-
-            results.append(result)
+                results.append(
+                    AssetStatus(
+                        creative_id=creative_id,
+                        status="not_implemented",
+                        message=f"Format '{format_id}' not yet implemented",
+                    )
+                )
 
         return results
 
