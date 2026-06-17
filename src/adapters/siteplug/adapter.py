@@ -15,6 +15,8 @@ Entity Mapping:
 - AdCP Product → Siteplug Platform/Brand configuration
 """
 
+import asyncio
+import concurrent.futures
 import logging
 from datetime import UTC, datetime
 from typing import Any
@@ -37,19 +39,21 @@ from src.adapters.siteplug.managers import (
 )
 from src.core.schemas import (
     AdapterGetMediaBuyDeliveryResponse,
+    AffectedPackage,
     AssetStatus,
     CheckMediaBuyStatusResponse,
+    CreateMediaBuyError,
     CreateMediaBuyRequest,
     CreateMediaBuyResponse,
     CreateMediaBuySuccess,
     DeliveryTotals,
+    Error,
     MediaPackage,
     PackagePerformance,
     Principal,
     ReportingPeriod,
     UpdateMediaBuyResponse,
     UpdateMediaBuySuccess,
-    AffectedPackage,
 )
 
 logger = logging.getLogger(__name__)
@@ -175,23 +179,123 @@ class SiteplugAdapter(AdServerAdapter):
     ) -> CreateMediaBuyResponse:
         """Create a new media buy (campaign) in Siteplug.
 
-        Stub — wired in Task 02.
+        Calls ``provision_entity_stack()`` on the first package to create the
+        full entity stack (Platform → Agency → Brand → Advertiser → Campaign)
+        and returns the resulting ``siteplug_campaign_id`` as the media buy ID.
+
+        The ``implementation_config`` on the product (stored in the package's
+        product config) must supply the Siteplug-specific fields:
+        ``platform_name``, ``rtb_flag``, ``brand_name``, ``brand_domain``,
+        ``vertical``, ``sub_category``, ``campaign_type``, ``sol_id``.
+        Optional: ``deal_type``, ``budget_type``.
 
         Returns:
-            CreateMediaBuySuccess with pending_activation status
+            CreateMediaBuySuccess with ``pending_activation`` status.
         """
         self.log(
-            f"Siteplug.create_media_buy [STUB] for principal '{self.principal.name}'",
+            f"Siteplug.create_media_buy for principal '{self.principal.name}'",
             dry_run_prefix=False,
         )
 
-        media_buy_id = f"sp_{request.po_number or int(datetime.now(UTC).timestamp())}"
+        assert self.tenant_id is not None, "tenant_id required for Siteplug provisioning"
 
-        return self._build_create_success(
-            request,
-            media_buy_id,
-            packages,
+        # ── Dry-run: return a synthetic media_buy_id without API calls ────
+        if self.dry_run:
+            media_buy_id = f"sp_{request.po_number or int(datetime.now(UTC).timestamp())}"
+            self.log(f"[dry-run] Would provision entity stack → media_buy_id={media_buy_id}")
+            return self._build_create_success(request, media_buy_id, packages)
+
+        # ── Extract Siteplug config from the first package ────────────────
+        # All packages in a single media buy share the same platform/brand
+        # config (one media buy = one brand stack per the onboarding spec).
+        first_package = packages[0] if packages else None
+        if first_package is None:
+            return CreateMediaBuyError(
+                errors=[Error(code="VALIDATION_ERROR", message="No packages provided")]
+            )
+
+        # The product's implementation_config carries the Siteplug-specific
+        # provisioning fields.  The core layer stores these on the package
+        # object via the product lookup; fall back to an empty dict if absent.
+        impl_config: dict[str, Any] = getattr(first_package, "implementation_config", None) or {}
+
+        platform_name: str = impl_config.get("platform_name", "")
+        rtb_flag: int = int(impl_config.get("rtb_flag", 0))
+        brand_name: str = impl_config.get("brand_name", self.principal.name or "")
+        brand_domain: str = impl_config.get("brand_domain", "")
+        vertical: str = impl_config.get("vertical", "")
+        sub_category: str = impl_config.get("sub_category", "")
+        campaign_type: str = impl_config.get("campaign_type", "SDC")
+        sol_id: int = int(impl_config.get("sol_id", 1))
+        deal_type: str | None = impl_config.get("deal_type")
+        budget_type: int | None = (
+            int(impl_config.get("budget_type")) if impl_config.get("budget_type") is not None else None
         )
+
+        if not platform_name:
+            return CreateMediaBuyError(
+                errors=[
+                    Error(
+                        code="VALIDATION_ERROR",
+                        message=(
+                            "Siteplug product implementation_config is missing 'platform_name'. "
+                            "Configure the product with the Siteplug network name (e.g. 'CJ', 'Awin')."
+                        ),
+                    )
+                ]
+            )
+
+        # ── Provision entity stack (async → sync bridge) ──────────────────
+        # provision_entity_stack is async; create_media_buy is called
+        # synchronously by the core layer (which itself runs inside an async
+        # event loop).  asyncio.run() would raise "event loop already running",
+        # so we spin up a dedicated thread with its own event loop instead.
+        provisional_media_buy_id = f"sp_{request.po_number or int(datetime.now(UTC).timestamp())}"
+
+        async def _run_provision() -> int:
+            return await self.campaign_manager.provision_entity_stack(
+                media_buy_id=provisional_media_buy_id,
+                package_id=first_package.package_id,
+                platform_name=platform_name,
+                rtb_flag=rtb_flag,
+                brand_name=brand_name,
+                brand_domain=brand_domain,
+                vertical=vertical,
+                sub_category=sub_category,
+                campaign_type=campaign_type,
+                sol_id=sol_id,
+                deal_type=deal_type,
+                budget_type=budget_type,
+                tenant_id=self.tenant_id,
+                idempotency_key=request.idempotency_key,
+            )
+
+        def _run_in_new_loop() -> int:
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(_run_provision())
+            finally:
+                loop.close()
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_run_in_new_loop)
+                campaign_id: int = future.result()
+        except Exception as exc:
+            logger.error(f"Siteplug.create_media_buy: provisioning failed: {exc}", exc_info=True)
+            return CreateMediaBuyError(
+                errors=[
+                    Error(
+                        code="PROVISIONING_ERROR",
+                        message=f"Siteplug entity provisioning failed: {exc}",
+                    )
+                ]
+            )
+
+        media_buy_id = f"sp_{campaign_id}"
+        self.log(f"Siteplug.create_media_buy: provisioned campaign_id={campaign_id} → media_buy_id={media_buy_id}")
+
+        return self._build_create_success(request, media_buy_id, packages)
 
     def update_media_buy(
         self,
