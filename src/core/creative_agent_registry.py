@@ -22,6 +22,7 @@ import copy
 import logging
 import os
 import typing
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -30,7 +31,7 @@ from adcp import ADCPMultiAgentClient, ListCreativeFormatsRequest
 from adcp.exceptions import ADCPAuthenticationError, ADCPConnectionError, ADCPError, ADCPTimeoutError
 from adcp.types import AssetContentType as AssetType
 from adcp.types import Error as AdCPResponseError
-from adcp.types import ImageFormatAsset
+from adcp.types import ImageFormatAsset, TextFormatAsset, UrlFormatAsset
 from pydantic import ValidationError
 from yarl import URL
 
@@ -62,7 +63,10 @@ def _known_asset_types() -> frozenset[str]:
     return frozenset(literals)
 
 
-_KNOWN_ASSET_TYPES = _known_asset_types()
+# Bug 5: "url" is used by text_ad_search's category_url asset but is not in adcp's
+# closed discriminated union (ImageFormatAsset | VideoFormatAsset | …).  Add it
+# explicitly so _validate_formats_tolerant() does NOT drop text_ad_search.
+_KNOWN_ASSET_TYPES = _known_asset_types() | frozenset({"url"})
 _SCHEMA_VALIDATION_FAILURE_MARKERS = (
     "doesn't match expected schema",
     "does not match expected schema",
@@ -205,6 +209,33 @@ def _create_mock_format(format_id_str: str, name: str, asset_type: str) -> Forma
     )
 
 
+def _create_mock_text_ad_search_format() -> Format:
+    """Create a mock text_ad_search format with text + url assets."""
+    assets: list[ImageFormatAsset | TextFormatAsset | UrlFormatAsset] = [
+        TextFormatAsset(item_type="individual", asset_id="brief", asset_type="text", required=False),
+        TextFormatAsset(item_type="individual", asset_id="language", asset_type="text", required=True),
+        TextFormatAsset(item_type="individual", asset_id="country", asset_type="text", required=True),
+        UrlFormatAsset(item_type="individual", asset_id="category_url", asset_type="url", required=False),
+        TextFormatAsset(item_type="individual", asset_id="category_name", asset_type="text", required=False),
+        TextFormatAsset(item_type="individual", asset_id="title", asset_type="text", required=False),
+        TextFormatAsset(item_type="individual", asset_id="description", asset_type="text", required=False),
+        UrlFormatAsset(item_type="individual", asset_id="click_url", asset_type="url", required=False),
+    ]
+    return Format(
+        format_id=FormatId(id="text_ad_search", agent_url=url("https://creative.adcontextprotocol.org")),
+        name="Text Ad (Search)",
+        assets=assets,
+        is_standard=True,
+        # Generative format: mirrors creative-agent's TEXT_AD_SEARCH_FORMAT.output_format_ids
+        output_format_ids=[FormatId(id="text_ad_search", agent_url=url("https://creative.adcontextprotocol.org"))],
+        platform_config=None,
+        category=None,
+        requirements=None,
+        iab_specification=None,
+        accepts_3p_tags=None,
+    )
+
+
 def _get_mock_formats() -> list[Format]:
     """Return mock formats for testing mode (ADCP_TESTING=true).
 
@@ -224,6 +255,7 @@ def _get_mock_formats() -> list[Format]:
         _create_mock_format("display_image", "Display Image", "image"),
         _create_mock_format("display_html", "Display HTML", "image"),
         _create_mock_format("display_js", "Display JavaScript", "image"),
+        _create_mock_text_ad_search_format(),
     ]
 
 
@@ -935,24 +967,29 @@ class CreativeAgentRegistry:
         agent_url: str,
         format_id: str,
         message: str,
-        gemini_api_key: str,
+        gemini_api_key: str | None = None,
         promoted_offerings: dict[str, Any] | None = None,
         context_id: str | None = None,
         finalize: bool = False,
+        creative_manifest: dict[str, Any] | None = None,
+        brand: str | dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Build a creative using AI generation via the creative agent.
 
-        This calls the creative agent's build_creative tool which requires the user's
-        Gemini API key (the creative agent doesn't pay for API calls).
+        This calls the creative agent's build_creative tool.
 
         Args:
             agent_url: URL of the creative agent
-            format_id: Format ID (must be generative type like display_300x250_generative)
+            format_id: Format ID (e.g. "text_ad_search", "display_300x250_generative")
             message: Creative brief or refinement instructions
-            gemini_api_key: User's Gemini API key (REQUIRED)
+            gemini_api_key: User's Gemini API key (only required for Gemini-based formats)
             promoted_offerings: Brand and product information for AI generation
             context_id: Session ID for iterative refinement (optional)
             finalize: Set to true to finalize the creative (default: False)
+            creative_manifest: Input assets dict (brief, language, country, category_url, etc.)
+            brand: Brand identifier — string domain or dict with "domain" key
+            idempotency_key: Optional idempotency key for deduplication
 
         Returns:
             Build response containing:
@@ -963,12 +1000,28 @@ class CreativeAgentRegistry:
         """
         # Use custom MCP client for non-standard tools (build_creative not in AdCP spec)
         async with create_mcp_client(agent_url=agent_url, timeout=30) as client:
-            params = {
+            # Bug 6: creative-agent handler reads "target_format_id" (not "format_id")
+            # and expects "creative_manifest" + "brand" for text_ad_search.
+            # Bug C: target_format_id must be an object {id, agent_url}, not a plain string.
+            params: dict[str, Any] = {
                 "message": message,
-                "format_id": format_id,
-                "gemini_api_key": gemini_api_key,
+                "target_format_id": {"id": format_id, "agent_url": agent_url},
                 "finalize": finalize,
             }
+
+            if creative_manifest is not None:
+                params["creative_manifest"] = creative_manifest
+
+            if brand is not None:
+                params["brand"] = brand
+
+            if idempotency_key is None:
+                idempotency_key = uuid.uuid4().hex
+            params["idempotency_key"] = idempotency_key
+
+            # gemini_api_key is only needed for Gemini-based (non-Vertex) formats
+            if gemini_api_key:
+                params["gemini_api_key"] = gemini_api_key
 
             if promoted_offerings:
                 params["promoted_offerings"] = promoted_offerings

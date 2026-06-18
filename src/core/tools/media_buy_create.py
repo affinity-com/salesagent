@@ -102,6 +102,7 @@ from src.core.audit_logger import get_audit_logger
 from src.core.auth import (
     get_principal_object,
 )
+from src.core.validation_helpers import run_async_in_sync_context
 from src.core.context_manager import get_context_manager
 from src.core.database.models import MediaBuy
 from src.core.database.models import Principal as ModelPrincipal
@@ -232,11 +233,12 @@ def _determine_media_buy_status(
 
 
 def _get_format_spec_sync(agent_url: str, format_id: str) -> Any | None:
-    """Get format specification synchronously using asyncio.run().
+    """Get format specification synchronously using run_async_in_sync_context().
 
     This helper function wraps the async registry.get_format() call to make it
-    usable in synchronous contexts. The registry uses in-memory cache (30min TTL)
-    and falls back to the creative agent if not cached.
+    usable in synchronous contexts (including when called from within an async
+    function). The registry uses in-memory cache (30min TTL) and falls back to
+    the creative agent if not cached.
 
     Args:
         agent_url: Creative agent URL
@@ -245,14 +247,12 @@ def _get_format_spec_sync(agent_url: str, format_id: str) -> Any | None:
     Returns:
         Format specification object or None if not found
     """
-    import asyncio
-
     from src.core.creative_agent_registry import get_creative_agent_registry
 
     registry = get_creative_agent_registry()
 
     try:
-        return asyncio.run(registry.get_format(agent_url, format_id))
+        return run_async_in_sync_context(registry.get_format(agent_url, format_id))
     except Exception as e:
         logger.warning(f"Could not fetch format {format_id} from {agent_url}: {e}")
         return None
@@ -319,13 +319,17 @@ def _validate_creatives_before_adapter_call(
         if creative.format:
             format_spec = _get_format_spec_sync(creative.agent_url, str(creative.format))
 
-        # Fail validation if format spec not found (no skipping!)
         if not format_spec:
-            validation_errors.append(
-                f"Creative {creative.creative_id} has unknown format '{creative.format}' "
-                f"from agent {creative.agent_url}. Format must be registered with the creative agent."
-            )
-            continue
+            agent_url_str = str(creative.agent_url) if creative.agent_url else ""
+            is_adapter_format = not agent_url_str.startswith(("http://", "https://"))
+            if is_adapter_format:
+                # Non-HTTP agent URLs (e.g. broadstreet://) are adapter-provided formats;
+                # validation is handled internally by the adapter — skip silently.
+                logger.debug(
+                    f"Skipping validation for adapter-provided format '{creative.format}' "
+                    f"(agent_url: {creative.agent_url})"
+                )
+                continue
 
         # Skip validation for generative formats - they need conversion first
         # Generative formats have output_format_ids (they generate reference formats)
@@ -568,7 +572,12 @@ def _build_adapter_asset_from_creative(
     click_url = extract_click_url(creative_data, format_spec)
     impression_tracker_url = extract_impression_tracker_url(creative_data, format_spec)
 
-    if not url or not width or not height:
+    # For text_ad_search creatives, url/width/height are not required —
+    # the SiteplugCreativeManager reads from creative_data["assets"] directly.
+    format_str = str(creative.format) if creative.format else ""
+    is_text_ad = format_str == "text_ad_search"
+
+    if not is_text_ad and (not url or not width or not height):
         return None, (
             f"Creative {creative.creative_id} missing url/width/height "
             f"(width={width}, height={height}, url={'set' if url else 'missing'}, format={creative.format})"
@@ -583,6 +592,13 @@ def _build_adapter_asset_from_creative(
         "click_url": click_url,
         "asset_type": creative_data.get("asset_type", "image"),
         "name": creative.name or f"Creative {creative.creative_id}",
+        # Pass raw assets dict so format-specific managers (e.g. SiteplugCreativeManager
+        # for text_ad_search) can read structured asset fields directly.
+        "assets": creative_data.get("assets") or {},
+        # Pass format_id so the creative manager can route by format.
+        "format_id": format_str,
+        # Pass brand info (domain) so Affilizz shop validation can proceed.
+        "brand": creative_data.get("brand") or {},
     }
     if impression_tracker_url:
         asset["delivery_settings"] = {"tracking_urls": {"impression": [impression_tracker_url]}}
@@ -3570,6 +3586,18 @@ async def _create_media_buy_impl(
                                             },
                                         )
                                     assert asset is not None
+
+                                    # Bug A: if creative was synced without brand (e.g. brand is
+                                    # on the media buy request, not the creative payload), fall back
+                                    # to req.brand so SiteplugCreativeManager can read brand.domain.
+                                    if not asset.get("brand") and req.brand:
+                                        req_brand = req.brand
+                                        if hasattr(req_brand, "model_dump"):
+                                            asset["brand"] = req_brand.model_dump(mode="json")
+                                        elif isinstance(req_brand, dict):
+                                            asset["brand"] = req_brand
+                                        elif isinstance(req_brand, str):
+                                            asset["brand"] = {"domain": req_brand}
 
                                     upload_result = adapter.add_creative_assets(
                                         response.media_buy_id if response.media_buy_id else "",

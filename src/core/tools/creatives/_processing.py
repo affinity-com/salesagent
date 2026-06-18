@@ -168,9 +168,10 @@ def _update_existing_creative(
             # This avoids async HTTP calls inside savepoint
 
             # Find matching format
+            # Compare only the string ID to avoid trailing-slash mismatch on agent_url
             format_obj = None
             for fmt in all_formats:
-                if fmt.format_id == creative_format:
+                if fmt.format_id.id == creative_format.id:
                     format_obj = fmt
                     break
 
@@ -180,18 +181,23 @@ def _update_existing_creative(
 
                 if is_generative:
                     # Generative creative update - rebuild using AI
+                    # Bug 1: text_ad_search uses Vertex AI (not Gemini API key).
+                    # Only gate on GEMINI_API_KEY for formats that actually need it.
+                    format_id_str = creative_format.id if hasattr(creative_format, "id") else str(creative_format)
+                    uses_gemini_api_key = format_id_str != "text_ad_search"
+
                     logger.info(
-                        f"[sync_creatives] Detected generative format update: {creative_format}, "
-                        f"checking for Gemini API key"
+                        f"[sync_creatives] Detected generative format update: {creative_format}"
+                        + (", checking for Gemini API key" if uses_gemini_api_key else " (Vertex AI — no Gemini key needed)")
                     )
 
-                    # Get Gemini API key from config
+                    # Get Gemini API key from config (only required for non-Vertex formats)
                     from src.core.config import get_config
 
                     config = get_config()
                     gemini_api_key = config.gemini_api_key
 
-                    if not gemini_api_key:
+                    if uses_gemini_api_key and not gemini_api_key:
                         error_msg = (
                             f"Cannot update generative creative {creative_format}: GEMINI_API_KEY not configured"
                         )
@@ -245,15 +251,18 @@ def _update_existing_creative(
                             f"context_id={context_id}"
                         )
 
+                        format_id_str = creative_format.id if hasattr(creative_format, "id") else str(creative_format)
                         build_result = run_async_in_sync_context(
                             registry.build_creative(
                                 agent_url=format_obj.agent_url,
-                                format_id=creative_format,
+                                format_id=format_id_str,
                                 message=message,
                                 gemini_api_key=gemini_api_key,
                                 promoted_offerings=promoted_offerings,
                                 context_id=context_id,
                                 finalize=getattr(creative, "approved", False),
+                                creative_manifest={"format_id": {"id": format_id_str, "agent_url": str(format_obj.agent_url)}, "assets": dict(creative.assets or {})},
+                                brand=getattr(creative, "brand", None),
                             )
                         )
 
@@ -279,6 +288,14 @@ def _update_existing_creative(
                                         "[sync_creatives] Preserving user-provided assets in update, "
                                         "not overwriting with generative output"
                                     )
+
+                            # Gap B: fallback to creative_manifest assets if creative_output had none
+                            if not data.get("assets") and not user_provided_assets:
+                                manifest_assets = build_result.get("creative_manifest", {}).get("assets")
+                                if manifest_assets:
+                                    data["assets"] = manifest_assets
+                                    changes.append("assets")
+                                    logger.info("[sync_creatives] Using assets from creative_manifest (update)")
 
                                 if creative_output.get("output_format"):
                                     output_format = creative_output["output_format"]
@@ -498,9 +515,10 @@ def _create_new_creative(
             # This avoids async HTTP calls inside savepoint
 
             # Find matching format
+            # Compare only the string ID to avoid trailing-slash mismatch on agent_url
             format_obj = None
             for fmt in all_formats:
-                if fmt.format_id == creative_format:
+                if fmt.format_id.id == creative_format.id:
                     format_obj = fmt
                     break
 
@@ -510,17 +528,23 @@ def _create_new_creative(
 
                 if is_generative:
                     # Generative creative - call build_creative
+                    # Bug 1: text_ad_search uses Vertex AI (not Gemini API key).
+                    # Only gate on GEMINI_API_KEY for formats that actually need it.
+                    format_id_str = creative_format.id if hasattr(creative_format, "id") else str(creative_format)
+                    uses_gemini_api_key = format_id_str != "text_ad_search"
+
                     logger.info(
-                        f"[sync_creatives] Detected generative format: {creative_format}, checking for Gemini API key"
+                        f"[sync_creatives] Detected generative format: {creative_format}"
+                        + (", checking for Gemini API key" if uses_gemini_api_key else " (Vertex AI — no Gemini key needed)")
                     )
 
-                    # Get Gemini API key from config
+                    # Get Gemini API key from config (only required for non-Vertex formats)
                     from src.core.config import get_config
 
                     config = get_config()
                     gemini_api_key = config.gemini_api_key
 
-                    if not gemini_api_key:
+                    if uses_gemini_api_key and not gemini_api_key:
                         error_msg = f"Cannot build generative creative {creative_format}: GEMINI_API_KEY not configured"
                         logger.error(f"[sync_creatives] {error_msg}")
                         raise ValueError(error_msg)
@@ -578,6 +602,8 @@ def _create_new_creative(
                             promoted_offerings=promoted_offerings,
                             context_id=getattr(creative, "context_id", None),
                             finalize=getattr(creative, "approved", False),
+                            creative_manifest={"format_id": {"id": format_id_str, "agent_url": str(format_obj.agent_url)}, "assets": dict(creative.assets or {})},
+                            brand=getattr(creative, "brand", None),
                         )
                     )
 
@@ -600,6 +626,13 @@ def _create_new_creative(
                                     "[sync_creatives] Preserving user-provided assets, "
                                     "not overwriting with generative output"
                                 )
+
+                        # Gap B: fallback to creative_manifest assets if creative_output had none
+                        if not data.get("assets") and not user_provided_assets:
+                            manifest_assets = build_result.get("creative_manifest", {}).get("assets")
+                            if manifest_assets:
+                                data["assets"] = manifest_assets
+                                logger.info("[sync_creatives] Using assets from creative_manifest")
 
                             if creative_output.get("output_format"):
                                 output_format = creative_output["output_format"]
