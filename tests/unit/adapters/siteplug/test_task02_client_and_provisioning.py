@@ -6,7 +6,7 @@ Covers:
 - SiteplugClient method routing (platforms, agencies, brands, advertisers, campaigns, onboard)
 - provision_entity_stack: onboarding primary path (207 parse + idempotency guard)
 - provision_entity_stack: sequential fallback (per-step guards, 409 platform resolution)
-- provision_entity_stack: agency skipped when rtb_flag=0
+- provision_entity_stack: agency always skipped (non-RTB, agency_id=0 unconditionally)
 - SiteplugAdapter.create_media_buy: dry-run, missing platform_name, provisioning error
 """
 
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import time
+import unittest.mock
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -311,7 +312,6 @@ class TestProvisionEntityStackOnboarding:
                 media_buy_id="sp_123",
                 package_id="pkg-1",
                 platform_name="CJ",
-                rtb_flag=1,
                 brand_name="Acme",
                 brand_domain="acme.com",
                 vertical="Retail",
@@ -322,13 +322,16 @@ class TestProvisionEntityStackOnboarding:
             )
 
         assert result == 99
-        mock_persist.assert_called_once()
-        call_kwargs = mock_persist.call_args.kwargs
-        assert call_kwargs["campaign_id"] == 99
-        assert call_kwargs["platform_id"] == 1
-        assert call_kwargs["agency_id"] == 5
-        assert call_kwargs["brand_id"] == 10
-        assert call_kwargs["advertiser_id"] == 20
+        mock_persist.assert_called_once_with(
+            media_buy_id=unittest.mock.ANY,
+            package_id=unittest.mock.ANY,
+            platform_id=1,
+            agency_id=5,
+            brand_id=10,
+            advertiser_id=20,
+            campaign_id=99,
+            tenant_id=unittest.mock.ANY,
+        )
 
     @pytest.mark.asyncio
     async def test_idempotency_guard_skips_onboard_when_campaign_id_exists(self):
@@ -341,7 +344,6 @@ class TestProvisionEntityStackOnboarding:
                 media_buy_id="sp_123",
                 package_id="pkg-1",
                 platform_name="CJ",
-                rtb_flag=0,
                 brand_name="Acme",
                 brand_domain="acme.com",
                 vertical="Retail",
@@ -379,7 +381,6 @@ class TestProvisionEntityStackOnboarding:
                 media_buy_id="sp_123",
                 package_id="pkg-1",
                 platform_name="CJ",
-                rtb_flag=0,
                 brand_name="Acme",
                 brand_domain="acme.com",
                 vertical="Retail",
@@ -404,7 +405,6 @@ class TestProvisionEntityStackOnboarding:
                 media_buy_id="sp_123",
                 package_id="pkg-1",
                 platform_name="CJ",
-                rtb_flag=1,
                 brand_name="Acme",
                 brand_domain="acme.com",
                 vertical="Retail",
@@ -423,7 +423,7 @@ class TestProvisionEntityStackOnboarding:
         assert "deal_type" not in payload
         assert "budget_type" not in payload
         assert payload["platform_name"] == "CJ"
-        assert payload["rtb_flag"] == 1
+        assert payload["rtb_flag"] == 0  # always 0 — all AdCP campaigns are non-RTB
         assert len(payload["brands"]) == 1
         assert payload["brands"][0]["brand_name"] == "Acme"
 
@@ -446,7 +446,6 @@ class TestProvisionEntityStackOnboarding:
                 media_buy_id="sp_123",
                 package_id="pkg-1",
                 platform_name="CJ",
-                rtb_flag=0,
                 brand_name="Acme",
                 brand_domain="acme.com",
                 vertical="Retail",
@@ -467,15 +466,18 @@ class TestProvisionEntityStackOnboarding:
 class TestProvisionEntityStackSequential:
     def _make_manager(self):
         client = MagicMock()
+        client.list_platforms = AsyncMock(return_value=[])  # empty → triggers POST
         client.create_platform = AsyncMock(return_value={"platform_id": 1})
         client.create_agency = AsyncMock(return_value={"masteraccount_id": 5})
+        client.list_advertisers = AsyncMock(return_value=[])  # empty → triggers POST
         client.create_brand = AsyncMock(return_value={"brand_id": 10})
         client.create_advertiser = AsyncMock(return_value={"advertiser_id": 20})
         client.create_campaign = AsyncMock(return_value={"campaign_id": 30})
         return SiteplugCampaignManager(client=client, log_func=lambda msg, **kw: None), client
 
     @pytest.mark.asyncio
-    async def test_sequential_happy_path_rtb(self):
+    async def test_sequential_happy_path(self):
+        """Agency is always skipped; platform resolved via GET then POST; advertiser via POST."""
         manager, client = self._make_manager()
 
         persisted = []
@@ -485,13 +487,13 @@ class TestProvisionEntityStackSequential:
                 media_buy_id="sp_123",
                 package_id="pkg-1",
                 platform_name="CJ",
-                rtb_flag=1,
                 brand_name="Acme",
                 brand_domain="acme.com",
                 vertical="Retail",
                 sub_category="Fashion",
                 campaign_type="SDC",
                 sol_id=1,
+                is_product=0,
                 deal_type=None,
                 budget_type=None,
                 tenant_id="test-tenant",
@@ -499,14 +501,23 @@ class TestProvisionEntityStackSequential:
             )
 
         assert result == 30
-        client.create_platform.assert_called_once()
-        client.create_agency.assert_called_once()
-        client.create_brand.assert_called_once()
-        client.create_advertiser.assert_called_once()
-        client.create_campaign.assert_called_once()
+        client.create_platform.assert_called_once_with(
+            {"platform": "CJ"}, idempotency_key=unittest.mock.ANY
+        )
+        client.create_agency.assert_not_called()  # C1: agency always skipped
+        client.create_brand.assert_called_once_with(
+            unittest.mock.ANY, idempotency_key=unittest.mock.ANY
+        )
+        client.create_advertiser.assert_called_once_with(
+            unittest.mock.ANY, idempotency_key=unittest.mock.ANY
+        )
+        client.create_campaign.assert_called_once_with(
+            unittest.mock.ANY, idempotency_key=unittest.mock.ANY
+        )
 
     @pytest.mark.asyncio
-    async def test_sequential_skips_agency_when_rtb_flag_0(self):
+    async def test_sequential_always_skips_agency(self):
+        """Agency step is unconditionally skipped — agency_id=0 always (C1)."""
         manager, client = self._make_manager()
 
         with patch.object(manager, "_read_package_config_field", return_value=None), \
@@ -515,13 +526,13 @@ class TestProvisionEntityStackSequential:
                 media_buy_id="sp_123",
                 package_id="pkg-1",
                 platform_name="CJ",
-                rtb_flag=0,
                 brand_name="Acme",
                 brand_domain="acme.com",
                 vertical="Retail",
                 sub_category="Fashion",
                 campaign_type="SDC",
                 sol_id=1,
+                is_product=0,
                 deal_type=None,
                 budget_type=None,
                 tenant_id="test-tenant",
@@ -531,12 +542,11 @@ class TestProvisionEntityStackSequential:
         client.create_agency.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_sequential_resolves_409_platform_via_search(self):
+    async def test_sequential_resolves_existing_platform_via_search(self):
+        """Platform is resolved via GET /platforms?search= first; POST only if not found."""
         manager, client = self._make_manager()
-        client.create_platform = AsyncMock(
-            side_effect=SiteplugAPIError("exists", status_code=409, error_code="ENTITY_ALREADY_EXISTS")
-        )
-        client.list_platforms = AsyncMock(return_value=[{"platform_name": "CJ", "platform_id": 7}])
+        # GET returns the existing platform — POST should NOT be called
+        client.list_platforms = AsyncMock(return_value=[{"platform": "CJ", "platform_id": 7}])
 
         with patch.object(manager, "_read_package_config_field", return_value=None), \
              patch.object(manager, "_persist_entity_ids"):
@@ -544,13 +554,13 @@ class TestProvisionEntityStackSequential:
                 media_buy_id="sp_123",
                 package_id="pkg-1",
                 platform_name="CJ",
-                rtb_flag=0,
                 brand_name="Acme",
                 brand_domain="acme.com",
                 vertical="Retail",
                 sub_category="Fashion",
                 campaign_type="SDC",
                 sol_id=1,
+                is_product=0,
                 deal_type=None,
                 budget_type=None,
                 tenant_id="test-tenant",
@@ -559,10 +569,11 @@ class TestProvisionEntityStackSequential:
 
         assert result == 30  # campaign_id from mock
         client.list_platforms.assert_called_once_with(search="CJ")
+        client.create_platform.assert_not_called()  # resolved via GET, no POST needed
 
     @pytest.mark.asyncio
     async def test_sequential_per_step_idempotency_skips_existing(self):
-        """If platform_id already in package_config, skip create_platform."""
+        """If platform_id already in package_config, skip platform resolution entirely."""
         manager, client = self._make_manager()
 
         def read_field(media_buy_id, package_id, field, tenant_id):
@@ -576,13 +587,13 @@ class TestProvisionEntityStackSequential:
                 media_buy_id="sp_123",
                 package_id="pkg-1",
                 platform_name="CJ",
-                rtb_flag=0,
                 brand_name="Acme",
                 brand_domain="acme.com",
                 vertical="Retail",
                 sub_category="Fashion",
                 campaign_type="SDC",
                 sol_id=1,
+                is_product=0,
                 deal_type=None,
                 budget_type=None,
                 tenant_id="test-tenant",
@@ -590,7 +601,10 @@ class TestProvisionEntityStackSequential:
             )
 
         client.create_platform.assert_not_called()
-        client.create_brand.assert_called_once()  # brand still created
+        client.list_platforms.assert_not_called()  # skipped entirely when ID already in config
+        client.create_brand.assert_called_once_with(
+            unittest.mock.ANY, idempotency_key=unittest.mock.ANY
+        )  # brand still created
 
 
 # ---------------------------------------------------------------------------
@@ -620,13 +634,13 @@ class TestAdapterCreateMediaBuy:
         if impl_config is None:
             pkg.implementation_config = {
                 "platform_name": "CJ",
-                "rtb_flag": 0,
                 "brand_name": "Acme",
                 "brand_domain": "acme.com",
                 "vertical": "Retail",
                 "sub_category": "Fashion",
                 "campaign_type": "SDC",
                 "sol_id": 1,
+                "is_product": 0,
             }
         else:
             pkg.implementation_config = impl_config
@@ -641,25 +655,22 @@ class TestAdapterCreateMediaBuy:
 
         assert result.media_buy_id.startswith("sp_")
 
-    def test_missing_platform_name_returns_error(self):
-        from src.core.schemas import CreateMediaBuyError
+    def test_missing_platform_name_raises_validation_error(self):
+        from src.core.exceptions import AdCPValidationError
         adapter = self._make_adapter(dry_run=False)
         req = self._make_request()
         pkg = self._make_package(impl_config={})  # no platform_name
 
-        result = adapter.create_media_buy(req, [pkg], MagicMock(), MagicMock())
+        with pytest.raises(AdCPValidationError, match="platform_name"):
+            adapter.create_media_buy(req, [pkg], MagicMock(), MagicMock())
 
-        assert isinstance(result, CreateMediaBuyError)
-        assert result.errors[0].code == "VALIDATION_ERROR"
-
-    def test_no_packages_returns_error(self):
-        from src.core.schemas import CreateMediaBuyError
+    def test_no_packages_raises_validation_error(self):
+        from src.core.exceptions import AdCPValidationError
         adapter = self._make_adapter(dry_run=False)
         req = self._make_request()
 
-        result = adapter.create_media_buy(req, [], MagicMock(), MagicMock())
-
-        assert isinstance(result, CreateMediaBuyError)
+        with pytest.raises(AdCPValidationError, match="No packages"):
+            adapter.create_media_buy(req, [], MagicMock(), MagicMock())
 
     def test_provisioning_success_returns_sp_campaign_id(self):
         from src.core.schemas import CreateMediaBuySuccess
@@ -673,8 +684,8 @@ class TestAdapterCreateMediaBuy:
         assert isinstance(result, CreateMediaBuySuccess)
         assert result.media_buy_id == "sp_42"
 
-    def test_provisioning_error_returns_error_response(self):
-        from src.core.schemas import CreateMediaBuyError
+    def test_provisioning_error_raises_validation_error(self):
+        from src.core.exceptions import AdCPValidationError
         adapter = self._make_adapter(dry_run=False)
         req = self._make_request()
         pkg = self._make_package()
@@ -684,7 +695,5 @@ class TestAdapterCreateMediaBuy:
             "provision_entity_stack",
             new=AsyncMock(side_effect=SiteplugAPIError("SP failed", error_code="PLATFORM_ERROR")),
         ):
-            result = adapter.create_media_buy(req, [pkg], MagicMock(), MagicMock())
-
-        assert isinstance(result, CreateMediaBuyError)
-        assert result.errors[0].code == "PROVISIONING_ERROR"
+            with pytest.raises(AdCPValidationError, match="provisioning failed"):
+                adapter.create_media_buy(req, [pkg], MagicMock(), MagicMock())

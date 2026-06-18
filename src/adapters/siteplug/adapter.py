@@ -37,6 +37,7 @@ from src.adapters.siteplug.managers import (
     SiteplugTargetingManager,
     SiteplugWorkflowManager,
 )
+from src.core.exceptions import AdCPValidationError
 from src.core.schemas import (
     AdapterGetMediaBuyDeliveryResponse,
     AffectedPackage,
@@ -180,14 +181,20 @@ class SiteplugAdapter(AdServerAdapter):
         """Create a new media buy (campaign) in Siteplug.
 
         Calls ``provision_entity_stack()`` on the first package to create the
-        full entity stack (Platform → Agency → Brand → Advertiser → Campaign)
-        and returns the resulting ``siteplug_campaign_id`` as the media buy ID.
+        full entity stack (Platform → Brand → Advertiser → Campaign) and
+        returns the resulting ``siteplug_campaign_id`` as the media buy ID.
 
         The ``implementation_config`` on the product (stored in the package's
         product config) must supply the Siteplug-specific fields:
-        ``platform_name``, ``rtb_flag``, ``brand_name``, ``brand_domain``,
-        ``vertical``, ``sub_category``, ``campaign_type``, ``sol_id``.
-        Optional: ``deal_type``, ``budget_type``.
+        ``platform_name``, ``brand_name``, ``brand_domain``, ``vertical``,
+        ``sub_category``, ``campaign_type``, ``sol_id``.
+        Optional: ``deal_type``, ``budget_type``, ``is_product``.
+
+        Fix 5: ``package_id`` is used as the stable idempotency lookup key
+        (known before provisioning, never changes). The provisional
+        ``sp_{po_number}`` key was causing the idempotency guard to miss on
+        retry because IDs were stored under a different key than the final
+        ``sp_{campaign_id}`` media_buy_id.
 
         Returns:
             CreateMediaBuySuccess with ``pending_activation`` status.
@@ -210,9 +217,7 @@ class SiteplugAdapter(AdServerAdapter):
         # config (one media buy = one brand stack per the onboarding spec).
         first_package = packages[0] if packages else None
         if first_package is None:
-            return CreateMediaBuyError(
-                errors=[Error(code="VALIDATION_ERROR", message="No packages provided")]
-            )
+            raise AdCPValidationError("No packages provided")
 
         # The product's implementation_config carries the Siteplug-specific
         # provisioning fields.  The core layer stores these on the package
@@ -220,29 +225,22 @@ class SiteplugAdapter(AdServerAdapter):
         impl_config: dict[str, Any] = getattr(first_package, "implementation_config", None) or {}
 
         platform_name: str = impl_config.get("platform_name", "")
-        rtb_flag: int = int(impl_config.get("rtb_flag", 0))
         brand_name: str = impl_config.get("brand_name", self.principal.name or "")
         brand_domain: str = impl_config.get("brand_domain", "")
         vertical: str = impl_config.get("vertical", "")
         sub_category: str = impl_config.get("sub_category", "")
         campaign_type: str = impl_config.get("campaign_type", "SDC")
         sol_id: int = int(impl_config.get("sol_id", 1))
+        is_product: int = int(impl_config.get("is_product", 0))
         deal_type: str | None = impl_config.get("deal_type")
         budget_type: int | None = (
             int(impl_config.get("budget_type")) if impl_config.get("budget_type") is not None else None
         )
 
         if not platform_name:
-            return CreateMediaBuyError(
-                errors=[
-                    Error(
-                        code="VALIDATION_ERROR",
-                        message=(
-                            "Siteplug product implementation_config is missing 'platform_name'. "
-                            "Configure the product with the Siteplug network name (e.g. 'CJ', 'Awin')."
-                        ),
-                    )
-                ]
+            raise AdCPValidationError(
+                "Siteplug product implementation_config is missing 'platform_name'. "
+                "Configure the product with the Siteplug network name (e.g. 'CJ', 'Awin')."
             )
 
         # ── Provision entity stack (async → sync bridge) ──────────────────
@@ -250,20 +248,24 @@ class SiteplugAdapter(AdServerAdapter):
         # synchronously by the core layer (which itself runs inside an async
         # event loop).  asyncio.run() would raise "event loop already running",
         # so we spin up a dedicated thread with its own event loop instead.
-        provisional_media_buy_id = f"sp_{request.po_number or int(datetime.now(UTC).timestamp())}"
+        #
+        # Fix 5: Use first_package.package_id as the stable media_buy_id for
+        # the idempotency guard. This key is known before provisioning and
+        # never changes, so retries correctly find the already-stored IDs.
+        stable_lookup_id = first_package.package_id
 
         async def _run_provision() -> int:
             return await self.campaign_manager.provision_entity_stack(
-                media_buy_id=provisional_media_buy_id,
+                media_buy_id=stable_lookup_id,
                 package_id=first_package.package_id,
                 platform_name=platform_name,
-                rtb_flag=rtb_flag,
                 brand_name=brand_name,
                 brand_domain=brand_domain,
                 vertical=vertical,
                 sub_category=sub_category,
                 campaign_type=campaign_type,
                 sol_id=sol_id,
+                is_product=is_product,
                 deal_type=deal_type,
                 budget_type=budget_type,
                 tenant_id=self.tenant_id,
@@ -283,14 +285,7 @@ class SiteplugAdapter(AdServerAdapter):
                 campaign_id: int = future.result()
         except Exception as exc:
             logger.error(f"Siteplug.create_media_buy: provisioning failed: {exc}", exc_info=True)
-            return CreateMediaBuyError(
-                errors=[
-                    Error(
-                        code="PROVISIONING_ERROR",
-                        message=f"Siteplug entity provisioning failed: {exc}",
-                    )
-                ]
-            )
+            raise AdCPValidationError(f"Siteplug entity provisioning failed: {exc}") from exc
 
         media_buy_id = f"sp_{campaign_id}"
         self.log(f"Siteplug.create_media_buy: provisioned campaign_id={campaign_id} → media_buy_id={media_buy_id}")

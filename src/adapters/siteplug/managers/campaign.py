@@ -10,6 +10,16 @@ Provisioning strategy (Task 02-A + 02-B):
 The primary path is attempted first. If the onboard endpoint is unavailable
 (ENTITY_NOT_FOUND / connection error) the manager falls back to sequential
 provisioning automatically.
+
+Fixes applied (2026-06-18, post MR !12 review):
+  Fix 1: POST /platforms field is "platform" not "platform_name"
+  Fix 2: POST /brands removes platform_id (not in schema); adds is_product
+  Fix 3: POST /advertisers field is "adv_name" not "advertiser_name";
+         naming convention "{platform_name} – {brand_name}" (em-dash)
+  Fix 4: POST /campaigns always includes campaign_name, deal_type, budget_type
+  C1:    Agency step removed — agency_id auto-detected server-side from
+         platform.masteraccount_id; all AdCP platforms are non-RTB → direct flow
+  C3:    Advertiser resolved by name before creation to avoid duplicates
 """
 
 import logging
@@ -43,13 +53,13 @@ class SiteplugCampaignManager:
         media_buy_id: str,
         package_id: str,
         platform_name: str,
-        rtb_flag: int,
         brand_name: str,
         brand_domain: str,
         vertical: str,
         sub_category: str,
         campaign_type: str,
         sol_id: int,
+        is_product: int = 0,
         deal_type: str | None = None,
         budget_type: int | None = None,
         tenant_id: str,
@@ -71,13 +81,13 @@ class SiteplugCampaignManager:
             media_buy_id: AdCP media buy ID (used to locate DB packages).
             package_id: AdCP package ID (the specific package to update).
             platform_name: Siteplug platform name (e.g. "CJ", "Awin").
-            rtb_flag: 1 for RTB networks (agency created), 0 for non-RTB.
             brand_name: Advertiser brand name.
             brand_domain: Advertiser brand domain (e.g. "example.com").
             vertical: IAB vertical category.
             sub_category: IAB sub-category.
             campaign_type: Siteplug campaign type string ("SD", "SSS", "SDC").
             sol_id: Source of Lead ID (must exist in SSP DB).
+            is_product: 0 = home brand (default), 1 = product brand.
             deal_type: Deal type ("CPC", "CPA", "VCPC") — required for non-RTB.
             budget_type: Budget type int (1–5) — required for non-RTB.
             tenant_id: Tenant ID for DB session.
@@ -106,7 +116,6 @@ class SiteplugCampaignManager:
                 media_buy_id=media_buy_id,
                 package_id=package_id,
                 platform_name=platform_name,
-                rtb_flag=rtb_flag,
                 brand_name=brand_name,
                 brand_domain=brand_domain,
                 vertical=vertical,
@@ -132,13 +141,13 @@ class SiteplugCampaignManager:
             media_buy_id=media_buy_id,
             package_id=package_id,
             platform_name=platform_name,
-            rtb_flag=rtb_flag,
             brand_name=brand_name,
             brand_domain=brand_domain,
             vertical=vertical,
             sub_category=sub_category,
             campaign_type=campaign_type,
             sol_id=sol_id,
+            is_product=is_product,
             deal_type=deal_type,
             budget_type=budget_type,
             tenant_id=tenant_id,
@@ -155,7 +164,6 @@ class SiteplugCampaignManager:
         media_buy_id: str,
         package_id: str,
         platform_name: str,
-        rtb_flag: int,
         brand_name: str,
         brand_domain: str,
         vertical: str,
@@ -177,7 +185,7 @@ class SiteplugCampaignManager:
         """
         payload: dict[str, Any] = {
             "platform_name": platform_name,
-            "rtb_flag": rtb_flag,
+            "rtb_flag": 0,  # All AdCP campaigns are non-RTB
             "brands": [
                 {
                     "brand_name": brand_name,
@@ -190,7 +198,7 @@ class SiteplugCampaignManager:
 
         self._log(
             f"[siteplug] POST /onboard platform_name={platform_name!r} "
-            f"rtb_flag={rtb_flag} brand={brand_name!r}"
+            f"brand={brand_name!r}"
         )
 
         body = await self.client.onboard(payload, idempotency_key=idempotency_key)
@@ -198,7 +206,7 @@ class SiteplugCampaignManager:
         # ── Parse 207 flat envelope ───────────────────────────────────────
         # Top-level keys: platform, agency, summary, results
         platform_id: int = body["platform"]["platform_id"]
-        agency_id: int = body["agency"]["masteraccount_id"]  # 0 when rtb_flag=0
+        agency_id: int = body["agency"]["masteraccount_id"]  # 0 for non-RTB
 
         result = body["results"][0]
         result_status: str = result.get("status", "")
@@ -263,19 +271,23 @@ class SiteplugCampaignManager:
         media_buy_id: str,
         package_id: str,
         platform_name: str,
-        rtb_flag: int,
         brand_name: str,
         brand_domain: str,
         vertical: str,
         sub_category: str,
         campaign_type: str,
         sol_id: int,
+        is_product: int,
         deal_type: str | None,
         budget_type: int | None,
         tenant_id: str,
         idempotency_key: str | None,
     ) -> int:
-        """Provision entities sequentially: Platform → Agency → Brand → Advertiser → Campaign.
+        """Provision entities sequentially: Platform → Brand → Advertiser → Campaign.
+
+        Agency step is skipped unconditionally — agency_id is auto-detected
+        server-side from platform.masteraccount_id. All AdCP platforms are
+        non-RTB (is_external_rtb=0) so masteraccount_id=0 → direct flow always.
 
         Each step checks ``package_config`` for an existing ID before calling
         the SSP API (per-step idempotency guard).
@@ -302,30 +314,21 @@ class SiteplugCampaignManager:
             self._log(f"[siteplug] platform already provisioned (platform_id={platform_id}), skipping.")
         platform_id = int(platform_id)
 
-        # ── Step 2: Agency (skip for non-RTB) ────────────────────────────
+        # ── Step 2: Agency — SKIPPED (C1) ────────────────────────────────
+        # agency_id is auto-detected server-side from platform.masteraccount_id.
+        # All AdCP platforms are non-RTB → masteraccount_id=0 → direct flow.
+        # We persist 0 so the idempotency guard recognises this step as done.
         agency_id_raw = self._read_package_config_field(
             media_buy_id, package_id, "siteplug_agency_id", tenant_id
         )
         if agency_id_raw is None:
-            if rtb_flag == 1:
-                agency_data = await self.client.create_agency(
-                    {"platform_id": platform_id, "agency_name": platform_name},
-                    idempotency_key=idempotency_key,
-                )
-                agency_id = int(agency_data.get("masteraccount_id", 0))
-                self._log(f"[siteplug] agency created: agency_id={agency_id}")
-            else:
-                agency_id = 0
-                self._log("[siteplug] rtb_flag=0 — skipping agency creation, agency_id=0")
             self._persist_entity_ids(
                 media_buy_id=media_buy_id,
                 package_id=package_id,
-                agency_id=agency_id,
+                agency_id=0,
                 tenant_id=tenant_id,
             )
-        else:
-            agency_id = int(agency_id_raw)
-            self._log(f"[siteplug] agency already provisioned (agency_id={agency_id}), skipping.")
+        self._log("[siteplug] agency step skipped (non-RTB, agency_id=0)")
 
         # ── Step 3: Brand ─────────────────────────────────────────────────
         brand_id = self._read_package_config_field(
@@ -338,7 +341,7 @@ class SiteplugCampaignManager:
                     "brand_domain": brand_domain,
                     "vertical": vertical,
                     "sub_category": sub_category,
-                    "platform_id": platform_id,
+                    "is_product": is_product,  # Fix 2: removed platform_id; added is_product
                 },
                 idempotency_key=idempotency_key,
             )
@@ -354,21 +357,18 @@ class SiteplugCampaignManager:
             brand_id = int(brand_id)
             self._log(f"[siteplug] brand already provisioned (brand_id={brand_id}), skipping.")
 
-        # ── Step 4: Advertiser ────────────────────────────────────────────
+        # ── Step 4: Advertiser (resolve by name before creating) ──────────
         advertiser_id = self._read_package_config_field(
             media_buy_id, package_id, "siteplug_advertiser_id", tenant_id
         )
         if not advertiser_id:
-            advertiser_data = await self.client.create_advertiser(
-                {
-                    "advertiser_name": brand_name,
-                    "platform_id": platform_id,
-                    "brand_id": brand_id,
-                },
+            advertiser_id = await self._resolve_or_create_advertiser(
+                platform_id=platform_id,
+                brand_id=brand_id,
+                platform_name=platform_name,
+                brand_name=brand_name,
                 idempotency_key=idempotency_key,
             )
-            advertiser_id = int(advertiser_data.get("advertiser_id", 0))
-            self._log(f"[siteplug] advertiser created: advertiser_id={advertiser_id}")
             self._persist_entity_ids(
                 media_buy_id=media_buy_id,
                 package_id=package_id,
@@ -384,12 +384,14 @@ class SiteplugCampaignManager:
             media_buy_id, package_id, "siteplug_campaign_id", tenant_id
         )
         if not campaign_id:
+            # Fix 4: campaign_name, deal_type, budget_type always required for non-RTB
             campaign_payload: dict[str, Any] = {
                 "advertiser_id": advertiser_id,
                 "platform_id": platform_id,
                 "brand_id": brand_id,
                 "campaign_type": campaign_type,
                 "sol_id": sol_id,
+                "campaign_name": f"{platform_name} {brand_name} {campaign_type}",
             }
             if deal_type is not None:
                 campaign_payload["deal_type"] = deal_type
@@ -424,17 +426,36 @@ class SiteplugCampaignManager:
         platform_name: str,
         idempotency_key: str | None,
     ) -> int:
-        """Create a platform, resolving 409 ENTITY_ALREADY_EXISTS via GET /platforms?search=.
+        """Resolve an existing platform by name, or create it if not found.
 
-        In production, POST /platforms almost always returns 409 because the
-        network already exists. This is the normal path — resolve and continue.
+        In production, the platform almost always already exists in IC.
+        Strategy: GET /platforms?search= first; only POST if not found.
+        On 409 from POST, fall back to GET /platforms?search= again.
+
+        Fix 1: POST /platforms uses field "platform" (not "platform_name").
 
         Returns:
             Siteplug platform_id.
         """
+        # Try to resolve existing platform first (normal path — platform exists)
+        self._log(f"[siteplug] resolving platform '{platform_name}' via GET /platforms?search=...")
+        platforms = await self.client.list_platforms(search=platform_name)
+        items: list[dict[str, Any]] = (
+            platforms if isinstance(platforms, list)
+            else platforms.get("data", []) if isinstance(platforms, dict)
+            else []
+        )
+        for p in items:
+            if p.get("platform", "").lower() == platform_name.lower():
+                platform_id = int(p["platform_id"])
+                self._log(f"[siteplug] resolved existing platform_id={platform_id}")
+                return platform_id
+
+        # Not found — create it (rare: new network)
+        self._log(f"[siteplug] platform '{platform_name}' not found — creating via POST /platforms...")
         try:
             data = await self.client.create_platform(
-                {"platform_name": platform_name},
+                {"platform": platform_name},  # Fix 1: "platform" not "platform_name"
                 idempotency_key=idempotency_key,
             )
             platform_id = int(data.get("platform_id", 0))
@@ -445,21 +466,19 @@ class SiteplugCampaignManager:
             if exc.error_code != "ENTITY_ALREADY_EXISTS":
                 raise
 
+            # 409 race condition — resolve again
             self._log(
-                f"[siteplug] platform '{platform_name}' already exists (409) — "
-                "resolving via GET /platforms?search=..."
+                f"[siteplug] platform '{platform_name}' 409 on create — "
+                "resolving via GET /platforms?search= (race condition)..."
             )
             platforms = await self.client.list_platforms(search=platform_name)
-            # list_platforms returns the data list directly
-            if isinstance(platforms, list):
-                items = platforms
-            elif isinstance(platforms, dict):
-                items = platforms.get("data", [])
-            else:
-                items = []
-
+            items = (
+                platforms if isinstance(platforms, list)
+                else platforms.get("data", []) if isinstance(platforms, dict)
+                else []
+            )
             for p in items:
-                if p.get("platform_name", "").lower() == platform_name.lower():
+                if p.get("platform", "").lower() == platform_name.lower():
                     platform_id = int(p["platform_id"])
                     self._log(f"[siteplug] resolved existing platform_id={platform_id}")
                     return platform_id
@@ -467,6 +486,97 @@ class SiteplugCampaignManager:
             raise SiteplugAPIError(
                 f"Platform '{platform_name}' returned 409 but could not be resolved via search.",
                 error_code="PLATFORM_LOOKUP_ERROR",
+            )
+
+    # =========================================================================
+    # Advertiser resolution helper (C3)
+    # =========================================================================
+
+    async def _resolve_or_create_advertiser(
+        self,
+        *,
+        platform_id: int,
+        brand_id: int,
+        platform_name: str,
+        brand_name: str,
+        idempotency_key: str | None,
+    ) -> int:
+        """Resolve an existing advertiser by name convention, or create it.
+
+        Naming convention (IC standard, confirmed by Milan):
+            "{platform_name} – {brand_name}"  (em-dash)
+
+        Strategy:
+          1. GET /advertisers?search="{platform_name} – {brand_name}"
+          2. If found and platform_id matches → reuse existing advertiser_id
+          3. If not found → POST /advertisers with adv_name using convention
+          4. On 409 → resolve via GET /advertisers?search= again
+
+        Fix 3: field is "adv_name" (not "advertiser_name").
+
+        Returns:
+            Siteplug advertiser_id.
+        """
+        adv_name = f"{platform_name} \u2013 {brand_name}"  # em-dash (–)
+
+        # Try to resolve existing advertiser first
+        self._log(f"[siteplug] resolving advertiser '{adv_name}' via GET /advertisers?search=...")
+        try:
+            advertisers = await self.client.list_advertisers(search=adv_name)
+            items: list[dict[str, Any]] = (
+                advertisers if isinstance(advertisers, list)
+                else advertisers.get("data", []) if isinstance(advertisers, dict)
+                else []
+            )
+            for a in items:
+                name_match = a.get("adv_name", "").lower() == adv_name.lower()
+                platform_match = int(a.get("platform_id", 0)) == platform_id
+                if name_match and platform_match:
+                    advertiser_id = int(a["advertiser_id"])
+                    self._log(f"[siteplug] resolved existing advertiser_id={advertiser_id}")
+                    return advertiser_id
+        except SiteplugAPIError:
+            pass  # Search failure is non-fatal — proceed to create
+
+        # Not found — create it
+        self._log(f"[siteplug] advertiser '{adv_name}' not found — creating via POST /advertisers...")
+        try:
+            advertiser_data = await self.client.create_advertiser(
+                {
+                    "platform_id": platform_id,
+                    "brand_id": brand_id,
+                    "adv_name": adv_name,  # Fix 3: "adv_name" not "advertiser_name"
+                },
+                idempotency_key=idempotency_key,
+            )
+            advertiser_id = int(advertiser_data.get("advertiser_id", 0))
+            self._log(f"[siteplug] advertiser created: advertiser_id={advertiser_id}")
+            return advertiser_id
+
+        except SiteplugAPIError as exc:
+            if exc.error_code != "ENTITY_ALREADY_EXISTS":
+                raise
+
+            # 409 — resolve again
+            self._log(
+                f"[siteplug] advertiser '{adv_name}' 409 on create — "
+                "resolving via GET /advertisers?search= (race condition)..."
+            )
+            advertisers = await self.client.list_advertisers(search=adv_name)
+            items = (
+                advertisers if isinstance(advertisers, list)
+                else advertisers.get("data", []) if isinstance(advertisers, dict)
+                else []
+            )
+            for a in items:
+                if int(a.get("platform_id", 0)) == platform_id:
+                    advertiser_id = int(a["advertiser_id"])
+                    self._log(f"[siteplug] resolved existing advertiser_id={advertiser_id}")
+                    return advertiser_id
+
+            raise SiteplugAPIError(
+                f"Advertiser '{adv_name}' returned 409 but could not be resolved via search.",
+                error_code="ADVERTISER_LOOKUP_ERROR",
             )
 
     # =========================================================================
