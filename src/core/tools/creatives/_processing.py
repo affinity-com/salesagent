@@ -274,31 +274,22 @@ def _update_existing_creative(
                             changes.append("generative_build_result")
 
                             # Extract creative output if available
-                            if build_result.get("creative_output"):
-                                creative_output = build_result["creative_output"]
-
-                                # Only use generative assets if user didn't provide their own
-                                user_provided_assets = creative.assets
-                                if creative_output.get("assets") and not user_provided_assets:
-                                    data["assets"] = creative_output["assets"]
-                                    changes.append("assets")
-                                    logger.info("[sync_creatives] Using assets from generative output (update)")
-                                elif user_provided_assets:
-                                    logger.info(
-                                        "[sync_creatives] Preserving user-provided assets in update, "
-                                        "not overwriting with generative output"
-                                    )
+                            creative_manifest_out = build_result.get("creative_manifest", {})
+                            if creative_manifest_out.get("assets"):
+                                data["assets"] = {**data.get("assets", {}), **creative_manifest_out["assets"]}
+                                changes.append("assets")
+                                logger.info("[sync_creatives] Using assets from generative output (update)")
 
                             # Gap B: fallback to creative_manifest assets if creative_output had none
-                            if not data.get("assets") and not user_provided_assets:
+                            if not data.get("assets"):
                                 manifest_assets = build_result.get("creative_manifest", {}).get("assets")
                                 if manifest_assets:
                                     data["assets"] = manifest_assets
                                     changes.append("assets")
                                     logger.info("[sync_creatives] Using assets from creative_manifest (update)")
 
-                                if creative_output.get("output_format"):
-                                    output_format = creative_output["output_format"]
+                                if creative_manifest_out.get("output_format"):
+                                    output_format = creative_manifest_out["output_format"]
                                     data["output_format"] = output_format
                                     changes.append("output_format")
 
@@ -614,40 +605,33 @@ def _create_new_creative(
                         data["generative_context_id"] = build_result.get("context_id")
 
                         # Extract creative output
-                        if build_result.get("creative_output"):
-                            creative_output = build_result["creative_output"]
-
-                            # Only use generative assets if user didn't provide their own
-                            if creative_output.get("assets") and not user_provided_assets:
-                                data["assets"] = creative_output["assets"]
-                                logger.info("[sync_creatives] Using assets from generative output")
-                            elif user_provided_assets:
-                                logger.info(
-                                    "[sync_creatives] Preserving user-provided assets, "
-                                    "not overwriting with generative output"
-                                )
+                        creative_manifest_out = build_result.get("creative_manifest", {})
+                        if creative_manifest_out.get("assets"):
+                            data["assets"] = {**data.get("assets", {}), **creative_manifest_out["assets"]}
+                            logger.info("[sync_creatives] Using assets from generative output")
 
                         # Gap B: fallback to creative_manifest assets if creative_output had none
-                        if not data.get("assets") and not user_provided_assets:
+                        if not data.get("assets"):
                             manifest_assets = build_result.get("creative_manifest", {}).get("assets")
                             if manifest_assets:
                                 data["assets"] = manifest_assets
                                 logger.info("[sync_creatives] Using assets from creative_manifest")
 
-                            if creative_output.get("output_format"):
-                                output_format = creative_output["output_format"]
-                                data["output_format"] = output_format
+                        creative_manifest_out2 = build_result.get("creative_manifest", {})
+                        if creative_manifest_out2.get("output_format"):
+                            output_format = creative_manifest_out2["output_format"]
+                            data["output_format"] = output_format
 
-                                # Only use generative URL if user didn't provide one
-                                if isinstance(output_format, dict) and output_format.get("url"):
-                                    if not data.get("url"):
-                                        data["url"] = output_format["url"]
-                                        logger.info(f"[sync_creatives] Got URL from generative output: {data['url']}")
-                                    else:
-                                        logger.info(
-                                            "[sync_creatives] Preserving user-provided URL, "
-                                            "not overwriting with generative output"
-                                        )
+                            # Only use generative URL if user didn't provide one
+                            if isinstance(output_format, dict) and output_format.get("url"):
+                                if not data.get("url"):
+                                    data["url"] = output_format["url"]
+                                    logger.info(f"[sync_creatives] Got URL from generative output: {data['url']}")
+                                else:
+                                    logger.info(
+                                        "[sync_creatives] Preserving user-provided URL, "
+                                        "not overwriting with generative output"
+                                    )
 
                         logger.info(
                             f"[sync_creatives] Generative creative built: "

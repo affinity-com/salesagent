@@ -356,7 +356,7 @@ def build_text_ad_payload(
         "shopId": shop_info.shop_id,
         "shopName": shop_info.shop_name,
         "shopDomain": shop_info.shop_domain,
-        "countryCodes": [country] if country else [],
+        "countryCodes": [country] if country else shop_info.country_codes,
         "externalMetadata": {"contentSource": content_source} if content_source else None,
     }
 
