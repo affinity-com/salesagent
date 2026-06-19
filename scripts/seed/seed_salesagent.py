@@ -427,7 +427,8 @@ def seed_siteplug_extra_products(conn):
         else:
             print(f"  ✓ superseded product '{old_id}' not present — skipping cleanup")
 
-    # (product_id, name, description, format_ids_json, format_id)
+    # (product_id, name, description, format_ids_json, format_id, implementation_config)
+    SSS_IMPL_CONFIG = '{"platform_name": "Affilizz", "campaign_type": "SSS", "sol_id": 1}'
     EXTRA_PRODUCTS = [
         (
             "siteplug_sss_homepage",
@@ -439,6 +440,7 @@ def seed_siteplug_extra_products(conn):
             ),
             '[{"id": "text_ad_search", "agent_url": "http://creative-agent.localhost:8080"}]',
             "text_ad_search",
+            SSS_IMPL_CONFIG,
         ),
         (
             "siteplug_sss_category",
@@ -450,6 +452,7 @@ def seed_siteplug_extra_products(conn):
             ),
             '[{"id": "text_ad_search", "agent_url": "http://creative-agent.localhost:8080"}]',
             "text_ad_search",
+            SSS_IMPL_CONFIG,
         ),
         (
             "siteplug_sss_product",
@@ -461,6 +464,7 @@ def seed_siteplug_extra_products(conn):
             ),
             '[{"id": "text_ad_search", "agent_url": "http://creative-agent.localhost:8080"}]',
             "text_ad_search",
+            SSS_IMPL_CONFIG,
         ),
         (
             "opinary_survey_ad",
@@ -468,6 +472,7 @@ def seed_siteplug_extra_products(conn):
             "Opinary first-party interactive poll widget for addressable audiences",
             '[{"id": "survey_ad", "agent_url": "http://creative-agent.localhost:8080"}]',
             "survey_ad",
+            None,
         ),
     ]
 
@@ -479,17 +484,18 @@ def seed_siteplug_extra_products(conn):
     ]
     SSS_PRODUCT_IDS = {"siteplug_sss_homepage", "siteplug_sss_category", "siteplug_sss_product"}
 
-    for product_id, name, description, format_ids, format_id in EXTRA_PRODUCTS:
+    for product_id, name, description, format_ids, format_id, impl_config in EXTRA_PRODUCTS:
         n = count(conn, f"SELECT COUNT(*) FROM products WHERE tenant_id='siteplug' AND product_id='{product_id}'")
         if n > 0:
             print(f"  ✓ siteplug product '{product_id}' already exists — skipping")
         else:
             print(f"  Seeding siteplug product '{product_id}'...")
+            impl_config_sql = f"'{impl_config}'::jsonb" if impl_config is not None else "NULL"
             run_sql(conn, f"""
                 INSERT INTO products (
                     tenant_id, product_id, name, description,
                     format_ids, targeting_template, delivery_type,
-                    delivery_measurement, property_tags
+                    delivery_measurement, property_tags, implementation_config
                 ) VALUES (
                     'siteplug',
                     '{product_id}',
@@ -499,7 +505,8 @@ def seed_siteplug_extra_products(conn):
                     '{{"geo": {{}}, "audience": {{}}}}'::jsonb,
                     'non_guaranteed',
                     '{{"provider": "publisher"}}'::jsonb,
-                    '["all_inventory"]'::jsonb
+                    '["all_inventory"]'::jsonb,
+                    {impl_config_sql}
                 ) ON CONFLICT (tenant_id, product_id) DO NOTHING
             """, f"siteplug product '{product_id}' seeded")
 
@@ -542,6 +549,16 @@ def seed_siteplug_extra_products(conn):
             WHERE tenant_id = 'siteplug'
               AND NOT (COALESCE(auto_approve_format_ids, '[]'::jsonb) @> '["{format_id}"]'::jsonb)
         """, f"siteplug auto_approve_format_ids updated with '{format_id}'")
+
+    # Patch existing SSS product rows that were inserted before implementation_config was added.
+    # This UPDATE is idempotent: it only touches rows where platform_name is absent.
+    run_sql(conn, f"""
+        UPDATE products
+        SET implementation_config = '{SSS_IMPL_CONFIG}'::jsonb
+        WHERE tenant_id = 'siteplug'
+          AND product_id IN ('siteplug_sss_homepage', 'siteplug_sss_category', 'siteplug_sss_product')
+          AND (implementation_config IS NULL OR NOT implementation_config ? 'platform_name')
+    """, "siteplug SSS products implementation_config backfilled")
 
 
 def seed_tmp_provider(conn):

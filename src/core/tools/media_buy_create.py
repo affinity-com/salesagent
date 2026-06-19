@@ -864,6 +864,7 @@ def execute_approved_media_buy(media_buy_id: str, tenant_id: str) -> tuple[bool,
                         targeting_overlay=targeting_overlay,
                         product_id=product_id,
                         budget=budget,
+                        implementation_config=getattr(product, "implementation_config", None),  # Adapter-specific config
                     )
                     packages.append(media_package)
 
@@ -3138,6 +3139,7 @@ async def _create_media_buy_impl(
                     creative_ids=(
                         _get_creative_ids(matching_package) if matching_package else None
                     ),  # Include creative_ids from uploaded creatives
+                    implementation_config=getattr(pkg_product, "implementation_config", None),  # Adapter-specific config
                 )
             )
 
