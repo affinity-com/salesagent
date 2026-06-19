@@ -2,11 +2,11 @@
 
 Handles authentication and HTTP requests to the Siteplug SSP API.
 Auth: X-API-Key header.
-
-All methods are stubs returning mock data. Real API calls are wired in Task 02+.
 """
 
+import asyncio
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -14,6 +14,17 @@ import httpx
 from src.adapters.siteplug.config_schema import SiteplugConnectionConfig
 
 logger = logging.getLogger(__name__)
+
+# HTTP status → SiteplugAPIError.error_code mapping
+_HTTP_ERROR_CODES: dict[int, str] = {
+    400: "VALIDATION_ERROR",
+    401: "API_KEY_INVALID",
+    404: "ENTITY_NOT_FOUND",
+    409: "ENTITY_ALREADY_EXISTS",
+    422: "VALIDATION_ERROR",
+    429: "RATE_LIMITED",
+    500: "INTERNAL_ERROR",
+}
 
 
 class SiteplugAPIError(Exception):
@@ -32,11 +43,6 @@ class SiteplugAPIError(Exception):
 
 class SiteplugClient:
     """Client for interacting with the Siteplug SSP Tech API.
-
-    All methods are stubs returning safe mock data.
-    Real HTTP calls are wired in Task 02 (platform/brand/campaign CRUD),
-    Task 03 (inventory), Task 04 (ad groups), Task 05 (delivery),
-    and Task 06 (creatives).
 
     Attributes:
         config: Validated connection configuration
@@ -62,23 +68,36 @@ class SiteplugClient:
         self,
         method: str,
         path: str,
+        *,
+        idempotency_key: str | None = None,
         **kwargs: Any,
     ) -> Any:
         """Make an authenticated HTTP request with retry logic.
 
+        On HTTP 429, reads X-RateLimit-Reset (Unix timestamp) and sleeps
+        until that time (capped at 60 s) before retrying.
+
+        On POST/PUT, forwards ``idempotency_key`` as the ``Idempotency-Key``
+        header when provided.
+
         Args:
             method: HTTP method (GET, POST, PUT, DELETE, PATCH)
             path: API endpoint path (e.g. "/platforms")
+            idempotency_key: Optional idempotency key forwarded on POST/PUT.
             **kwargs: Additional arguments passed to httpx.AsyncClient.request
 
         Returns:
-            Parsed JSON response body
+            Parsed JSON response body (or full body for 207)
 
         Raises:
             SiteplugAPIError: If the request fails or returns an error status
         """
         url = f"{self.base_url}{path}"
         headers = {**self._headers, **kwargs.pop("headers", {})}
+
+        # Forward idempotency key on mutating requests
+        if idempotency_key and method.upper() in ("POST", "PUT"):
+            headers["Idempotency-Key"] = idempotency_key
 
         last_exc: Exception | None = None
         for attempt in range(self.config.max_retries + 1):
@@ -90,7 +109,31 @@ class SiteplugClient:
                         headers=headers,
                         **kwargs,
                     )
+
+                # Handle 429 with rate-limit sleep before retry
+                if response.status_code == 429:
+                    reset_header = response.headers.get("X-RateLimit-Reset")
+                    if reset_header:
+                        try:
+                            reset_ts = float(reset_header)
+                            sleep_secs = min(reset_ts - time.time(), 60.0)
+                            if sleep_secs > 0:
+                                logger.warning(
+                                    f"Siteplug rate limited. Sleeping {sleep_secs:.1f}s "
+                                    f"(X-RateLimit-Reset={reset_header})"
+                                )
+                                await asyncio.sleep(sleep_secs)
+                        except (ValueError, TypeError):
+                            await asyncio.sleep(1)
+                    else:
+                        await asyncio.sleep(1)
+                    # Let _handle_response raise so the outer except re-raises
+                    # only if we've exhausted retries; otherwise continue loop
+                    if attempt < self.config.max_retries:
+                        continue
+
                 return self._handle_response(response)
+
             except SiteplugAPIError:
                 raise
             except Exception as exc:
@@ -106,13 +149,20 @@ class SiteplugClient:
         )
 
     def _handle_response(self, response: httpx.Response) -> Any:
-        """Check status codes and raise SiteplugAPIError on failures.
+        """Parse the SSP API response envelope and raise on errors.
+
+        - HTTP 207: return the full body (flat envelope with platform/agency/
+          summary/results keys — NOT body["data"]).
+        - HTTP 2xx: extract and return body["data"].
+        - HTTP 4xx/5xx: raise SiteplugAPIError with the mapped error_code.
+          For 500 onboarding errors, prefer body["error"]["code"] over the
+          HTTP-mapped code.
 
         Args:
             response: httpx Response object
 
         Returns:
-            Parsed JSON response body (or None for empty responses)
+            Parsed response data
 
         Raises:
             SiteplugAPIError: On 4xx/5xx responses
@@ -122,104 +172,183 @@ class SiteplugClient:
         except Exception:
             body = response.text
 
-        if response.status_code == 401:
-            raise SiteplugAPIError(
-                "Siteplug API authentication failed (HTTP 401)",
-                status_code=401,
-                error_code="UNAUTHORIZED",
-            )
+        status = response.status_code
 
-        if response.status_code == 403:
-            raise SiteplugAPIError(
-                "Siteplug API access denied (HTTP 403)",
-                status_code=403,
-                error_code="FORBIDDEN",
-            )
+        # ── Error responses ────────────────────────────────────────────────
+        if status in _HTTP_ERROR_CODES or status >= 400:
+            mapped_code = _HTTP_ERROR_CODES.get(status, "INTERNAL_ERROR")
 
-        if response.status_code == 404:
-            raise SiteplugAPIError(
-                "Resource not found (HTTP 404)",
-                status_code=404,
-                error_code="NOT_FOUND",
-            )
+            # For 500 onboarding errors, prefer the API's own error code
+            if status == 500 and isinstance(body, dict):
+                api_code = (
+                    body.get("error", {}).get("code")
+                    if isinstance(body.get("error"), dict)
+                    else None
+                )
+                error_code = api_code or mapped_code
+            else:
+                # For other errors, try to extract a more specific code from body
+                error_code = mapped_code
+                if isinstance(body, dict):
+                    api_code = (
+                        body.get("error", {}).get("code")
+                        if isinstance(body.get("error"), dict)
+                        else body.get("error_code") or body.get("code")
+                    )
+                    if api_code and api_code not in ("SUCCESS", "success"):
+                        error_code = api_code
 
-        if response.status_code == 429:
-            raise SiteplugAPIError(
-                "Siteplug API rate limit exceeded (HTTP 429)",
-                status_code=429,
-                error_code="RATE_LIMITED",
-            )
-
-        if response.status_code >= 500:
-            raise SiteplugAPIError(
-                f"Siteplug API server error (HTTP {response.status_code})",
-                status_code=response.status_code,
-                error_code="SERVER_ERROR",
-            )
-
-        if response.status_code >= 400:
-            error_code = None
+            message = f"Siteplug API error (HTTP {status})"
             if isinstance(body, dict):
-                error_code = body.get("error_code") or body.get("code")
-            raise SiteplugAPIError(
-                f"Siteplug API error (HTTP {response.status_code}): {body}",
-                status_code=response.status_code,
-                error_code=error_code,
-            )
+                msg = (
+                    body.get("message")
+                    or (body.get("error", {}).get("message") if isinstance(body.get("error"), dict) else None)
+                    or str(body)
+                )
+                message = f"{message}: {msg}"
+            elif body:
+                message = f"{message}: {body}"
+
+            raise SiteplugAPIError(message, status_code=status, error_code=error_code)
+
+        # ── 207 Multi-Status (onboarding) — return full body ──────────────
+        if status == 207:
+            return body
+
+        # ── 2xx success — extract body["data"] ────────────────────────────
+        if isinstance(body, dict) and "data" in body:
+            return body["data"]
 
         return body
 
     # =========================================================================
-    # Health / Platform Operations  (wired in Task 02)
+    # Health
     # =========================================================================
 
     async def health(self) -> dict[str, Any]:
-        """Check SSP API health. Stub — wired in Task 02."""
-        return {"status": "ok"}
+        """Check SSP API health. Public route — no auth header sent."""
+        async with httpx.AsyncClient(timeout=self.config.timeout) as client:
+            response = await client.get(
+                f"{self.base_url}/health",
+                headers={"Accept": "application/json"},
+            )
+        return self._handle_response(response)
 
-    async def create_platform(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Create a platform. Stub — wired in Task 02."""
-        return {"platform_id": 0}
+    # =========================================================================
+    # Platform Operations
+    # =========================================================================
+
+    async def create_platform(
+        self, data: dict[str, Any], *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        """Create a platform. POST /platforms."""
+        return await self._request("POST", "/platforms", json=data, idempotency_key=idempotency_key)
 
     async def list_platforms(self, **filters: Any) -> list[dict[str, Any]]:
-        """List platforms. Stub — wired in Task 02."""
-        return []
+        """List platforms. GET /platforms."""
+        params = {k: v for k, v in filters.items() if v is not None}
+        return await self._request("GET", "/platforms", params=params)
 
-    async def create_agency(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Create an agency (master account). Stub — wired in Task 02."""
-        return {"masteraccount_id": 0}
-
-    async def create_brand(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Create a brand. Stub — wired in Task 02."""
-        return {"brand_id": 0}
-
-    async def create_advertiser(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Create an advertiser. Stub — wired in Task 02."""
-        return {"advertiser_id": 0}
+    async def get_platform(self, platform_id: int) -> dict[str, Any]:
+        """Get a platform by ID. GET /platforms/{id}."""
+        return await self._request("GET", f"/platforms/{platform_id}")
 
     # =========================================================================
-    # Campaign Operations  (wired in Task 02)
+    # Agency Operations
     # =========================================================================
 
-    async def create_campaign(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Create a campaign. Stub — wired in Task 02."""
-        return {"campaign_id": 0}
+    async def create_agency(
+        self, data: dict[str, Any], *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        """Create an agency (master account). POST /agencies."""
+        return await self._request("POST", "/agencies", json=data, idempotency_key=idempotency_key)
+
+    async def list_agencies(self, **filters: Any) -> list[dict[str, Any]]:
+        """List agencies. GET /agencies."""
+        params = {k: v for k, v in filters.items() if v is not None}
+        return await self._request("GET", "/agencies", params=params)
+
+    async def get_agency(self, agency_id: int) -> dict[str, Any]:
+        """Get an agency by ID. GET /agencies/{id}."""
+        return await self._request("GET", f"/agencies/{agency_id}")
+
+    # =========================================================================
+    # Brand Operations
+    # =========================================================================
+
+    async def create_brand(
+        self, data: dict[str, Any], *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        """Create a brand. POST /brands."""
+        return await self._request("POST", "/brands", json=data, idempotency_key=idempotency_key)
+
+    async def list_brands(self, **filters: Any) -> list[dict[str, Any]]:
+        """List brands. GET /brands."""
+        params = {k: v for k, v in filters.items() if v is not None}
+        return await self._request("GET", "/brands", params=params)
+
+    async def get_brand(self, brand_id: int) -> dict[str, Any]:
+        """Get a brand by ID. GET /brands/{id}."""
+        return await self._request("GET", f"/brands/{brand_id}")
+
+    # =========================================================================
+    # Advertiser Operations
+    # =========================================================================
+
+    async def create_advertiser(
+        self, data: dict[str, Any], *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        """Create an advertiser. POST /advertisers."""
+        return await self._request("POST", "/advertisers", json=data, idempotency_key=idempotency_key)
+
+    async def list_advertisers(self, **filters: Any) -> list[dict[str, Any]]:
+        """List advertisers. GET /advertisers."""
+        params = {k: v for k, v in filters.items() if v is not None}
+        return await self._request("GET", "/advertisers", params=params)
+
+    async def get_advertiser(self, advertiser_id: int) -> dict[str, Any]:
+        """Get an advertiser by ID. GET /advertisers/{id}."""
+        return await self._request("GET", f"/advertisers/{advertiser_id}")
+
+    # =========================================================================
+    # Campaign Operations
+    # =========================================================================
+
+    async def create_campaign(
+        self, data: dict[str, Any], *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        """Create a campaign. POST /campaigns."""
+        return await self._request("POST", "/campaigns", json=data, idempotency_key=idempotency_key)
 
     async def get_campaign(self, campaign_id: int) -> dict[str, Any]:
-        """Get a campaign by ID. Stub — wired in Task 02."""
-        return {}
+        """Get a campaign by ID. GET /campaigns/{id}."""
+        return await self._request("GET", f"/campaigns/{campaign_id}")
 
-    async def update_campaign(self, campaign_id: int, data: dict[str, Any]) -> dict[str, Any]:
-        """Update a campaign. Stub — wired in Task 02."""
-        return {}
+    async def update_campaign(
+        self, campaign_id: int, data: dict[str, Any], *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        """Update a campaign. PUT /campaigns/{id}."""
+        return await self._request(
+            "PUT", f"/campaigns/{campaign_id}", json=data, idempotency_key=idempotency_key
+        )
 
     async def list_campaigns(self, **filters: Any) -> list[dict[str, Any]]:
-        """List campaigns. Stub — wired in Task 02."""
-        return []
+        """List campaigns. GET /campaigns/list (note: not /campaigns)."""
+        params = {k: v for k, v in filters.items() if v is not None}
+        return await self._request("GET", "/campaigns/list", params=params)
 
-    async def onboard(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Onboard a new advertiser/campaign. Stub — wired in Task 02."""
-        return {"results": []}
+    async def onboard(
+        self, data: dict[str, Any], *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        """POST /onboard — Phase 7 onboarding orchestration.
+
+        Returns the full 207 response body on success (flat envelope with
+        top-level ``platform``, ``agency``, ``summary``, ``results`` keys).
+
+        Raises:
+            SiteplugAPIError: On 400/401/500 responses.
+        """
+        return await self._request("POST", "/onboard", json=data, idempotency_key=idempotency_key)
 
     # =========================================================================
     # Inventory Operations  (Task 03)
@@ -237,7 +366,7 @@ class SiteplugClient:
         search: str | None = None,
         **_extra: Any,
     ) -> dict[str, Any]:
-        """List available inventory zones from GET /ssp/v1/inventory.
+        """List available inventory zones from GET /inventory.
 
         Queries IC only (no AX cross-join). Returns the full paginated
         response envelope so the caller can iterate pages.
@@ -276,7 +405,7 @@ class SiteplugClient:
         return await self._request("GET", "/inventory", params=params)
 
     async def get_inventory_zone(self, zone_id: int) -> dict[str, Any]:
-        """Get a single inventory zone with delivery stats from GET /ssp/v1/inventory/{id}.
+        """Get a single inventory zone with delivery stats from GET /inventory/{id}.
 
         Queries IC for zone metadata and AX for 7-day / 30-day delivery stats.
 
