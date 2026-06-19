@@ -1461,7 +1461,7 @@ def then_uc006_result_should_be(ctx: dict, outcome: str) -> None:
         "CREATIVE_FORMAT_UNKNOWN",
         "CREATIVE_AGENT_UNREACHABLE",
         "CREATIVE_NAME_EMPTY",
-        "CREATIVE_GEMINI_KEY_MISSING",
+        "CREATIVE_AGENT_ERROR",
     ):
         _assert_per_creative_failure(ctx, outcome)
     elif outcome == "assignment updated":
@@ -2069,8 +2069,8 @@ def _promote_creative_errors_to_ctx(ctx: dict, errs: list) -> None:
 def _infer_error_code_from_message(msg: str) -> str:
     """Map production error strings to spec error codes."""
     lower = msg.lower()
-    if "gemini_api_key" in lower and "not configured" in lower:
-        return "CREATIVE_GEMINI_KEY_MISSING"
+    if "creative agent" in lower or "creative-agent" in lower or "build_creative" in lower:
+        return "CREATIVE_AGENT_ERROR"
     if "preview" in lower and ("failed" in lower or "no preview" in lower):
         return "CREATIVE_PREVIEW_FAILED"
     if "format" in lower and "required" in lower:
@@ -2083,8 +2083,8 @@ def _infer_error_code_from_message(msg: str) -> str:
 def _infer_suggestion_from_message(msg: str) -> str | None:
     """Extract or generate a suggestion from a production error message."""
     lower = msg.lower()
-    if "gemini_api_key" in lower:
-        return "Ask the seller to configure GEMINI_API_KEY in their agent settings"
+    if "creative agent" in lower or "creative-agent" in lower or "build_creative" in lower:
+        return "Check that the creative-agent is reachable and configured correctly"
     if "preview" in lower:
         return "Provide a media_url for the creative"
     return None
@@ -4740,22 +4740,26 @@ def given_new_creative_generative_no_prompt_with_name(ctx: dict) -> None:
     ctx["generative_create_path"] = True
 
 
-@given("a creative with a generative format but GEMINI_API_KEY not configured")
-def given_creative_generative_no_gemini(ctx: dict) -> None:
-    """Set up a generative creative but with GEMINI_API_KEY removed (boundary).
+@given("the creative-agent returns an error for build_creative")
+def given_creative_agent_error(ctx: dict) -> None:
+    """Set up a generative creative where the creative-agent raises an error.
 
-    Production raises ValueError when gemini_api_key is not configured
-    for a generative format.
+    After the refactor, the salesagent delegates to the creative-agent without
+    checking gemini_api_key. When the creative-agent fails, the salesagent
+    propagates action=failed.
     """
+    from unittest.mock import AsyncMock
+
     env = ctx["env"]
     _ensure_tenant_principal(ctx, env)
-    # Set up generative format but WITHOUT gemini key
-    fmt = env.setup_generative_build(format_id="display_gen", gemini_api_key="test-gemini-key")
-    # Now remove the key — setup_generative_build sets it, we override
-    env.mock["config"].return_value.gemini_api_key = None
+    fmt = env.setup_generative_build(format_id="display_gen")
+    # Simulate creative-agent unavailability
+    env.mock["registry"].return_value.build_creative = AsyncMock(
+        side_effect=Exception("Creative agent unavailable")
+    )
     creative_payload = {
-        "creative_id": "creative-gen-no-key-001",
-        "name": "Generative No Key",
+        "creative_id": "creative-gen-agent-error-001",
+        "name": "Generative Agent Error",
         "format_id": fmt,
         "assets": {
             "message": {"content": "Generate a banner ad"},

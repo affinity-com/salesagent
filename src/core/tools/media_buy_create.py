@@ -323,8 +323,10 @@ def _validate_creatives_before_adapter_call(
             agent_url_str = str(creative.agent_url) if creative.agent_url else ""
             is_adapter_format = not agent_url_str.startswith(("http://", "https://"))
             if is_adapter_format:
-                # Non-HTTP agent URLs (e.g. broadstreet://) are adapter-provided formats;
-                # validation is handled internally by the adapter — skip silently.
+                # Non-HTTP agent URLs (e.g. broadstreet://) identify adapter-native formats.
+                # These formats are not registered with any creative-agent; the adapter
+                # validates them internally. This is not a format-name check — it is a
+                # structural property of the agent_url scheme.
                 logger.debug(
                     f"Skipping validation for adapter-provided format '{creative.format}' "
                     f"(agent_url: {creative.agent_url})"
@@ -572,12 +574,7 @@ def _build_adapter_asset_from_creative(
     click_url = extract_click_url(creative_data, format_spec)
     impression_tracker_url = extract_impression_tracker_url(creative_data, format_spec)
 
-    # For text_ad_search creatives, url/width/height are not required —
-    # the SiteplugCreativeManager reads from creative_data["assets"] directly.
-    format_str = str(creative.format) if creative.format else ""
-    is_text_ad = format_str == "text_ad_search"
-
-    if not is_text_ad and (not url or not width or not height):
+    if not url or not width or not height:
         return None, (
             f"Creative {creative.creative_id} missing url/width/height "
             f"(width={width}, height={height}, url={'set' if url else 'missing'}, format={creative.format})"
@@ -592,12 +589,11 @@ def _build_adapter_asset_from_creative(
         "click_url": click_url,
         "asset_type": creative_data.get("asset_type", "image"),
         "name": creative.name or f"Creative {creative.creative_id}",
-        # Pass raw assets dict so format-specific managers (e.g. SiteplugCreativeManager
-        # for text_ad_search) can read structured asset fields directly.
+        # Adapter-routing fields: passed as data so the adapter can route by format
+        # and build format-specific payloads (e.g. Affilizz text ad). The salesagent
+        # does not branch on these — the adapter decides what to do with them.
+        "format_id": str(creative.format) if creative.format else "",
         "assets": creative_data.get("assets") or {},
-        # Pass format_id so the creative manager can route by format.
-        "format_id": format_str,
-        # Pass brand info (domain) so Affilizz shop validation can proceed.
         "brand": creative_data.get("brand") or {},
     }
     if impression_tracker_url:
@@ -2256,6 +2252,7 @@ async def _create_media_buy_impl(
                     packages=cast(list[PackageRequest], req.packages),
                     context=identity,
                     testing_ctx=testing_ctx,
+                    media_buy_brand=req.brand.model_dump(mode="json") if req.brand else None,
                 )
                 # Replace packages with updated versions (functional approach)
                 req.packages = cast(list[AdcpPackageRequest], updated_packages)  # type: ignore[assignment]
@@ -3586,18 +3583,6 @@ async def _create_media_buy_impl(
                                             },
                                         )
                                     assert asset is not None
-
-                                    # Bug A: if creative was synced without brand (e.g. brand is
-                                    # on the media buy request, not the creative payload), fall back
-                                    # to req.brand so SiteplugCreativeManager can read brand.domain.
-                                    if not asset.get("brand") and req.brand:
-                                        req_brand = req.brand
-                                        if hasattr(req_brand, "model_dump"):
-                                            asset["brand"] = req_brand.model_dump(mode="json")
-                                        elif isinstance(req_brand, dict):
-                                            asset["brand"] = req_brand
-                                        elif isinstance(req_brand, str):
-                                            asset["brand"] = {"domain": req_brand}
 
                                     upload_result = adapter.add_creative_assets(
                                         response.media_buy_id if response.media_buy_id else "",

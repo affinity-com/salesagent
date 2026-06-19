@@ -1093,28 +1093,34 @@ class TestStaticPreviewFailed:
 
 
 @pytest.mark.requires_db
-class TestGeminiKeyMissing:
-    """Generative format without GEMINI_API_KEY → per-creative failure.
+class TestCreativeAgentDelegationFailure:
+    """Generative format where creative-agent returns an error → per-creative failure.
 
     Covers: UC-006-EXT-I-01
+
+    After the refactor, the salesagent no longer gates on gemini_api_key for
+    creative generation. The creative-agent is the authority. When the creative-agent
+    is unavailable or returns an error, the salesagent propagates action=failed.
     """
 
     @pytest.mark.parametrize("transport", ALL_TRANSPORTS, ids=lambda t: t.value)
-    def test_generative_no_gemini_key_fails(self, integration_db, transport):
-        """Generative format + no gemini_api_key → action=failed."""
+    def test_creative_agent_error_propagates_as_failed(self, integration_db, transport):
+        """Generative format + creative-agent raises exception → action=failed."""
         with CreativeSyncEnv() as env:
             env.setup_default_data()
-            fmt = env.setup_generative_build(gemini_api_key="")
+            fmt = env.setup_generative_build()
 
-            # Override: remove the gemini key after setup
-            env.mock["config"].return_value.gemini_api_key = None
+            # Simulate creative-agent unavailability
+            env.mock["registry"].return_value.build_creative.side_effect = Exception(
+                "Creative agent unavailable"
+            )
 
             result = env.call_via(
                 transport,
                 creatives=[
                     {
-                        "creative_id": "c_no_gemini",
-                        "name": "No Gemini Key",
+                        "creative_id": "c_agent_error",
+                        "name": "Agent Error Creative",
                         "format_id": fmt,
                         "assets": {"message": {"content": "Build a banner"}},
                     }
@@ -1126,7 +1132,6 @@ class TestGeminiKeyMissing:
         assert_envelope(result, transport)
         creative_result = result.payload.creatives[0]
         assert creative_result.action == CreativeAction.failed
-        assert any("gemini" in e.lower() for e in _error_messages(creative_result.errors))
 
 
 # ---------------------------------------------------------------------------

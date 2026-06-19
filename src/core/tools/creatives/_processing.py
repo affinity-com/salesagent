@@ -50,6 +50,7 @@ def _update_existing_creative(
     all_formats: list[Any],
     registry: Any,
     principal_id: str,
+    media_buy_brand: dict | None = None,
 ) -> tuple[SyncCreativeResult, bool]:
     """Update an existing creative with upsert semantics (AdCP 2.5).
 
@@ -180,29 +181,14 @@ def _update_existing_creative(
                 is_generative = bool(getattr(format_obj, "output_format_ids", None))
 
                 if is_generative:
-                    # Generative creative update - rebuild using AI
-                    # Bug 1: text_ad_search uses Vertex AI (not Gemini API key).
-                    # Only gate on GEMINI_API_KEY for formats that actually need it.
+                    # Generative creative update - delegate to creative-agent
+                    # creative-agent decides model internally — no format-specific key checks here
                     format_id_str = creative_format.id if hasattr(creative_format, "id") else str(creative_format)
-                    uses_gemini_api_key = format_id_str != "text_ad_search"
 
                     logger.info(
                         f"[sync_creatives] Detected generative format update: {creative_format}"
-                        + (", checking for Gemini API key" if uses_gemini_api_key else " (Vertex AI — no Gemini key needed)")
+                        ", delegating to creative-agent"
                     )
-
-                    # Get Gemini API key from config (only required for non-Vertex formats)
-                    from src.core.config import get_config
-
-                    config = get_config()
-                    gemini_api_key = config.gemini_api_key
-
-                    if uses_gemini_api_key and not gemini_api_key:
-                        error_msg = (
-                            f"Cannot update generative creative {creative_format}: GEMINI_API_KEY not configured"
-                        )
-                        logger.error(f"[sync_creatives] {error_msg}")
-                        raise ValueError(error_msg)
 
                     # Extract message/brief from assets or inputs
                     message = None
@@ -257,7 +243,6 @@ def _update_existing_creative(
                                 agent_url=format_obj.agent_url,
                                 format_id=format_id_str,
                                 message=message,
-                                gemini_api_key=gemini_api_key,
                                 promoted_offerings=promoted_offerings,
                                 context_id=context_id,
                                 finalize=getattr(creative, "approved", False),
@@ -288,25 +273,52 @@ def _update_existing_creative(
                                     changes.append("assets")
                                     logger.info("[sync_creatives] Using assets from creative_manifest (update)")
 
-                                if creative_manifest_out.get("output_format"):
-                                    output_format = creative_manifest_out["output_format"]
-                                    data["output_format"] = output_format
-                                    changes.append("output_format")
+                            if creative_manifest_out.get("output_format"):
+                                output_format = creative_manifest_out["output_format"]
+                                data["output_format"] = output_format
+                                changes.append("output_format")
 
-                                    # Only use generative URL if user didn't provide one
-                                    if isinstance(output_format, dict) and output_format.get("url"):
-                                        if not data.get("url"):
-                                            data["url"] = output_format["url"]
-                                            changes.append("url")
-                                            logger.info(
-                                                f"[sync_creatives] Got URL from generative output (update): "
-                                                f"{data['url']}"
-                                            )
-                                        else:
-                                            logger.info(
-                                                "[sync_creatives] Preserving user-provided URL in update, "
-                                                "not overwriting with generative output"
-                                            )
+                                # Only use generative URL if user didn't provide one
+                                if isinstance(output_format, dict) and output_format.get("url"):
+                                    if not data.get("url"):
+                                        data["url"] = output_format["url"]
+                                        changes.append("url")
+                                        logger.info(
+                                            f"[sync_creatives] Got URL from generative output (update): "
+                                            f"{data['url']}"
+                                        )
+                                    else:
+                                        logger.info(
+                                            "[sync_creatives] Preserving user-provided URL in update, "
+                                            "not overwriting with generative output"
+                                        )
+
+                            # Extract url/width/height from top-level creative_manifest_out (unconditional)
+                            # These are set by the creative-agent for rendered formats (e.g. text_ad_search → HTML preview)
+                            if creative_manifest_out.get("url") and not data.get("url"):
+                                data["url"] = creative_manifest_out["url"]
+                                changes.append("url")
+                                logger.info(
+                                    f"[sync_creatives] Got URL from generative output manifest (update): {data['url']}"
+                                )
+                            if creative_manifest_out.get("width") and not data.get("width"):
+                                data["width"] = creative_manifest_out["width"]
+                                changes.append("width")
+                            if creative_manifest_out.get("height") and not data.get("height"):
+                                data["height"] = creative_manifest_out["height"]
+                                changes.append("height")
+
+                            # Persist brand from the media buy request so adapters can route by domain
+                            # (e.g. Affilizz domain guard in SiteplugCreativeManager._sync_text_ad_to_affilizz).
+                            # brand is buyer-supplied creative metadata — not a generation decision.
+                            if not data.get("brand"):
+                                if media_buy_brand:
+                                    data["brand"] = media_buy_brand
+                                    changes.append("brand")
+                                elif getattr(creative, "brand", None):
+                                    brand_val = creative.brand
+                                    data["brand"] = brand_val if isinstance(brand_val, dict) else {"domain": str(brand_val)}
+                                    changes.append("brand")
 
                             logger.info(
                                 f"[sync_creatives] Generative creative updated: "
@@ -475,6 +487,7 @@ def _create_new_creative(
     all_formats: list[Any],
     registry: Any,
     principal_id: str,
+    media_buy_brand: dict | None = None,
 ) -> tuple[SyncCreativeResult, bool]:
     """Create a new creative and persist it to the database (AdCP 2.5).
 
@@ -518,27 +531,14 @@ def _create_new_creative(
                 is_generative = bool(getattr(format_obj, "output_format_ids", None))
 
                 if is_generative:
-                    # Generative creative - call build_creative
-                    # Bug 1: text_ad_search uses Vertex AI (not Gemini API key).
-                    # Only gate on GEMINI_API_KEY for formats that actually need it.
+                    # Generative creative - delegate to creative-agent
+                    # creative-agent decides model internally — no format-specific key checks here
                     format_id_str = creative_format.id if hasattr(creative_format, "id") else str(creative_format)
-                    uses_gemini_api_key = format_id_str != "text_ad_search"
 
                     logger.info(
                         f"[sync_creatives] Detected generative format: {creative_format}"
-                        + (", checking for Gemini API key" if uses_gemini_api_key else " (Vertex AI — no Gemini key needed)")
+                        ", delegating to creative-agent"
                     )
-
-                    # Get Gemini API key from config (only required for non-Vertex formats)
-                    from src.core.config import get_config
-
-                    config = get_config()
-                    gemini_api_key = config.gemini_api_key
-
-                    if uses_gemini_api_key and not gemini_api_key:
-                        error_msg = f"Cannot build generative creative {creative_format}: GEMINI_API_KEY not configured"
-                        logger.error(f"[sync_creatives] {error_msg}")
-                        raise ValueError(error_msg)
 
                     # Extract message/brief from assets or inputs
                     message = None
@@ -589,7 +589,6 @@ def _create_new_creative(
                             agent_url=format_obj.agent_url,
                             format_id=format_id_str,
                             message=message,
-                            gemini_api_key=gemini_api_key,
                             promoted_offerings=promoted_offerings,
                             context_id=getattr(creative, "context_id", None),
                             finalize=getattr(creative, "approved", False),
@@ -632,6 +631,30 @@ def _create_new_creative(
                                         "[sync_creatives] Preserving user-provided URL, "
                                         "not overwriting with generative output"
                                     )
+
+                        # Extract url/width/height from top-level creative_manifest_out2 (unconditional)
+                        # These are set by the creative-agent for rendered formats (e.g. text_ad_search → HTML preview)
+                        if creative_manifest_out2.get("url") and not data.get("url"):
+                            data["url"] = creative_manifest_out2["url"]
+                            logger.info(
+                                f"[sync_creatives] Got URL from generative output manifest (create): {data['url']}"
+                            )
+                        if creative_manifest_out2.get("width") and not data.get("width"):
+                            data["width"] = creative_manifest_out2["width"]
+                        if creative_manifest_out2.get("height") and not data.get("height"):
+                            data["height"] = creative_manifest_out2["height"]
+
+                        # Persist brand from the media buy request so adapters can route by domain
+                        # (e.g. Affilizz domain guard in SiteplugCreativeManager._sync_text_ad_to_affilizz).
+                        # brand is buyer-supplied creative metadata — not a generation decision.
+                        if not data.get("brand"):
+                            if media_buy_brand:
+                                data["brand"] = media_buy_brand
+                                changes.append("brand")
+                            elif getattr(creative, "brand", None):
+                                brand_val = creative.brand
+                                data["brand"] = brand_val if isinstance(brand_val, dict) else {"domain": str(brand_val)}
+                                changes.append("brand")
 
                         logger.info(
                             f"[sync_creatives] Generative creative built: "

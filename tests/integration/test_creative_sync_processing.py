@@ -318,36 +318,41 @@ class TestGenerativeUpdatePromotedOfferings:
             assert call_args[1]["promoted_offerings"] is not None
 
 
-class TestGenerativeUpdateGeminiKeyMissing:
-    """Generative update without GEMINI_API_KEY returns failure.
+class TestGenerativeUpdateCreativeAgentError:
+    """Generative update where creative-agent returns an error → failure.
 
     BDD: UC-006-EXT-I-01 (update path)
+
+    After the refactor, the salesagent no longer gates on gemini_api_key.
+    The creative-agent is the authority. When it raises, the salesagent propagates failure.
     """
 
-    def test_update_generative_no_gemini_key_fails(self, integration_db):
-        """Update generative creative without GEMINI_API_KEY → action=failed."""
+    def test_update_generative_creative_agent_error_fails(self, integration_db):
+        """Update generative creative when creative-agent raises → action=failed."""
         with CreativeSyncEnv() as env:
             env.setup_default_data()
             fmt = env.setup_generative_build()
 
-            # Create with gemini key
+            # Create successfully first
             env.call_impl(
                 creatives=[
                     _creative(
-                        creative_id="c_no_gemini_up",
+                        creative_id="c_agent_err_up",
                         format_id=fmt,
                         assets={"message": {"content": "Initial"}},
                     )
                 ]
             )
 
-            # Remove gemini key for update
-            env.mock["config"].return_value.gemini_api_key = None
+            # Simulate creative-agent failure on update
+            env.mock["registry"].return_value.build_creative.side_effect = Exception(
+                "Creative agent unavailable"
+            )
 
             result = env.call_impl(
                 creatives=[
                     _creative(
-                        creative_id="c_no_gemini_up",
+                        creative_id="c_agent_err_up",
                         format_id=fmt,
                         assets={"message": {"content": "Try to update"}},
                     )
@@ -356,7 +361,6 @@ class TestGenerativeUpdateGeminiKeyMissing:
 
             creative_result = result.creatives[0]
             assert creative_result.action == CreativeAction.failed
-            assert any("GEMINI_API_KEY" in e for e in _error_messages(creative_result.errors))
 
 
 # ── Approval Mode UPDATE Tests (covers lines 97-139) ──────────────────────
@@ -793,3 +797,365 @@ class TestCreateServerGeneratedId:
             assert generated_id is not None
             assert len(generated_id) > 0
             assert generated_id != ""
+
+
+# ── Bug 1: Generative Manifest Top-Level URL/Width/Height Extraction ──────
+
+
+class TestGenerativeManifestTopLevelExtraction:
+    """Top-level url/width/height from creative_manifest_out (Bug 1 fix).
+
+    The creative-agent may return url/width/height at the manifest root
+    (e.g. text_ad_search → HTML preview) rather than inside output_format.url.
+    The fix at _processing.py:296-309 (UPDATE) and 635-645 (CREATE) extracts
+    these unconditionally when present at the top level.
+    """
+
+    def test_create_url_from_manifest_top_level(self, integration_db):
+        """CREATE: build_creative returns top-level url/width/height → stored in DB.
+
+        When creative-agent returns {"url": ..., "width": ..., "height": ...}
+        at the manifest root (no output_format key), the values must be stored
+        in data["url"], data["width"], data["height"].
+        """
+        with CreativeSyncEnv() as env:
+            env.setup_default_data()
+            fmt = env.setup_generative_build(
+                build_result={
+                    "status": "draft",
+                    "context_id": "ctx-1",
+                    "url": "https://agent.example.com/rendered.html",
+                    "width": 320,
+                    "height": 50,
+                    # No "output_format" key — top-level only
+                }
+            )
+
+            result = env.call_impl(
+                creatives=[
+                    _creative(
+                        creative_id="c_manifest_url_create",
+                        format_id=fmt,
+                        assets={"message": {"content": "Build me an ad"}},
+                    )
+                ]
+            )
+
+            assert result.creatives[0].action == CreativeAction.created
+
+            with get_db_session() as session:
+                db = session.scalars(select(DBCreative).filter_by(creative_id="c_manifest_url_create")).first()
+                assert db.data.get("url") == "https://agent.example.com/rendered.html"
+                assert db.data.get("width") == 320
+                assert db.data.get("height") == 50
+
+    def test_update_url_from_manifest_top_level(self, integration_db):
+        """UPDATE: build_creative returns top-level url/width/height → stored in DB.
+
+        Same as CREATE but exercises the UPDATE code path (_processing.py:296-309).
+        """
+        with CreativeSyncEnv() as env:
+            env.setup_default_data()
+            fmt = env.setup_generative_build(
+                build_result={
+                    "status": "draft",
+                    "context_id": "ctx-1",
+                    "url": "https://agent.example.com/rendered.html",
+                    "width": 320,
+                    "height": 50,
+                }
+            )
+
+            # CREATE first
+            env.call_impl(
+                creatives=[
+                    _creative(
+                        creative_id="c_manifest_url_update",
+                        format_id=fmt,
+                        assets={"message": {"content": "Initial prompt"}},
+                    )
+                ]
+            )
+
+            # UPDATE with new manifest result
+            env.mock["registry"].return_value.build_creative.reset_mock()
+            from unittest.mock import AsyncMock
+
+            env.mock["registry"].return_value.build_creative = AsyncMock(
+                return_value={
+                    "status": "draft",
+                    "context_id": "ctx-2",
+                    "url": "https://agent.example.com/updated.html",
+                    "width": 728,
+                    "height": 90,
+                }
+            )
+
+            result = env.call_impl(
+                creatives=[
+                    _creative(
+                        creative_id="c_manifest_url_update",
+                        format_id=fmt,
+                        assets={"message": {"content": "Updated prompt"}},
+                    )
+                ]
+            )
+
+            assert result.creatives[0].action == CreativeAction.updated
+
+            with get_db_session() as session:
+                db = session.scalars(select(DBCreative).filter_by(creative_id="c_manifest_url_update")).first()
+                assert db.data.get("url") == "https://agent.example.com/updated.html"
+                assert db.data.get("width") == 728
+                assert db.data.get("height") == 90
+
+    def test_create_manifest_url_not_overwrite_user_url(self, integration_db):
+        """CREATE: user-provided creative.url wins over manifest top-level url.
+
+        When the creative has a user-provided url AND the manifest also has
+        a top-level url, the user URL must be preserved (not overwritten).
+        """
+        with CreativeSyncEnv() as env:
+            env.setup_default_data()
+            fmt = env.setup_generative_build(
+                build_result={
+                    "status": "draft",
+                    "context_id": "ctx-1",
+                    "url": "https://agent.example.com/generated.html",
+                    "width": 320,
+                    "height": 50,
+                }
+            )
+
+            creative = _creative(
+                creative_id="c_manifest_url_no_overwrite",
+                format_id=fmt,
+                assets={"message": {"content": "Build me an ad"}},
+            )
+            # User provides their own URL
+            creative["url"] = "https://user-provided.example.com/my-ad.html"
+
+            result = env.call_impl(creatives=[creative])
+
+            assert result.creatives[0].action == CreativeAction.created
+
+            with get_db_session() as session:
+                db = session.scalars(
+                    select(DBCreative).filter_by(creative_id="c_manifest_url_no_overwrite")
+                ).first()
+                # User URL must be preserved
+                assert db.data.get("url") == "https://user-provided.example.com/my-ad.html"
+
+
+# ── Bug 3: Brand Storage in data ──────────────────────────────────────────
+
+
+class TestBrandStorageInData:
+    """Brand stored in data from creative.brand or media_buy_brand (Bug 3 & 4 fix).
+
+    The fix at _processing.py:314-321 (UPDATE) and 650-657 (CREATE) persists
+    brand into data["brand"] so adapters can route by domain.
+    """
+
+    def test_create_brand_from_creative_brand_dict(self, integration_db):
+        """CREATE: creative.brand as dict → stored in data["brand"]."""
+        with CreativeSyncEnv() as env:
+            env.setup_default_data()
+            fmt = env.setup_generative_build()
+
+            creative = _creative(
+                creative_id="c_brand_dict",
+                format_id=fmt,
+                assets={"message": {"content": "Build me an ad"}},
+            )
+            creative["brand"] = {"domain": "acme.com"}
+
+            result = env.call_impl(creatives=[creative])
+
+            assert result.creatives[0].action == CreativeAction.created
+
+            with get_db_session() as session:
+                db = session.scalars(select(DBCreative).filter_by(creative_id="c_brand_dict")).first()
+                assert db.data.get("brand") == {"domain": "acme.com"}
+
+    def test_create_brand_from_creative_brand_string(self, integration_db):
+        """CREATE: creative.brand as string → stored as {"domain": brand_string}."""
+        with CreativeSyncEnv() as env:
+            env.setup_default_data()
+            fmt = env.setup_generative_build()
+
+            creative = _creative(
+                creative_id="c_brand_string",
+                format_id=fmt,
+                assets={"message": {"content": "Build me an ad"}},
+            )
+            creative["brand"] = "acme.com"
+
+            result = env.call_impl(creatives=[creative])
+
+            assert result.creatives[0].action == CreativeAction.created
+
+            with get_db_session() as session:
+                db = session.scalars(select(DBCreative).filter_by(creative_id="c_brand_string")).first()
+                assert db.data.get("brand") == {"domain": "acme.com"}
+
+    def test_update_brand_from_creative_brand(self, integration_db):
+        """UPDATE: creative.brand → stored in data["brand"] on update path."""
+        with CreativeSyncEnv() as env:
+            env.setup_default_data()
+            fmt = env.setup_generative_build()
+
+            # CREATE first (no brand)
+            env.call_impl(
+                creatives=[
+                    _creative(
+                        creative_id="c_brand_update",
+                        format_id=fmt,
+                        assets={"message": {"content": "Initial"}},
+                    )
+                ]
+            )
+
+            # UPDATE with brand
+            creative = _creative(
+                creative_id="c_brand_update",
+                format_id=fmt,
+                assets={"message": {"content": "Updated"}},
+            )
+            creative["brand"] = {"domain": "updated.com"}
+
+            result = env.call_impl(creatives=[creative])
+
+            assert result.creatives[0].action == CreativeAction.updated
+
+            with get_db_session() as session:
+                db = session.scalars(select(DBCreative).filter_by(creative_id="c_brand_update")).first()
+                assert db.data.get("brand") == {"domain": "updated.com"}
+
+    def test_create_brand_not_overwritten_if_already_set(self, integration_db):
+        """CREATE then UPDATE: existing data["brand"] is NOT overwritten on second sync.
+
+        The fix uses `if not data.get("brand")` guard — once brand is set,
+        subsequent syncs without media_buy_brand should not overwrite it.
+        """
+        with CreativeSyncEnv() as env:
+            env.setup_default_data()
+            fmt = env.setup_generative_build()
+
+            # First CREATE with brand
+            creative = _creative(
+                creative_id="c_brand_no_overwrite",
+                format_id=fmt,
+                assets={"message": {"content": "Initial"}},
+            )
+            creative["brand"] = {"domain": "original.com"}
+            env.call_impl(creatives=[creative])
+
+            # Second sync (UPDATE) with different brand — should NOT overwrite
+            creative2 = _creative(
+                creative_id="c_brand_no_overwrite",
+                format_id=fmt,
+                assets={"message": {"content": "Updated"}},
+            )
+            creative2["brand"] = {"domain": "different.com"}
+            result = env.call_impl(creatives=[creative2])
+
+            assert result.creatives[0].action == CreativeAction.updated
+
+            with get_db_session() as session:
+                db = session.scalars(
+                    select(DBCreative).filter_by(creative_id="c_brand_no_overwrite")
+                ).first()
+                # Original brand preserved
+                assert db.data.get("brand") == {"domain": "original.com"}
+
+    def test_create_media_buy_brand_takes_priority_over_creative_brand(self, integration_db):
+        """CREATE: media_buy_brand kwarg takes priority over creative.brand.
+
+        When both media_buy_brand and creative.brand are provided,
+        media_buy_brand wins (it's the buyer-level brand from the media buy request).
+        """
+        with CreativeSyncEnv() as env:
+            env.setup_default_data()
+            fmt = env.setup_generative_build()
+
+            creative = _creative(
+                creative_id="c_brand_priority",
+                format_id=fmt,
+                assets={"message": {"content": "Build me an ad"}},
+            )
+            creative["brand"] = {"domain": "creative.com"}
+
+            result = env.call_impl(
+                creatives=[creative],
+                media_buy_brand={"domain": "mediabuy.com"},
+            )
+
+            assert result.creatives[0].action == CreativeAction.created
+
+            with get_db_session() as session:
+                db = session.scalars(select(DBCreative).filter_by(creative_id="c_brand_priority")).first()
+                assert db.data.get("brand") == {"domain": "mediabuy.com"}
+
+    def test_create_media_buy_brand_fallback_to_creative_brand(self, integration_db):
+        """CREATE: media_buy_brand=None → falls back to creative.brand.
+
+        When media_buy_brand is None, the creative.brand is used as fallback.
+        """
+        with CreativeSyncEnv() as env:
+            env.setup_default_data()
+            fmt = env.setup_generative_build()
+
+            creative = _creative(
+                creative_id="c_brand_fallback",
+                format_id=fmt,
+                assets={"message": {"content": "Build me an ad"}},
+            )
+            creative["brand"] = {"domain": "creative.com"}
+
+            result = env.call_impl(
+                creatives=[creative],
+                media_buy_brand=None,
+            )
+
+            assert result.creatives[0].action == CreativeAction.created
+
+            with get_db_session() as session:
+                db = session.scalars(select(DBCreative).filter_by(creative_id="c_brand_fallback")).first()
+                assert db.data.get("brand") == {"domain": "creative.com"}
+
+    def test_update_media_buy_brand_propagated(self, integration_db):
+        """UPDATE: media_buy_brand kwarg propagated and stored in data["brand"]."""
+        with CreativeSyncEnv() as env:
+            env.setup_default_data()
+            fmt = env.setup_generative_build()
+
+            # CREATE first (no brand)
+            env.call_impl(
+                creatives=[
+                    _creative(
+                        creative_id="c_brand_mb_update",
+                        format_id=fmt,
+                        assets={"message": {"content": "Initial"}},
+                    )
+                ]
+            )
+
+            # UPDATE with media_buy_brand
+            creative = _creative(
+                creative_id="c_brand_mb_update",
+                format_id=fmt,
+                assets={"message": {"content": "Updated"}},
+            )
+            creative["brand"] = {"domain": "creative.com"}
+
+            result = env.call_impl(
+                creatives=[creative],
+                media_buy_brand={"domain": "mediabuy.com"},
+            )
+
+            assert result.creatives[0].action == CreativeAction.updated
+
+            with get_db_session() as session:
+                db = session.scalars(select(DBCreative).filter_by(creative_id="c_brand_mb_update")).first()
+                assert db.data.get("brand") == {"domain": "mediabuy.com"}

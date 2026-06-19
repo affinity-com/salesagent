@@ -27,7 +27,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from adcp import ADCPMultiAgentClient, ListCreativeFormatsRequest
+from adcp import ADCPMultiAgentClient, BuildCreativeRequest, ListCreativeFormatsRequest
+from adcp.types.generated_poc.core.format_id import FormatReferenceStructuredObject
 from adcp.exceptions import ADCPAuthenticationError, ADCPConnectionError, ADCPError, ADCPTimeoutError
 from adcp.types import AssetContentType as AssetType
 from adcp.types import Error as AdCPResponseError
@@ -967,7 +968,6 @@ class CreativeAgentRegistry:
         agent_url: str,
         format_id: str,
         message: str,
-        gemini_api_key: str | None = None,
         promoted_offerings: dict[str, Any] | None = None,
         context_id: str | None = None,
         finalize: bool = False,
@@ -977,13 +977,12 @@ class CreativeAgentRegistry:
     ) -> dict[str, Any]:
         """Build a creative using AI generation via the creative agent.
 
-        This calls the creative agent's build_creative tool.
+        This calls the creative agent's build_creative AdCP task via ADCPMultiAgentClient.
 
         Args:
             agent_url: URL of the creative agent
             format_id: Format ID (e.g. "text_ad_search", "display_300x250_generative")
             message: Creative brief or refinement instructions
-            gemini_api_key: User's Gemini API key (only required for Gemini-based formats)
             promoted_offerings: Brand and product information for AI generation
             context_id: Session ID for iterative refinement (optional)
             finalize: Set to true to finalize the creative (default: False)
@@ -998,53 +997,51 @@ class CreativeAgentRegistry:
             - status: "draft" or "finalized"
             - creative_output: Generated creative manifest with output_format
         """
-        # Use custom MCP client for non-standard tools (build_creative not in AdCP spec)
-        async with create_mcp_client(agent_url=agent_url, timeout=30) as client:
-            # Bug 6: creative-agent handler reads "target_format_id" (not "format_id")
-            # and expects "creative_manifest" + "brand" for text_ad_search.
-            # Bug C: target_format_id must be an object {id, agent_url}, not a plain string.
-            params: dict[str, Any] = {
-                "message": message,
-                "target_format_id": {"id": format_id, "agent_url": agent_url},
-                "finalize": finalize,
-            }
+        import logging
 
-            if creative_manifest is not None:
-                params["creative_manifest"] = creative_manifest
+        logger = logging.getLogger(__name__)
 
-            if brand is not None:
-                params["brand"] = brand
+        if idempotency_key is None:
+            idempotency_key = uuid.uuid4().hex
 
-            if idempotency_key is None:
-                idempotency_key = uuid.uuid4().hex
-            params["idempotency_key"] = idempotency_key
+        # Build the AdCP request using model_construct to allow plain dict/string
+        # values for creative_manifest and brand (the creative-agent handler reads
+        # these as raw dicts from the serialized params, not as typed objects).
+        request = BuildCreativeRequest.model_construct(
+            message=message,
+            target_format_id=FormatReferenceStructuredObject(
+                agent_url=agent_url,  # type: ignore[arg-type]
+                id=format_id,
+            ),
+            idempotency_key=idempotency_key,
+            finalize=finalize,
+            **({"creative_manifest": creative_manifest} if creative_manifest is not None else {}),
+            **({"brand": brand} if brand is not None else {}),
+            **({"promoted_offerings": promoted_offerings} if promoted_offerings else {}),
+            **({"context_id": context_id} if context_id else {}),
+        )
 
-            # gemini_api_key is only needed for Gemini-based (non-Vertex) formats
-            if gemini_api_key:
-                params["gemini_api_key"] = gemini_api_key
+        agent = CreativeAgent(agent_url=agent_url, name="Unknown", enabled=True)
+        client = self._build_adcp_client([agent])
 
-            if promoted_offerings:
-                params["promoted_offerings"] = promoted_offerings
+        logger.info("build_creative: calling agent %s for format %s", agent_url, format_id)
+        result = await client.agent(agent.name).build_creative(request)
+        logger.info("build_creative: got result status=%s", result.status)
 
-            if context_id:
-                params["context_id"] = context_id
+        if result.status == "completed":
+            if result.data is None:
+                return {}
+            return result.data.model_dump(mode="json", exclude_none=True)
 
-            result = await client.call_tool("build_creative", params)
+        if result.status == "failed":
+            error_msg = getattr(result, "error", None) or getattr(result, "message", None) or "build_creative failed"
+            logger.error("build_creative: agent returned FAILED status. Error: %s", error_msg)
+            raise AdCPAdapterError(f"Creative agent build_creative failed: {error_msg}")
 
-            # Use structured_content field for JSON response (MCP protocol update)
-            if hasattr(result, "structured_content") and result.structured_content:
-                return result.structured_content
-
-            # Fallback: Parse result from content field (legacy)
-            import json
-
-            if isinstance(result.content, list) and result.content:
-                creative_data = result.content[0].text if hasattr(result.content[0], "text") else result.content[0]
-                if isinstance(creative_data, str):
-                    creative_data = json.loads(creative_data)
-                return creative_data
-
-            return {}
+        raise AdCPAdapterError(
+            f"Unexpected result status from build_creative: {result.status}",
+            recovery="terminal",
+        )
 
 
 # Global registry instance
