@@ -102,9 +102,13 @@ ALLOWLIST: set[tuple[str, str]] = {
     ("src/admin/app.py", "inject_context"),
     # ── Admin blueprints ──
     ("src/admin/blueprints/activity_stream.py", "get_recent_activities"),
+    ("src/admin/blueprints/adapters.py", "get_siteplug_zone"),
     ("src/admin/blueprints/adapters.py", "list_broadstreet_zones"),
+    ("src/admin/blueprints/adapters.py", "list_siteplug_inventory"),
     ("src/admin/blueprints/adapters.py", "mock_config"),
     ("src/admin/blueprints/adapters.py", "save_adapter_config"),
+    ("src/admin/blueprints/adapters.py", "save_siteplug_config"),
+    ("src/admin/blueprints/adapters.py", "sync_siteplug_inventory"),
     ("src/admin/blueprints/api.py", "get_tenant_products"),
     ("src/admin/blueprints/auth.py", "gam_authorize"),
     ("src/admin/blueprints/auth.py", "gam_callback"),
