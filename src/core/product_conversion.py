@@ -14,6 +14,7 @@ V3 Migration Notes:
 import logging
 
 from adcp import (
+    CpaPricingOption,
     CpcPricingOption,
     CpcvPricingOption,
     CpmPricingOption,
@@ -23,6 +24,7 @@ from adcp import (
     VcpmPricingOption,
 )
 from adcp.types._generated import MediaChannel
+from adcp.types.generated_poc.enums.event_type import EventType
 from packaging.version import InvalidVersion, Version
 
 # Import our extended Product (includes implementation_config)
@@ -65,6 +67,7 @@ def convert_pricing_option_to_adcp(
     | CpvPricingOption
     | CppPricingOption
     | FlatRatePricingOption
+    | CpaPricingOption
 ):
     """Convert database PricingOption to AdCP V3 pricing option.
 
@@ -248,9 +251,33 @@ def convert_pricing_option_to_adcp(
             result_fields["parameters"] = parameters
         return FlatRatePricingOption(**result_fields)
 
+    elif pricing_model == "cpa":
+        # CPA (Cost Per Acquisition) - AdCP v3 pricing model for affiliate/conversion pricing.
+        # Requires event_type; defaults to "purchase" for affiliate/SSS use cases.
+        if not rate:
+            raise ValueError(f"CPA pricing option {pricing_option_id} requires rate")
+        # Resolve event_type from parameters if provided, otherwise default to "purchase"
+        event_type_val = EventType.purchase
+        if parameters and isinstance(parameters, dict):
+            raw_event = parameters.get("event_type")
+            if raw_event:
+                try:
+                    event_type_val = EventType(raw_event)
+                except ValueError:
+                    logger.warning(
+                        "Unknown event_type '%s' for CPA pricing option %s, defaulting to 'purchase'",
+                        raw_event,
+                        pricing_option_id,
+                    )
+        return CpaPricingOption(
+            **common_fields,
+            event_type=event_type_val,
+            fixed_price=float(rate),
+        )
+
     else:
         raise ValueError(
-            f"Unsupported pricing_model '{pricing_model}'. Supported models: cpm, vcpm, cpc, cpcv, cpv, cpp, flat_rate"
+            f"Unsupported pricing_model '{pricing_model}'. Supported models: cpm, vcpm, cpc, cpcv, cpv, cpp, flat_rate, cpa"
         )
 
 
