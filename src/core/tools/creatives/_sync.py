@@ -123,9 +123,7 @@ def _sync_creatives_impl(
     logger.info(f"[sync_creatives] Tenant dict keys: {list(tenant.keys())}")
     logger.info(f"[sync_creatives] Tenant approval_mode field: {tenant.get('approval_mode', 'NOT FOUND')}")
     approval_mode = tenant.get("approval_mode", "require-human")
-    auto_approve_format_ids = tenant.get("auto_approve_format_ids") or []
     logger.info(f"[sync_creatives] Final approval mode: {approval_mode} (from tenant: {tenant.get('tenant_id')})")
-    logger.info(f"[sync_creatives] Auto-approve format IDs: {auto_approve_format_ids}")
 
     # Fetch creative formats ONCE before processing loop (outside any transaction)
     # This avoids async HTTP calls inside database savepoints which cause transaction errors
@@ -230,27 +228,13 @@ def _sync_creatives_impl(
                     if creative.creative_id:
                         existing_creative = creative_repo.get_by_id(creative.creative_id, principal_id)
 
-                    # Per-format approval mode override: if this format is in
-                    # auto_approve_format_ids, treat it as auto-approve regardless
-                    # of the tenant-level approval_mode setting.
-                    _format_id_str = (
-                        creative.format_id.id
-                        if hasattr(creative.format_id, "id")
-                        else str(creative.format_id)
-                    ) if creative.format_id else ""
-                    effective_approval_mode = (
-                        "auto-approve"
-                        if _format_id_str in auto_approve_format_ids
-                        else approval_mode
-                    )
-
                     if existing_creative:
                         update_result, needs_approval = _update_existing_creative(
                             creative=creative,
                             existing_creative=existing_creative,
                             creative_repo=creative_repo,
                             format_value=format_value,
-                            approval_mode=effective_approval_mode,
+                            approval_mode=approval_mode,
                             tenant=tenant,
                             webhook_url=webhook_url,
                             context=context,
@@ -311,7 +295,7 @@ def _sync_creatives_impl(
                             creative=creative,
                             creative_repo=creative_repo,
                             format_value=format_value,
-                            approval_mode=effective_approval_mode,
+                            approval_mode=approval_mode,
                             tenant=tenant,
                             webhook_url=webhook_url,
                             context=context,
