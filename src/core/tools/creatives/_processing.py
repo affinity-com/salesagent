@@ -24,6 +24,47 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _find_format(
+    all_formats: list[Any],
+    creative_format: Any,  # FormatId object with .agent_url and .id
+) -> Any | None:
+    """Find a Format from all_formats matching the composite (agent_url, id) key.
+
+    Uses normalize_agent_url() to handle trailing-slash variants consistently.
+    Returns None if not found.
+    """
+    from src.core.validation import normalize_agent_url
+
+    target_agent = normalize_agent_url(str(creative_format.agent_url))
+    target_id = creative_format.id
+
+    for fmt in all_formats:
+        fmt_agent = normalize_agent_url(str(fmt.format_id.agent_url))
+        if fmt_agent == target_agent and fmt.format_id.id == target_id:
+            return fmt
+    return None
+
+
+def _build_generative_manifest(
+    format_id_str: str,
+    agent_url: str,
+    assets: dict | None,
+) -> dict[str, Any]:
+    """Build a compliant AdCP creative_manifest for build_creative calls.
+
+    Per AdCP creative-manifest.json schema:
+    - format_id: required, full FormatId object {agent_url, id}
+    - assets: required, dict of asset_id -> asset object
+    """
+    return {
+        "format_id": {
+            "id": format_id_str,
+            "agent_url": agent_url,
+        },
+        "assets": dict(assets or {}),
+    }
+
+
 def _failed_sync_result(creative_id: str, error_msg: str) -> SyncCreativeResult:
     """Build a SyncCreativeResult for a failed creative sync operation."""
     return SyncCreativeResult(
@@ -168,13 +209,8 @@ def _update_existing_creative(
             # Use pre-fetched formats (fetched outside transaction at function start)
             # This avoids async HTTP calls inside savepoint
 
-            # Find matching format
-            # Compare only the string ID to avoid trailing-slash mismatch on agent_url
-            format_obj = None
-            for fmt in all_formats:
-                if fmt.format_id.id == creative_format.id:
-                    format_obj = fmt
-                    break
+            # Find matching format using composite (normalized agent_url, id) key
+            format_obj = _find_format(all_formats, creative_format)
 
             if format_obj and format_obj.agent_url:
                 # Check if format is generative (has output_format_ids)
@@ -246,7 +282,11 @@ def _update_existing_creative(
                                 promoted_offerings=promoted_offerings,
                                 context_id=context_id,
                                 finalize=getattr(creative, "approved", False),
-                                creative_manifest={"format_id": {"id": format_id_str, "agent_url": str(format_obj.agent_url)}, "assets": dict(creative.assets or {})},
+                                creative_manifest=_build_generative_manifest(
+                                    format_id_str=format_id_str,
+                                    agent_url=str(format_obj.agent_url),
+                                    assets=creative.assets,
+                                ),
                                 brand=getattr(creative, "brand", None),
                             )
                         )
@@ -343,27 +383,22 @@ def _update_existing_creative(
                     preview_result = None
                 else:
                     # Static creative - use preview_creative
-                    # Build creative manifest from available data
-                    # Extract string ID from FormatId object if needed
+                    # Build AdCP-compliant creative manifest
                     format_id_str = creative_format.id
                     creative_manifest: dict[str, Any] = {
-                        "creative_id": existing_creative.creative_id,
-                        "name": creative.name or existing_creative.name,
-                        "format_id": format_id_str,
+                        "format_id": {
+                            "id": creative_format.id,
+                            "agent_url": str(format_obj.agent_url),
+                        },
+                        "assets": _validate_creative_assets(creative.assets) if creative.assets else {},
                     }
-
-                    # Add any provided asset data for validation
-                    # Validate assets are in dict format (AdCP v2.4+)
-                    if creative.assets:
-                        validated_assets = _validate_creative_assets(creative.assets)
-                        if validated_assets:
-                            creative_manifest["assets"] = validated_assets
+                    # Optional extras (non-spec but harmless for agent context)
+                    if creative.name or getattr(existing_creative, "name", None):
+                        creative_manifest["name"] = creative.name or existing_creative.name
                     if data.get("url"):
                         creative_manifest["url"] = data.get("url")
 
                     # Call creative agent's preview_creative for validation + preview
-                    # Extract string ID from FormatId object if needed
-                    format_id_str = creative_format.id
                     logger.info(
                         f"[sync_creatives] Calling preview_creative for validation (update): "
                         f"{existing_creative.creative_id} format {format_id_str} "
@@ -518,13 +553,8 @@ def _create_new_creative(
             # Use pre-fetched formats (fetched outside transaction at function start)
             # This avoids async HTTP calls inside savepoint
 
-            # Find matching format
-            # Compare only the string ID to avoid trailing-slash mismatch on agent_url
-            format_obj = None
-            for fmt in all_formats:
-                if fmt.format_id.id == creative_format.id:
-                    format_obj = fmt
-                    break
+            # Find matching format using composite (normalized agent_url, id) key
+            format_obj = _find_format(all_formats, creative_format)
 
             if format_obj and format_obj.agent_url:
                 # Check if format is generative (has output_format_ids)
@@ -592,7 +622,11 @@ def _create_new_creative(
                             promoted_offerings=promoted_offerings,
                             context_id=getattr(creative, "context_id", None),
                             finalize=getattr(creative, "approved", False),
-                            creative_manifest={"format_id": {"id": format_id_str, "agent_url": str(format_obj.agent_url)}, "assets": dict(creative.assets or {})},
+                            creative_manifest=_build_generative_manifest(
+                                format_id_str=format_id_str,
+                                agent_url=str(format_obj.agent_url),
+                                assets=creative.assets,
+                            ),
                             brand=getattr(creative, "brand", None),
                         )
                     )
@@ -666,27 +700,22 @@ def _create_new_creative(
                     preview_result = None
                 else:
                     # Static creative - use preview_creative
-                    # Build creative manifest from available data
-                    # Extract string ID from FormatId object if needed
+                    # Build AdCP-compliant creative manifest
                     format_id_str = creative_format.id
                     creative_manifest: dict[str, Any] = {
-                        "creative_id": creative.creative_id or str(uuid.uuid4()),
-                        "name": creative.name,
-                        "format_id": format_id_str,
+                        "format_id": {
+                            "id": creative_format.id,
+                            "agent_url": str(format_obj.agent_url),
+                        },
+                        "assets": _validate_creative_assets(creative.assets) if creative.assets else {},
                     }
-
-                    # Add any provided asset data for validation
-                    # Validate assets are in dict format (AdCP v2.4+)
-                    if creative.assets:
-                        validated_assets = _validate_creative_assets(creative.assets)
-                        if validated_assets:
-                            creative_manifest["assets"] = validated_assets
+                    # Optional extras (non-spec but harmless for agent context)
+                    if creative.name:
+                        creative_manifest["name"] = creative.name
                     if data.get("url"):
                         creative_manifest["url"] = data.get("url")
 
                     # Call creative agent's preview_creative for validation + preview
-                    # Extract string ID from FormatId object if needed
-                    format_id_str = creative_format.id
                     logger.info(
                         f"[sync_creatives] Calling preview_creative for validation: {format_id_str} "
                         f"from agent {format_obj.agent_url}, has_assets={bool(creative.assets)}, "
