@@ -684,11 +684,9 @@ def _create_new_creative(
                         if not data.get("brand"):
                             if media_buy_brand:
                                 data["brand"] = media_buy_brand
-                                changes.append("brand")
                             elif getattr(creative, "brand", None):
                                 brand_val = creative.brand
                                 data["brand"] = brand_val if isinstance(brand_val, dict) else {"domain": str(brand_val)}
-                                changes.append("brand")
 
                         logger.info(
                             f"[sync_creatives] Generative creative built: "
