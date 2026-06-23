@@ -375,34 +375,109 @@ def seed_authorized_properties(conn, tenant_id, label):
 
 
 def seed_siteplug_extra_products(conn):
-    """Seed siteplug-specific extra products not covered by the generic seed_products().
+    """Seed siteplug-specific products for the August 2026 ACN0 scope.
 
-    Adds:
-      - siteplug_survey_ad   — Opinary interactive poll widget (survey_ad format)
-      - siteplug_text_ad_search — Sponsored text ads in search/knowledge graph (text_ad_search format)
+    August scope = SiteSuggest (SSS) only. SiteDiscover and SiteDirect are out of scope.
+
+    Per decision D13 (ops-workflow/2026-06-15-ops-vs-plan-gap-analysis.md), campaign
+    variants (homepage vs. category-page lander) are separate AdCP products, not adapter
+    clones. Each product maps to one Siteplug SSS campaign type via the SP4 flags:
+        zc_domain_auto_status=0, kd_auto_status=1, sss_auto_status=1, sd_auto_status=0
+
+    Creative format: text_ad_search (confirmed correct for SSS in all three codebases).
+
+    Pricing: CPC and CPA (affiliate). CPM is NOT used for SSS.
+    Default bid from ops transcript: $0.10 CPC / $0.20 CPA (US market, low-query start).
+
+    Products seeded:
+      - siteplug_sss_homepage  — SSS campaign targeting the brand homepage URL
+      - siteplug_sss_category  — SSS campaign targeting a category-page deep-link URL
+      - siteplug_sss_product   — SSS campaign targeting a product-page deep-link URL
+      - opinary_survey_ad      — Opinary interactive poll widget (kept; out of August scope
+                                 but harmless and already present in some envs)
 
     Also appends the format IDs to tenants.auto_approve_format_ids so they are
     auto-approved without human review.
 
     Idempotent: ON CONFLICT DO NOTHING / WHERE NOT EXISTS guards throughout.
-    Previously these were standalone .sql files piped into psql from the Makefile.
+
+    Superseded product IDs (removed from EXTRA_PRODUCTS below) are explicitly
+    deleted so that regular seed runs don't leave orphaned rows in the DB.
+    Superseded IDs:
+      - siteplug_text_ad_search  (replaced by siteplug_sss_homepage / siteplug_sss_category / siteplug_sss_product)
+      - siteplug_survey_ad       (renamed to opinary_survey_ad)
     """
+    SUPERSEDED_PRODUCT_IDS = [
+        "siteplug_text_ad_search",
+        "siteplug_survey_ad",
+    ]
+    for old_id in SUPERSEDED_PRODUCT_IDS:
+        n = count(conn, f"SELECT COUNT(*) FROM products WHERE tenant_id='siteplug' AND product_id='{old_id}'")
+        if n > 0:
+            print(f"  Removing superseded siteplug product '{old_id}'...")
+            # Delete the product only — pricing_options are removed automatically via
+            # ON DELETE CASCADE. Do NOT delete pricing_options first: the
+            # prevent_empty_pricing_options trigger fires BEFORE the product row is
+            # gone and raises an exception when it sees the last option being removed
+            # while the product still exists.
+            run_sql(conn, f"""
+                DELETE FROM products
+                WHERE tenant_id='siteplug' AND product_id='{old_id}'
+            """, f"siteplug product '{old_id}' removed (pricing_options cascade-deleted)")
+        else:
+            print(f"  ✓ superseded product '{old_id}' not present — skipping cleanup")
+
+    # (product_id, name, description, format_ids_json, format_id)
     EXTRA_PRODUCTS = [
         (
-            "siteplug_survey_ad",
-            "SitePlug Survey Ad",
+            "siteplug_sss_homepage",
+            "SiteSuggest — Homepage",
+            (
+                "SiteSuggest keyword-driven text ads targeting the brand homepage URL. "
+                "Maps to Siteplug SSS campaign type (kd_auto_status=1, sss_auto_status=1). "
+                "August 2026 scope: US market, CJ/Haven/Impact networks."
+            ),
+            '[{"id": "text_ad_search", "agent_url": "http://creative-agent.localhost:8080"}]',
+            "text_ad_search",
+        ),
+        (
+            "siteplug_sss_category",
+            "SiteSuggest — Category Page",
+            (
+                "SiteSuggest keyword-driven text ads targeting a category-page deep-link URL. "
+                "Maps to Siteplug SSS campaign type (kd_auto_status=1, sss_auto_status=1). "
+                "August 2026 scope: US market, CJ/Haven/Impact networks."
+            ),
+            '[{"id": "text_ad_search", "agent_url": "http://creative-agent.localhost:8080"}]',
+            "text_ad_search",
+        ),
+        (
+            "siteplug_sss_product",
+            "SiteSuggest — Product Page",
+            (
+                "SiteSuggest keyword-driven text ads targeting a product-page deep-link URL. "
+                "Maps to Siteplug SSS campaign type (kd_auto_status=1, sss_auto_status=1). "
+                "August 2026 scope: US market, CJ/Haven/Impact networks."
+            ),
+            '[{"id": "text_ad_search", "agent_url": "http://creative-agent.localhost:8080"}]',
+            "text_ad_search",
+        ),
+        (
+            "opinary_survey_ad",
+            "Opinary Survey Ad",
             "Opinary first-party interactive poll widget for addressable audiences",
             '[{"id": "survey_ad", "agent_url": "http://creative-agent.localhost:8080"}]',
             "survey_ad",
         ),
-        (
-            "siteplug_text_ad_search",
-            "SitePlug Text Ad Search",
-            "Sponsored text ads shown in search autofill and knowledge graph placements",
-            '[{"id": "text_ad_search", "agent_url": "http://creative-agent.localhost:8080"}]',
-            "text_ad_search",
-        ),
     ]
+
+    # Pricing rows per SSS product: CPC $0.10 and CPA $0.20 (ops transcript defaults).
+    # survey_ad keeps its original CPM $5.00 placeholder.
+    SSS_PRICING = [
+        ("cpc", 0.10),
+        ("cpa", 0.20),
+    ]
+    SSS_PRODUCT_IDS = {"siteplug_sss_homepage", "siteplug_sss_category", "siteplug_sss_product"}
 
     for product_id, name, description, format_ids, format_id in EXTRA_PRODUCTS:
         n = count(conn, f"SELECT COUNT(*) FROM products WHERE tenant_id='siteplug' AND product_id='{product_id}'")
@@ -418,8 +493,8 @@ def seed_siteplug_extra_products(conn):
                 ) VALUES (
                     'siteplug',
                     '{product_id}',
-                    '{name}',
-                    '{description}',
+                    $${name}$$,
+                    $${description}$$,
                     '{format_ids}'::jsonb,
                     '{{"geo": {{}}, "audience": {{}}}}'::jsonb,
                     'non_guaranteed',
@@ -431,7 +506,24 @@ def seed_siteplug_extra_products(conn):
         po_n = count(conn, f"SELECT COUNT(*) FROM pricing_options WHERE tenant_id='siteplug' AND product_id='{product_id}'")
         if po_n > 0:
             print(f"  ✓ siteplug pricing for '{product_id}' already exists — skipping")
+        elif product_id in SSS_PRODUCT_IDS:
+            # SSS products: CPC + CPA pricing (no CPM — SSS is affiliate/CPC traffic)
+            for pricing_model, rate in SSS_PRICING:
+                run_sql(conn, f"""
+                    INSERT INTO pricing_options (
+                        tenant_id, product_id, pricing_model, rate, currency, is_fixed, price_guidance
+                    )
+                    SELECT 'siteplug', '{product_id}', '{pricing_model}', {rate}, 'USD', false,
+                           jsonb_build_object('floor', {rate}::numeric)
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM pricing_options
+                        WHERE tenant_id='siteplug'
+                          AND product_id='{product_id}'
+                          AND pricing_model='{pricing_model}'
+                    )
+                """, f"siteplug pricing for '{product_id}' seeded ({pricing_model.upper()} ${rate:.2f})")
         else:
+            # Non-SSS products (survey_ad): keep CPM placeholder
             run_sql(conn, f"""
                 INSERT INTO pricing_options (
                     tenant_id, product_id, pricing_model, rate, currency, is_fixed
@@ -441,7 +533,7 @@ def seed_siteplug_extra_products(conn):
                     SELECT 1 FROM pricing_options
                     WHERE tenant_id='siteplug' AND product_id='{product_id}'
                 )
-            """, f"siteplug pricing for '{product_id}' seeded (CPM $5.00)")
+            """, f"siteplug pricing for '{product_id}' seeded (CPM $5.00 placeholder)")
 
         # Append format_id to auto_approve_format_ids if not already present
         run_sql(conn, f"""
