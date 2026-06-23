@@ -30,6 +30,12 @@ class SiteplugConnectionConfig(BaseConnectionConfig):
         description="Max retry attempts for transient failures",
     )
 
+    # Affilizz Internal Text Ads API — for siteplug_text_ad_search creative sync
+    # These are ADDITIVE optional fields. The existing base_url + api_key fields
+    # (Siteplug SSP API, X-API-Key header) are unchanged and unrelated.
+    affilizz_internal_url: str = ""  # e.g. "https://api.affilizz.com/v1/ads-aura"
+    affilizz_api_key: str = ""  # ApiKey header value (INTERNAL_API-scoped token)
+
 
 class SiteplugProductConfig(BaseProductConfig):
     """Product-level configuration for Siteplug campaigns."""

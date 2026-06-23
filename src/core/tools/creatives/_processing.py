@@ -24,6 +24,47 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _find_format(
+    all_formats: list[Any],
+    creative_format: Any,  # FormatId object with .agent_url and .id
+) -> Any | None:
+    """Find a Format from all_formats matching the composite (agent_url, id) key.
+
+    Uses normalize_agent_url() to handle trailing-slash variants consistently.
+    Returns None if not found.
+    """
+    from src.core.validation import normalize_agent_url
+
+    target_agent = normalize_agent_url(str(creative_format.agent_url))
+    target_id = creative_format.id
+
+    for fmt in all_formats:
+        fmt_agent = normalize_agent_url(str(fmt.format_id.agent_url))
+        if fmt_agent == target_agent and fmt.format_id.id == target_id:
+            return fmt
+    return None
+
+
+def _build_generative_manifest(
+    format_id_str: str,
+    agent_url: str,
+    assets: dict | None,
+) -> dict[str, Any]:
+    """Build a compliant AdCP creative_manifest for build_creative calls.
+
+    Per AdCP creative-manifest.json schema:
+    - format_id: required, full FormatId object {agent_url, id}
+    - assets: required, dict of asset_id -> asset object
+    """
+    return {
+        "format_id": {
+            "id": format_id_str,
+            "agent_url": agent_url,
+        },
+        "assets": dict(assets or {}),
+    }
+
+
 def _failed_sync_result(creative_id: str, error_msg: str) -> SyncCreativeResult:
     """Build a SyncCreativeResult for a failed creative sync operation."""
     return SyncCreativeResult(
@@ -50,6 +91,7 @@ def _update_existing_creative(
     all_formats: list[Any],
     registry: Any,
     principal_id: str,
+    media_buy_brand: dict | None = None,
 ) -> tuple[SyncCreativeResult, bool]:
     """Update an existing creative with upsert semantics (AdCP 2.5).
 
@@ -167,36 +209,22 @@ def _update_existing_creative(
             # Use pre-fetched formats (fetched outside transaction at function start)
             # This avoids async HTTP calls inside savepoint
 
-            # Find matching format
-            format_obj = None
-            for fmt in all_formats:
-                if fmt.format_id == creative_format:
-                    format_obj = fmt
-                    break
+            # Find matching format using composite (normalized agent_url, id) key
+            format_obj = _find_format(all_formats, creative_format)
 
             if format_obj and format_obj.agent_url:
                 # Check if format is generative (has output_format_ids)
                 is_generative = bool(getattr(format_obj, "output_format_ids", None))
 
                 if is_generative:
-                    # Generative creative update - rebuild using AI
+                    # Generative creative update - delegate to creative-agent
+                    # creative-agent decides model internally — no format-specific key checks here
+                    format_id_str = creative_format.id if hasattr(creative_format, "id") else str(creative_format)
+
                     logger.info(
-                        f"[sync_creatives] Detected generative format update: {creative_format}, "
-                        f"checking for Gemini API key"
+                        f"[sync_creatives] Detected generative format update: {creative_format}"
+                        ", delegating to creative-agent"
                     )
-
-                    # Get Gemini API key from config
-                    from src.core.config import get_config
-
-                    config = get_config()
-                    gemini_api_key = config.gemini_api_key
-
-                    if not gemini_api_key:
-                        error_msg = (
-                            f"Cannot update generative creative {creative_format}: GEMINI_API_KEY not configured"
-                        )
-                        logger.error(f"[sync_creatives] {error_msg}")
-                        raise ValueError(error_msg)
 
                     # Extract message/brief from assets or inputs
                     message = None
@@ -245,15 +273,21 @@ def _update_existing_creative(
                             f"context_id={context_id}"
                         )
 
+                        format_id_str = creative_format.id if hasattr(creative_format, "id") else str(creative_format)
                         build_result = run_async_in_sync_context(
                             registry.build_creative(
                                 agent_url=format_obj.agent_url,
-                                format_id=creative_format,
+                                format_id=format_id_str,
                                 message=message,
-                                gemini_api_key=gemini_api_key,
                                 promoted_offerings=promoted_offerings,
                                 context_id=context_id,
                                 finalize=getattr(creative, "approved", False),
+                                creative_manifest=_build_generative_manifest(
+                                    format_id_str=format_id_str,
+                                    agent_url=str(format_obj.agent_url),
+                                    assets=creative.assets,
+                                ),
+                                brand=getattr(creative, "brand", None),
                             )
                         )
 
@@ -265,40 +299,66 @@ def _update_existing_creative(
                             changes.append("generative_build_result")
 
                             # Extract creative output if available
-                            if build_result.get("creative_output"):
-                                creative_output = build_result["creative_output"]
+                            creative_manifest_out = build_result.get("creative_manifest", {})
+                            if creative_manifest_out.get("assets"):
+                                data["assets"] = {**data.get("assets", {}), **creative_manifest_out["assets"]}
+                                changes.append("assets")
+                                logger.info("[sync_creatives] Using assets from generative output (update)")
 
-                                # Only use generative assets if user didn't provide their own
-                                user_provided_assets = creative.assets
-                                if creative_output.get("assets") and not user_provided_assets:
-                                    data["assets"] = creative_output["assets"]
+                            # Gap B: fallback to creative_manifest assets if creative_output had none
+                            if not data.get("assets"):
+                                manifest_assets = build_result.get("creative_manifest", {}).get("assets")
+                                if manifest_assets:
+                                    data["assets"] = manifest_assets
                                     changes.append("assets")
-                                    logger.info("[sync_creatives] Using assets from generative output (update)")
-                                elif user_provided_assets:
-                                    logger.info(
-                                        "[sync_creatives] Preserving user-provided assets in update, "
-                                        "not overwriting with generative output"
-                                    )
+                                    logger.info("[sync_creatives] Using assets from creative_manifest (update)")
 
-                                if creative_output.get("output_format"):
-                                    output_format = creative_output["output_format"]
-                                    data["output_format"] = output_format
-                                    changes.append("output_format")
+                            if creative_manifest_out.get("output_format"):
+                                output_format = creative_manifest_out["output_format"]
+                                data["output_format"] = output_format
+                                changes.append("output_format")
 
-                                    # Only use generative URL if user didn't provide one
-                                    if isinstance(output_format, dict) and output_format.get("url"):
-                                        if not data.get("url"):
-                                            data["url"] = output_format["url"]
-                                            changes.append("url")
-                                            logger.info(
-                                                f"[sync_creatives] Got URL from generative output (update): "
-                                                f"{data['url']}"
-                                            )
-                                        else:
-                                            logger.info(
-                                                "[sync_creatives] Preserving user-provided URL in update, "
-                                                "not overwriting with generative output"
-                                            )
+                                # Only use generative URL if user didn't provide one
+                                if isinstance(output_format, dict) and output_format.get("url"):
+                                    if not data.get("url"):
+                                        data["url"] = output_format["url"]
+                                        changes.append("url")
+                                        logger.info(
+                                            f"[sync_creatives] Got URL from generative output (update): "
+                                            f"{data['url']}"
+                                        )
+                                    else:
+                                        logger.info(
+                                            "[sync_creatives] Preserving user-provided URL in update, "
+                                            "not overwriting with generative output"
+                                        )
+
+                            # Extract url/width/height from top-level creative_manifest_out (unconditional)
+                            # These are set by the creative-agent for rendered formats (e.g. text_ad_search → HTML preview)
+                            if creative_manifest_out.get("url") and not data.get("url"):
+                                data["url"] = creative_manifest_out["url"]
+                                changes.append("url")
+                                logger.info(
+                                    f"[sync_creatives] Got URL from generative output manifest (update): {data['url']}"
+                                )
+                            if creative_manifest_out.get("width") and not data.get("width"):
+                                data["width"] = creative_manifest_out["width"]
+                                changes.append("width")
+                            if creative_manifest_out.get("height") and not data.get("height"):
+                                data["height"] = creative_manifest_out["height"]
+                                changes.append("height")
+
+                            # Persist brand from the media buy request so adapters can route by domain
+                            # (e.g. Affilizz domain guard in SiteplugCreativeManager._sync_text_ad_to_affilizz).
+                            # brand is buyer-supplied creative metadata — not a generation decision.
+                            if not data.get("brand"):
+                                if media_buy_brand:
+                                    data["brand"] = media_buy_brand
+                                    changes.append("brand")
+                                elif getattr(creative, "brand", None):
+                                    brand_val = creative.brand
+                                    data["brand"] = brand_val if isinstance(brand_val, dict) else {"domain": str(brand_val)}
+                                    changes.append("brand")
 
                             logger.info(
                                 f"[sync_creatives] Generative creative updated: "
@@ -323,27 +383,22 @@ def _update_existing_creative(
                     preview_result = None
                 else:
                     # Static creative - use preview_creative
-                    # Build creative manifest from available data
-                    # Extract string ID from FormatId object if needed
+                    # Build AdCP-compliant creative manifest
                     format_id_str = creative_format.id
                     creative_manifest: dict[str, Any] = {
-                        "creative_id": existing_creative.creative_id,
-                        "name": creative.name or existing_creative.name,
-                        "format_id": format_id_str,
+                        "format_id": {
+                            "id": creative_format.id,
+                            "agent_url": str(format_obj.agent_url),
+                        },
+                        "assets": _validate_creative_assets(creative.assets) if creative.assets else {},
                     }
-
-                    # Add any provided asset data for validation
-                    # Validate assets are in dict format (AdCP v2.4+)
-                    if creative.assets:
-                        validated_assets = _validate_creative_assets(creative.assets)
-                        if validated_assets:
-                            creative_manifest["assets"] = validated_assets
+                    # Optional extras (non-spec but harmless for agent context)
+                    if creative.name or getattr(existing_creative, "name", None):
+                        creative_manifest["name"] = creative.name or existing_creative.name
                     if data.get("url"):
                         creative_manifest["url"] = data.get("url")
 
                     # Call creative agent's preview_creative for validation + preview
-                    # Extract string ID from FormatId object if needed
-                    format_id_str = creative_format.id
                     logger.info(
                         f"[sync_creatives] Calling preview_creative for validation (update): "
                         f"{existing_creative.creative_id} format {format_id_str} "
@@ -467,6 +522,7 @@ def _create_new_creative(
     all_formats: list[Any],
     registry: Any,
     principal_id: str,
+    media_buy_brand: dict | None = None,
 ) -> tuple[SyncCreativeResult, bool]:
     """Create a new creative and persist it to the database (AdCP 2.5).
 
@@ -497,33 +553,22 @@ def _create_new_creative(
             # Use pre-fetched formats (fetched outside transaction at function start)
             # This avoids async HTTP calls inside savepoint
 
-            # Find matching format
-            format_obj = None
-            for fmt in all_formats:
-                if fmt.format_id == creative_format:
-                    format_obj = fmt
-                    break
+            # Find matching format using composite (normalized agent_url, id) key
+            format_obj = _find_format(all_formats, creative_format)
 
             if format_obj and format_obj.agent_url:
                 # Check if format is generative (has output_format_ids)
                 is_generative = bool(getattr(format_obj, "output_format_ids", None))
 
                 if is_generative:
-                    # Generative creative - call build_creative
+                    # Generative creative - delegate to creative-agent
+                    # creative-agent decides model internally — no format-specific key checks here
+                    format_id_str = creative_format.id if hasattr(creative_format, "id") else str(creative_format)
+
                     logger.info(
-                        f"[sync_creatives] Detected generative format: {creative_format}, checking for Gemini API key"
+                        f"[sync_creatives] Detected generative format: {creative_format}"
+                        ", delegating to creative-agent"
                     )
-
-                    # Get Gemini API key from config
-                    from src.core.config import get_config
-
-                    config = get_config()
-                    gemini_api_key = config.gemini_api_key
-
-                    if not gemini_api_key:
-                        error_msg = f"Cannot build generative creative {creative_format}: GEMINI_API_KEY not configured"
-                        logger.error(f"[sync_creatives] {error_msg}")
-                        raise ValueError(error_msg)
 
                     # Extract message/brief from assets or inputs
                     message = None
@@ -574,10 +619,15 @@ def _create_new_creative(
                             agent_url=format_obj.agent_url,
                             format_id=format_id_str,
                             message=message,
-                            gemini_api_key=gemini_api_key,
                             promoted_offerings=promoted_offerings,
                             context_id=getattr(creative, "context_id", None),
                             finalize=getattr(creative, "approved", False),
+                            creative_manifest=_build_generative_manifest(
+                                format_id_str=format_id_str,
+                                agent_url=str(format_obj.agent_url),
+                                assets=creative.assets,
+                            ),
+                            brand=getattr(creative, "brand", None),
                         )
                     )
 
@@ -588,33 +638,55 @@ def _create_new_creative(
                         data["generative_context_id"] = build_result.get("context_id")
 
                         # Extract creative output
-                        if build_result.get("creative_output"):
-                            creative_output = build_result["creative_output"]
+                        creative_manifest_out = build_result.get("creative_manifest", {})
+                        if creative_manifest_out.get("assets"):
+                            data["assets"] = {**data.get("assets", {}), **creative_manifest_out["assets"]}
+                            logger.info("[sync_creatives] Using assets from generative output")
 
-                            # Only use generative assets if user didn't provide their own
-                            if creative_output.get("assets") and not user_provided_assets:
-                                data["assets"] = creative_output["assets"]
-                                logger.info("[sync_creatives] Using assets from generative output")
-                            elif user_provided_assets:
-                                logger.info(
-                                    "[sync_creatives] Preserving user-provided assets, "
-                                    "not overwriting with generative output"
-                                )
+                        # Gap B: fallback to creative_manifest assets if creative_output had none
+                        if not data.get("assets"):
+                            manifest_assets = build_result.get("creative_manifest", {}).get("assets")
+                            if manifest_assets:
+                                data["assets"] = manifest_assets
+                                logger.info("[sync_creatives] Using assets from creative_manifest")
 
-                            if creative_output.get("output_format"):
-                                output_format = creative_output["output_format"]
-                                data["output_format"] = output_format
+                        creative_manifest_out2 = build_result.get("creative_manifest", {})
+                        if creative_manifest_out2.get("output_format"):
+                            output_format = creative_manifest_out2["output_format"]
+                            data["output_format"] = output_format
 
-                                # Only use generative URL if user didn't provide one
-                                if isinstance(output_format, dict) and output_format.get("url"):
-                                    if not data.get("url"):
-                                        data["url"] = output_format["url"]
-                                        logger.info(f"[sync_creatives] Got URL from generative output: {data['url']}")
-                                    else:
-                                        logger.info(
-                                            "[sync_creatives] Preserving user-provided URL, "
-                                            "not overwriting with generative output"
-                                        )
+                            # Only use generative URL if user didn't provide one
+                            if isinstance(output_format, dict) and output_format.get("url"):
+                                if not data.get("url"):
+                                    data["url"] = output_format["url"]
+                                    logger.info(f"[sync_creatives] Got URL from generative output: {data['url']}")
+                                else:
+                                    logger.info(
+                                        "[sync_creatives] Preserving user-provided URL, "
+                                        "not overwriting with generative output"
+                                    )
+
+                        # Extract url/width/height from top-level creative_manifest_out2 (unconditional)
+                        # These are set by the creative-agent for rendered formats (e.g. text_ad_search → HTML preview)
+                        if creative_manifest_out2.get("url") and not data.get("url"):
+                            data["url"] = creative_manifest_out2["url"]
+                            logger.info(
+                                f"[sync_creatives] Got URL from generative output manifest (create): {data['url']}"
+                            )
+                        if creative_manifest_out2.get("width") and not data.get("width"):
+                            data["width"] = creative_manifest_out2["width"]
+                        if creative_manifest_out2.get("height") and not data.get("height"):
+                            data["height"] = creative_manifest_out2["height"]
+
+                        # Persist brand from the media buy request so adapters can route by domain
+                        # (e.g. Affilizz domain guard in SiteplugCreativeManager._sync_text_ad_to_affilizz).
+                        # brand is buyer-supplied creative metadata — not a generation decision.
+                        if not data.get("brand"):
+                            if media_buy_brand:
+                                data["brand"] = media_buy_brand
+                            elif getattr(creative, "brand", None):
+                                brand_val = creative.brand
+                                data["brand"] = brand_val if isinstance(brand_val, dict) else {"domain": str(brand_val)}
 
                         logger.info(
                             f"[sync_creatives] Generative creative built: "
@@ -626,27 +698,22 @@ def _create_new_creative(
                     preview_result = None
                 else:
                     # Static creative - use preview_creative
-                    # Build creative manifest from available data
-                    # Extract string ID from FormatId object if needed
+                    # Build AdCP-compliant creative manifest
                     format_id_str = creative_format.id
                     creative_manifest: dict[str, Any] = {
-                        "creative_id": creative.creative_id or str(uuid.uuid4()),
-                        "name": creative.name,
-                        "format_id": format_id_str,
+                        "format_id": {
+                            "id": creative_format.id,
+                            "agent_url": str(format_obj.agent_url),
+                        },
+                        "assets": _validate_creative_assets(creative.assets) if creative.assets else {},
                     }
-
-                    # Add any provided asset data for validation
-                    # Validate assets are in dict format (AdCP v2.4+)
-                    if creative.assets:
-                        validated_assets = _validate_creative_assets(creative.assets)
-                        if validated_assets:
-                            creative_manifest["assets"] = validated_assets
+                    # Optional extras (non-spec but harmless for agent context)
+                    if creative.name:
+                        creative_manifest["name"] = creative.name
                     if data.get("url"):
                         creative_manifest["url"] = data.get("url")
 
                     # Call creative agent's preview_creative for validation + preview
-                    # Extract string ID from FormatId object if needed
-                    format_id_str = creative_format.id
                     logger.info(
                         f"[sync_creatives] Calling preview_creative for validation: {format_id_str} "
                         f"from agent {format_obj.agent_url}, has_assets={bool(creative.assets)}, "

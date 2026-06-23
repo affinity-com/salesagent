@@ -102,6 +102,7 @@ from src.core.audit_logger import get_audit_logger
 from src.core.auth import (
     get_principal_object,
 )
+from src.core.validation_helpers import run_async_in_sync_context
 from src.core.context_manager import get_context_manager
 from src.core.database.models import MediaBuy
 from src.core.database.models import Principal as ModelPrincipal
@@ -232,11 +233,12 @@ def _determine_media_buy_status(
 
 
 def _get_format_spec_sync(agent_url: str, format_id: str) -> Any | None:
-    """Get format specification synchronously using asyncio.run().
+    """Get format specification synchronously using run_async_in_sync_context().
 
     This helper function wraps the async registry.get_format() call to make it
-    usable in synchronous contexts. The registry uses in-memory cache (30min TTL)
-    and falls back to the creative agent if not cached.
+    usable in synchronous contexts (including when called from within an async
+    function). The registry uses in-memory cache (30min TTL) and falls back to
+    the creative agent if not cached.
 
     Args:
         agent_url: Creative agent URL
@@ -245,14 +247,12 @@ def _get_format_spec_sync(agent_url: str, format_id: str) -> Any | None:
     Returns:
         Format specification object or None if not found
     """
-    import asyncio
-
     from src.core.creative_agent_registry import get_creative_agent_registry
 
     registry = get_creative_agent_registry()
 
     try:
-        return asyncio.run(registry.get_format(agent_url, format_id))
+        return run_async_in_sync_context(registry.get_format(agent_url, format_id))
     except Exception as e:
         logger.warning(f"Could not fetch format {format_id} from {agent_url}: {e}")
         return None
@@ -319,13 +319,19 @@ def _validate_creatives_before_adapter_call(
         if creative.format:
             format_spec = _get_format_spec_sync(creative.agent_url, str(creative.format))
 
-        # Fail validation if format spec not found (no skipping!)
         if not format_spec:
-            validation_errors.append(
-                f"Creative {creative.creative_id} has unknown format '{creative.format}' "
-                f"from agent {creative.agent_url}. Format must be registered with the creative agent."
-            )
-            continue
+            agent_url_str = str(creative.agent_url) if creative.agent_url else ""
+            is_adapter_format = not agent_url_str.startswith(("http://", "https://"))
+            if is_adapter_format:
+                # Non-HTTP agent URLs (e.g. broadstreet://) identify adapter-native formats.
+                # These formats are not registered with any creative-agent; the adapter
+                # validates them internally. This is not a format-name check — it is a
+                # structural property of the agent_url scheme.
+                logger.debug(
+                    f"Skipping validation for adapter-provided format '{creative.format}' "
+                    f"(agent_url: {creative.agent_url})"
+                )
+                continue
 
         # Skip validation for generative formats - they need conversion first
         # Generative formats have output_format_ids (they generate reference formats)
@@ -583,6 +589,12 @@ def _build_adapter_asset_from_creative(
         "click_url": click_url,
         "asset_type": creative_data.get("asset_type", "image"),
         "name": creative.name or f"Creative {creative.creative_id}",
+        # Adapter-routing fields: passed as data so the adapter can route by format
+        # and build format-specific payloads (e.g. Affilizz text ad). The salesagent
+        # does not branch on these — the adapter decides what to do with them.
+        "format_id": str(creative.format) if creative.format else "",
+        "assets": creative_data.get("assets") or {},
+        "brand": creative_data.get("brand") or {},
     }
     if impression_tracker_url:
         asset["delivery_settings"] = {"tracking_urls": {"impression": [impression_tracker_url]}}
@@ -852,6 +864,7 @@ def execute_approved_media_buy(media_buy_id: str, tenant_id: str) -> tuple[bool,
                         targeting_overlay=targeting_overlay,
                         product_id=product_id,
                         budget=budget,
+                        implementation_config=getattr(product, "implementation_config", None),  # Adapter-specific config
                     )
                     packages.append(media_package)
 
@@ -2240,6 +2253,7 @@ async def _create_media_buy_impl(
                     packages=cast(list[PackageRequest], req.packages),
                     context=identity,
                     testing_ctx=testing_ctx,
+                    media_buy_brand=req.brand.model_dump(mode="json") if req.brand else None,
                 )
                 # Replace packages with updated versions (functional approach)
                 req.packages = cast(list[AdcpPackageRequest], updated_packages)  # type: ignore[assignment]
@@ -3125,6 +3139,7 @@ async def _create_media_buy_impl(
                     creative_ids=(
                         _get_creative_ids(matching_package) if matching_package else None
                     ),  # Include creative_ids from uploaded creatives
+                    implementation_config=getattr(pkg_product, "implementation_config", None),  # Adapter-specific config
                 )
             )
 

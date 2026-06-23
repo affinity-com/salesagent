@@ -2411,3 +2411,276 @@ class TestUpgradeObligations:
             media_buy_id="mb_1", packages=[RespPkg(package_id="p1", product_id="prod_1", budget=100)], sandbox=True
         )
         assert resp.sandbox is True
+
+
+# ===========================================================================
+# Bug 2: _build_adapter_asset_from_creative — format_id/assets/brand fields
+# ===========================================================================
+
+
+class TestBuildAdapterAssetFromCreative:
+    """Bug 2 fix: _build_adapter_asset_from_creative includes format_id/assets/brand.
+
+    Before the fix, the asset dict was missing these adapter-routing fields.
+    The fix at media_buy_create.py:595-597 adds them unconditionally.
+    """
+
+    def _make_mock_creative(
+        self,
+        creative_id: str = "creative_1",
+        format_str: str = "display_300x250_image",
+        agent_url: str = "https://creative.example.com",
+        name: str = "Test Creative",
+        data: dict | None = None,
+    ) -> MagicMock:
+        """Build a mock DB Creative ORM object."""
+        creative = MagicMock()
+        creative.creative_id = creative_id
+        creative.format = format_str
+        creative.agent_url = agent_url
+        creative.name = name
+        creative.data = data if data is not None else {}
+        return creative
+
+    def test_asset_dict_contains_format_id_assets_brand(self):
+        """_build_adapter_asset_from_creative returns asset with format_id, assets, brand.
+
+        Anchors: media_buy_create.py:595-597
+        """
+        from src.core.tools.media_buy_create import _build_adapter_asset_from_creative
+
+        creative = self._make_mock_creative(
+            data={
+                "url": "https://example.com/ad.jpg",
+                "width": 300,
+                "height": 250,
+                "assets": {"headline": {"text": "Buy Now"}},
+                "brand": {"domain": "acme.com"},
+                "asset_type": "image",
+            }
+        )
+
+        package_assignments = [{"package_id": "pkg_1", "line_item_id": "li_1"}]
+
+        with (
+            patch("src.core.tools.media_buy_create._get_format_spec_sync", return_value=None),
+            patch(
+                "src.core.tools.media_buy_create.extract_media_url_and_dimensions",
+                return_value=("https://example.com/ad.jpg", 300, 250),
+            ),
+            patch("src.core.tools.media_buy_create.extract_click_url", return_value=None),
+            patch("src.core.tools.media_buy_create.extract_impression_tracker_url", return_value=None),
+        ):
+            asset, error = _build_adapter_asset_from_creative(
+                creative, package_assignments, tenant_id="test_tenant"
+            )
+
+        assert error is None
+        assert asset is not None
+        assert asset["format_id"] == "display_300x250_image"
+        assert asset["assets"] == {"headline": {"text": "Buy Now"}}
+        assert asset["brand"] == {"domain": "acme.com"}
+
+    def test_asset_dict_brand_defaults_to_empty_dict(self):
+        """When creative_data has no 'brand', asset["brand"] defaults to {}.
+
+        Anchors: media_buy_create.py:597 — `creative_data.get("brand") or {}`
+        """
+        from src.core.tools.media_buy_create import _build_adapter_asset_from_creative
+
+        creative = self._make_mock_creative(
+            data={
+                "url": "https://example.com/ad.jpg",
+                "width": 300,
+                "height": 250,
+                # No "brand" key
+            }
+        )
+
+        package_assignments = [{"package_id": "pkg_1", "line_item_id": "li_1"}]
+
+        with (
+            patch("src.core.tools.media_buy_create._get_format_spec_sync", return_value=None),
+            patch(
+                "src.core.tools.media_buy_create.extract_media_url_and_dimensions",
+                return_value=("https://example.com/ad.jpg", 300, 250),
+            ),
+            patch("src.core.tools.media_buy_create.extract_click_url", return_value=None),
+            patch("src.core.tools.media_buy_create.extract_impression_tracker_url", return_value=None),
+        ):
+            asset, error = _build_adapter_asset_from_creative(
+                creative, package_assignments, tenant_id="test_tenant"
+            )
+
+        assert error is None
+        assert asset is not None
+        assert asset["brand"] == {}
+
+    def test_asset_dict_assets_defaults_to_empty_dict(self):
+        """When creative_data has no 'assets', asset["assets"] defaults to {}.
+
+        Anchors: media_buy_create.py:596 — `creative_data.get("assets") or {}`
+        """
+        from src.core.tools.media_buy_create import _build_adapter_asset_from_creative
+
+        creative = self._make_mock_creative(
+            data={
+                "url": "https://example.com/ad.jpg",
+                "width": 300,
+                "height": 250,
+                # No "assets" key
+            }
+        )
+
+        package_assignments = [{"package_id": "pkg_1", "line_item_id": "li_1"}]
+
+        with (
+            patch("src.core.tools.media_buy_create._get_format_spec_sync", return_value=None),
+            patch(
+                "src.core.tools.media_buy_create.extract_media_url_and_dimensions",
+                return_value=("https://example.com/ad.jpg", 300, 250),
+            ),
+            patch("src.core.tools.media_buy_create.extract_click_url", return_value=None),
+            patch("src.core.tools.media_buy_create.extract_impression_tracker_url", return_value=None),
+        ):
+            asset, error = _build_adapter_asset_from_creative(
+                creative, package_assignments, tenant_id="test_tenant"
+            )
+
+        assert error is None
+        assert asset is not None
+        assert asset["assets"] == {}
+
+
+# ===========================================================================
+# Bug 4: media_buy_brand propagation from CreateMediaBuyRequest → _sync
+# ===========================================================================
+
+
+class TestMediaBuyBrandPropagation:
+    """Bug 4 fix: req.brand propagated as media_buy_brand to process_and_upload_package_creatives.
+
+    The fix at media_buy_create.py:2255 passes req.brand.model_dump() as
+    media_buy_brand kwarg to process_and_upload_package_creatives, which
+    threads it through _sync_creatives_impl → _processing.py.
+    """
+
+    @pytest.mark.asyncio
+    async def test_process_and_upload_called_with_media_buy_brand(self):
+        """When req.brand is set, process_and_upload_package_creatives receives media_buy_brand.
+
+        Anchors: media_buy_create.py:2251-2255
+        """
+        from adcp.types import BrandReference
+
+        from src.core.tools.media_buy_create import _create_media_buy_impl
+
+        req = _make_request(
+            brand={"domain": "acme.com"},
+            packages=[
+                {
+                    "product_id": "prod_1",
+                    "budget": 5000.0,
+                    "pricing_option_id": "cpm_usd_fixed",
+                    "creatives": [
+                        {
+                            "creative_id": "inline_1",
+                            "name": "Test Ad",
+                            "format_id": {
+                                "agent_url": "https://creative.example.com/",
+                                "id": "display_300x250_image",
+                            },
+                            "assets": {"banner_image": {"url": "https://example.com/ad.png"}},
+                            "variants": [],
+                        }
+                    ],
+                },
+            ],
+        )
+
+        product = _mock_product("prod_1")
+
+        with _PatchContext(products=[product]) as pc:
+            with (
+                patch("src.core.tools.media_buy_create.process_and_upload_package_creatives") as mock_upload,
+                patch("src.core.tools.media_buy_create.get_adapter") as mock_adapter_fn,
+                patch("src.core.tools.media_buy_create.get_slack_notifier"),
+                patch("src.core.tools.media_buy_create.activity_feed"),
+                patch("src.core.tools.media_buy_create.get_audit_logger"),
+            ):
+                mock_upload.return_value = (req.packages, {})
+                mock_adapter = MagicMock()
+                mock_adapter.manual_approval_required = True
+                mock_adapter.manual_approval_operations = ["create_media_buy"]
+                mock_adapter_fn.return_value = mock_adapter
+
+                try:
+                    await _create_media_buy_impl(req=req, identity=pc.identity)
+                except Exception:
+                    pass  # Downstream failures are fine — we only care about the upload call
+
+        # Verify process_and_upload_package_creatives was called with media_buy_brand
+        mock_upload.assert_called_once()
+        call_kwargs = mock_upload.call_args[1]
+        assert "media_buy_brand" in call_kwargs
+        assert call_kwargs["media_buy_brand"] == {"domain": "acme.com"}
+
+    @pytest.mark.asyncio
+    async def test_process_and_upload_called_with_none_brand_when_no_brand(self):
+        """When req.brand is None, process_and_upload_package_creatives receives media_buy_brand=None.
+
+        Anchors: media_buy_create.py:2255 — `req.brand.model_dump() if req.brand else None`
+        """
+        from src.core.tools.media_buy_create import _create_media_buy_impl
+
+        # Build request without brand
+        req = _make_request(
+            packages=[
+                {
+                    "product_id": "prod_1",
+                    "budget": 5000.0,
+                    "pricing_option_id": "cpm_usd_fixed",
+                    "creatives": [
+                        {
+                            "creative_id": "inline_2",
+                            "name": "Test Ad No Brand",
+                            "format_id": {
+                                "agent_url": "https://creative.example.com/",
+                                "id": "display_300x250_image",
+                            },
+                            "assets": {"banner_image": {"url": "https://example.com/ad.png"}},
+                            "variants": [],
+                        }
+                    ],
+                },
+            ],
+        )
+        # Override brand to None after construction (schema may default it)
+        object.__setattr__(req, "brand", None)
+
+        product = _mock_product("prod_1")
+
+        with _PatchContext(products=[product]) as pc:
+            with (
+                patch("src.core.tools.media_buy_create.process_and_upload_package_creatives") as mock_upload,
+                patch("src.core.tools.media_buy_create.get_adapter") as mock_adapter_fn,
+                patch("src.core.tools.media_buy_create.get_slack_notifier"),
+                patch("src.core.tools.media_buy_create.activity_feed"),
+                patch("src.core.tools.media_buy_create.get_audit_logger"),
+            ):
+                mock_upload.return_value = (req.packages, {})
+                mock_adapter = MagicMock()
+                mock_adapter.manual_approval_required = True
+                mock_adapter.manual_approval_operations = ["create_media_buy"]
+                mock_adapter_fn.return_value = mock_adapter
+
+                try:
+                    await _create_media_buy_impl(req=req, identity=pc.identity)
+                except Exception:
+                    pass  # Downstream failures are fine
+
+        # Verify process_and_upload_package_creatives was called with media_buy_brand=None
+        mock_upload.assert_called_once()
+        call_kwargs = mock_upload.call_args[1]
+        assert "media_buy_brand" in call_kwargs
+        assert call_kwargs["media_buy_brand"] is None

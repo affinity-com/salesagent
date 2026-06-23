@@ -22,15 +22,17 @@ import copy
 import logging
 import os
 import typing
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from adcp import ADCPMultiAgentClient, ListCreativeFormatsRequest
+from adcp import ADCPMultiAgentClient, BuildCreativeRequest, ListCreativeFormatsRequest
+from adcp.types.generated_poc.core.format_id import FormatReferenceStructuredObject
 from adcp.exceptions import ADCPAuthenticationError, ADCPConnectionError, ADCPError, ADCPTimeoutError
 from adcp.types import AssetContentType as AssetType
 from adcp.types import Error as AdCPResponseError
-from adcp.types import ImageFormatAsset
+from adcp.types import ImageFormatAsset, TextFormatAsset, UrlFormatAsset
 from pydantic import ValidationError
 from yarl import URL
 
@@ -62,7 +64,10 @@ def _known_asset_types() -> frozenset[str]:
     return frozenset(literals)
 
 
-_KNOWN_ASSET_TYPES = _known_asset_types()
+# Bug 5: "url" is used by text_ad_search's category_url asset but is not in adcp's
+# closed discriminated union (ImageFormatAsset | VideoFormatAsset | …).  Add it
+# explicitly so _validate_formats_tolerant() does NOT drop text_ad_search.
+_KNOWN_ASSET_TYPES = _known_asset_types() | frozenset({"url"})
 _SCHEMA_VALIDATION_FAILURE_MARKERS = (
     "doesn't match expected schema",
     "does not match expected schema",
@@ -205,6 +210,33 @@ def _create_mock_format(format_id_str: str, name: str, asset_type: str) -> Forma
     )
 
 
+def _create_mock_text_ad_search_format() -> Format:
+    """Create a mock text_ad_search format with text + url assets."""
+    assets: list[ImageFormatAsset | TextFormatAsset | UrlFormatAsset] = [
+        TextFormatAsset(item_type="individual", asset_id="brief", asset_type="text", required=False),
+        TextFormatAsset(item_type="individual", asset_id="language", asset_type="text", required=True),
+        TextFormatAsset(item_type="individual", asset_id="country", asset_type="text", required=True),
+        UrlFormatAsset(item_type="individual", asset_id="category_url", asset_type="url", required=False),
+        TextFormatAsset(item_type="individual", asset_id="category_name", asset_type="text", required=False),
+        TextFormatAsset(item_type="individual", asset_id="title", asset_type="text", required=False),
+        TextFormatAsset(item_type="individual", asset_id="description", asset_type="text", required=False),
+        UrlFormatAsset(item_type="individual", asset_id="click_url", asset_type="url", required=False),
+    ]
+    return Format(
+        format_id=FormatId(id="text_ad_search", agent_url=url("https://creative.adcontextprotocol.org")),
+        name="Text Ad (Search)",
+        assets=assets,
+        is_standard=True,
+        # Generative format: mirrors creative-agent's TEXT_AD_SEARCH_FORMAT.output_format_ids
+        output_format_ids=[FormatId(id="text_ad_search", agent_url=url("https://creative.adcontextprotocol.org"))],
+        platform_config=None,
+        category=None,
+        requirements=None,
+        iab_specification=None,
+        accepts_3p_tags=None,
+    )
+
+
 def _get_mock_formats() -> list[Format]:
     """Return mock formats for testing mode (ADCP_TESTING=true).
 
@@ -224,6 +256,7 @@ def _get_mock_formats() -> list[Format]:
         _create_mock_format("display_image", "Display Image", "image"),
         _create_mock_format("display_html", "Display HTML", "image"),
         _create_mock_format("display_js", "Display JavaScript", "image"),
+        _create_mock_text_ad_search_format(),
     ]
 
 
@@ -935,24 +968,27 @@ class CreativeAgentRegistry:
         agent_url: str,
         format_id: str,
         message: str,
-        gemini_api_key: str,
         promoted_offerings: dict[str, Any] | None = None,
         context_id: str | None = None,
         finalize: bool = False,
+        creative_manifest: dict[str, Any] | None = None,
+        brand: str | dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Build a creative using AI generation via the creative agent.
 
-        This calls the creative agent's build_creative tool which requires the user's
-        Gemini API key (the creative agent doesn't pay for API calls).
+        This calls the creative agent's build_creative AdCP task via ADCPMultiAgentClient.
 
         Args:
             agent_url: URL of the creative agent
-            format_id: Format ID (must be generative type like display_300x250_generative)
+            format_id: Format ID (e.g. "text_ad_search", "display_300x250_generative")
             message: Creative brief or refinement instructions
-            gemini_api_key: User's Gemini API key (REQUIRED)
             promoted_offerings: Brand and product information for AI generation
             context_id: Session ID for iterative refinement (optional)
             finalize: Set to true to finalize the creative (default: False)
+            creative_manifest: Input assets dict (brief, language, country, category_url, etc.)
+            brand: Brand identifier — string domain or dict with "domain" key
+            idempotency_key: Optional idempotency key for deduplication
 
         Returns:
             Build response containing:
@@ -961,37 +997,51 @@ class CreativeAgentRegistry:
             - status: "draft" or "finalized"
             - creative_output: Generated creative manifest with output_format
         """
-        # Use custom MCP client for non-standard tools (build_creative not in AdCP spec)
-        async with create_mcp_client(agent_url=agent_url, timeout=30) as client:
-            params = {
-                "message": message,
-                "format_id": format_id,
-                "gemini_api_key": gemini_api_key,
-                "finalize": finalize,
-            }
+        import logging
 
-            if promoted_offerings:
-                params["promoted_offerings"] = promoted_offerings
+        logger = logging.getLogger(__name__)
 
-            if context_id:
-                params["context_id"] = context_id
+        if idempotency_key is None:
+            idempotency_key = uuid.uuid4().hex
 
-            result = await client.call_tool("build_creative", params)
+        # Build the AdCP request using model_construct to allow plain dict/string
+        # values for creative_manifest and brand (the creative-agent handler reads
+        # these as raw dicts from the serialized params, not as typed objects).
+        request = BuildCreativeRequest.model_construct(
+            message=message,
+            target_format_id=FormatReferenceStructuredObject(
+                agent_url=agent_url,  # type: ignore[arg-type]
+                id=format_id,
+            ),
+            idempotency_key=idempotency_key,
+            finalize=finalize,
+            **({"creative_manifest": creative_manifest} if creative_manifest is not None else {}),
+            **({"brand": brand} if brand is not None else {}),
+            **({"promoted_offerings": promoted_offerings} if promoted_offerings else {}),
+            **({"context_id": context_id} if context_id else {}),
+        )
 
-            # Use structured_content field for JSON response (MCP protocol update)
-            if hasattr(result, "structured_content") and result.structured_content:
-                return result.structured_content
+        agent = CreativeAgent(agent_url=agent_url, name="Unknown", enabled=True)
+        client = self._build_adcp_client([agent])
 
-            # Fallback: Parse result from content field (legacy)
-            import json
+        logger.info("build_creative: calling agent %s for format %s", agent_url, format_id)
+        result = await client.agent(agent.name).build_creative(request)
+        logger.info("build_creative: got result status=%s", result.status)
 
-            if isinstance(result.content, list) and result.content:
-                creative_data = result.content[0].text if hasattr(result.content[0], "text") else result.content[0]
-                if isinstance(creative_data, str):
-                    creative_data = json.loads(creative_data)
-                return creative_data
+        if result.status == "completed":
+            if result.data is None:
+                return {}
+            return result.data.model_dump(mode="json", exclude_none=True)
 
-            return {}
+        if result.status == "failed":
+            error_msg = getattr(result, "error", None) or getattr(result, "message", None) or "build_creative failed"
+            logger.error("build_creative: agent returned FAILED status. Error: %s", error_msg)
+            raise AdCPAdapterError(f"Creative agent build_creative failed: {error_msg}")
+
+        raise AdCPAdapterError(
+            f"Unexpected result status from build_creative: {result.status}",
+            recovery="terminal",
+        )
 
 
 # Global registry instance
