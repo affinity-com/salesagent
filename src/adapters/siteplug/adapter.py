@@ -212,6 +212,27 @@ class SiteplugAdapter(AdServerAdapter):
             self.log(f"[dry-run] Would provision entity stack → media_buy_id={media_buy_id}")
             return self._build_create_success(request, media_buy_id, packages)
 
+        # ── Text-ad-only gate: skip Siteplug SSP provisioning ────────────
+        # text_ad_search creatives are managed via Affilizz — no Siteplug
+        # campaign entity is needed. Return a synthetic media_buy_id so the
+        # core layer can proceed to the Affilizz push in add_creative_assets.
+        # Only skip if ALL packages are text_ad_search; mixed buys still
+        # provision the Siteplug campaign normally.
+        _TEXT_AD_FORMATS = {"text_ad_search"}
+        _all_format_ids = {
+            fmt.id
+            for pkg in packages
+            for fmt in (pkg.format_ids or [])
+        }
+        if _all_format_ids and _all_format_ids.issubset(_TEXT_AD_FORMATS):
+            media_buy_id = f"sp_text_{request.po_number or int(datetime.now(UTC).timestamp())}"
+            self.log(
+                f"[text_ad_search] Skipping Siteplug SSP provisioning — "
+                f"text_ad_only media buy → media_buy_id={media_buy_id}",
+                dry_run_prefix=False,
+            )
+            return self._build_create_success(request, media_buy_id, packages)
+
         # ── Extract Siteplug config from the first package ────────────────
         # All packages in a single media buy share the same platform/brand
         # config (one media buy = one brand stack per the onboarding spec).
