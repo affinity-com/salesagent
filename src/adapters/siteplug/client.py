@@ -291,6 +291,31 @@ class SiteplugClient:
         """Get a brand by ID. GET /brands/{id}."""
         return await self._request("GET", f"/brands/{brand_id}")
 
+    async def update_brand_king_domains(
+        self, brand_id: int, domains: list[str]
+    ) -> dict[str, Any]:
+        """Whitelist king domains for a brand. PUT /brands/{id}.
+
+        Required for SiteDiscover (SDC) campaigns so the SD traffic matching
+        engine can associate publisher traffic with the correct brand.
+
+        Args:
+            brand_id: Siteplug brand_id.
+            domains: List of domain strings (e.g. ["nike.com", "nike.fr"]).
+
+        Returns:
+            Updated brand data.
+
+        Raises:
+            SiteplugAPIError: On HTTP 4xx/5xx responses.
+        """
+        payload = {
+            "king_domain_slogans": [
+                {"domain": domain, "slogan": ""} for domain in domains
+            ]
+        }
+        return await self._request("PUT", f"/brands/{brand_id}", json=payload)
+
     # =========================================================================
     # Advertiser Operations
     # =========================================================================
@@ -470,6 +495,34 @@ class SiteplugClient:
     ) -> dict[str, Any]:
         """Add keywords to an ad group. Stub — wired in Task 04."""
         return {}
+
+    async def update_adgroup(
+        self, adgroup_id: int, data: dict[str, Any], *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        """Update an ad group. PUT /adgroups/{id}."""
+        return await self._request(
+            "PUT", f"/adgroups/{adgroup_id}", json=data, idempotency_key=idempotency_key
+        )
+
+    async def update_adgroup_status(
+        self, adgroup_id: int, status: int, *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        """Update ad group status. PUT /adgroups/{id}/status.
+
+        Args:
+            adgroup_id: Siteplug ad group ID.
+            status: 0 = paused, 1 = active.
+            idempotency_key: Optional idempotency key.
+
+        Returns:
+            Updated ad group data.
+        """
+        return await self._request(
+            "PUT",
+            f"/adgroups/{adgroup_id}/status",
+            json={"status": status},
+            idempotency_key=idempotency_key,
+        )
 
     async def remove_keywords(
         self, adgroup_id: int, data: dict[str, Any]

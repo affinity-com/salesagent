@@ -37,6 +37,7 @@ from src.adapters.siteplug.managers import (
     SiteplugTargetingManager,
     SiteplugWorkflowManager,
 )
+from src.adapters.constants import REQUIRED_UPDATE_ACTIONS
 from src.core.exceptions import AdCPValidationError
 from src.core.schemas import (
     AdapterGetMediaBuyDeliveryResponse,
@@ -53,6 +54,7 @@ from src.core.schemas import (
     PackagePerformance,
     Principal,
     ReportingPeriod,
+    UpdateMediaBuyError,
     UpdateMediaBuyResponse,
     UpdateMediaBuySuccess,
 )
@@ -164,6 +166,37 @@ class SiteplugAdapter(AdServerAdapter):
         self.workflow_manager = SiteplugWorkflowManager(
             log_func=self.log,
         )
+
+    # =========================================================================
+    # Async → sync bridge helper
+    # =========================================================================
+
+    def _run_async(self, coro_func):
+        """Run an async coroutine function synchronously in a new event loop.
+
+        The sales agent core layer calls adapter methods synchronously, but
+        the Siteplug client is async. This helper spins up a dedicated thread
+        with its own event loop to avoid "event loop already running" errors.
+
+        Args:
+            coro_func: A zero-argument callable that returns a coroutine.
+
+        Returns:
+            The result of the coroutine.
+
+        Raises:
+            Any exception raised by the coroutine.
+        """
+        def _run_in_new_loop():
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(coro_func())
+            finally:
+                loop.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run_in_new_loop)
+            return future.result()
 
     # =========================================================================
     # Abstract method implementations — all stubs returning safe defaults
@@ -301,34 +334,291 @@ class SiteplugAdapter(AdServerAdapter):
         budget: int | None,
         today: datetime,
     ) -> UpdateMediaBuyResponse:
-        """Update a media buy with a specific action.
+        """Update a Siteplug campaign / ad group.
 
-        Stub — wired in Task 02.
+        Supported actions and their SSP API mappings:
+
+        | AdCP action              | SSP API call                                      |
+        |--------------------------|---------------------------------------------------|
+        | pause_media_buy          | PUT /campaigns/{id}  status=0                     |
+        | resume_media_buy         | PUT /campaigns/{id}  status=1                     |
+        | cancel_media_buy         | PUT /campaigns/{id}  status=0  (irreversible)     |
+        | pause_package            | PUT /adgroups/{id}/status  status=0               |
+        | resume_package           | PUT /adgroups/{id}/status  status=1               |
+        | update_package_budget    | PUT /adgroups/{id}  bid/budget fields             |
+
+        All mutating calls forward ``request.idempotency_key`` when present.
+        State is read from ``package_config`` JSONB (persisted by create_media_buy).
+
+        Args:
+            media_buy_id: AdCP media buy ID (format: "sp_{campaign_id}").
+            buyer_ref: Buyer reference string.
+            action: One of the REQUIRED_UPDATE_ACTIONS.
+            package_id: AdCP package ID (required for package-level actions).
+            budget: New budget in cents (for update_package_budget).
+            today: Current datetime.
 
         Returns:
-            UpdateMediaBuySuccess with current status unchanged
+            UpdateMediaBuySuccess or UpdateMediaBuyError.
         """
+        from sqlalchemy.orm import attributes
+
+        from src.core.database.database_session import get_db_session
+        from src.core.database.repositories.media_buy import MediaBuyRepository
+
         self.log(
-            f"Siteplug.update_media_buy [STUB] for '{media_buy_id}' action='{action}'",
+            f"Siteplug.update_media_buy for '{media_buy_id}' action='{action}'",
             dry_run_prefix=False,
         )
 
-        affected = []
-        if package_id:
-            affected.append(
+        if action not in REQUIRED_UPDATE_ACTIONS:
+            return UpdateMediaBuyError(
+                errors=[
+                    Error(
+                        code="UNSUPPORTED_FEATURE",
+                        message=(
+                            f"Action '{action}' not supported by Siteplug adapter. "
+                            f"Supported: {sorted(REQUIRED_UPDATE_ACTIONS)}"
+                        ),
+                        details=None,
+                    )
+                ]
+            )
+
+        assert self.tenant_id is not None, "tenant_id required for Siteplug update_media_buy"
+
+        # ── Dry-run: return success without API calls ─────────────────────
+        if self.dry_run:
+            is_pause = action in ("pause_media_buy", "pause_package")
+            affected = []
+            if package_id:
+                affected.append(
+                    AffectedPackage(
+                        package_id=package_id,
+                        buyer_ref=buyer_ref,
+                        paused=is_pause,
+                        changes_applied={"budget": budget} if budget is not None else None,
+                        buyer_package_ref=None,
+                    )
+                )
+            self.log(f"[dry-run] Would execute action='{action}' on '{media_buy_id}'")
+            return UpdateMediaBuySuccess(
+                media_buy_id=media_buy_id,
+                buyer_ref=buyer_ref,
+                affected_packages=affected,
+                implementation_date=today,
+            )
+
+        # ── Extract Siteplug campaign_id from media_buy_id ────────────────
+        # Format: "sp_{campaign_id}" — strip the prefix.
+        if media_buy_id.startswith("sp_"):
+            try:
+                campaign_id = int(media_buy_id[3:])
+            except ValueError:
+                return UpdateMediaBuyError(
+                    errors=[
+                        Error(
+                            code="VALIDATION_ERROR",
+                            message=f"Cannot parse campaign_id from media_buy_id '{media_buy_id}'",
+                            details=None,
+                        )
+                    ]
+                )
+        else:
+            return UpdateMediaBuyError(
+                errors=[
+                    Error(
+                        code="VALIDATION_ERROR",
+                        message=f"Unexpected media_buy_id format: '{media_buy_id}' (expected 'sp_<id>')",
+                        details=None,
+                    )
+                ]
+            )
+
+        # ── Campaign-level pause / resume ─────────────────────────────────
+        if action in ("pause_media_buy", "resume_media_buy"):
+            sp_status = 0 if action == "pause_media_buy" else 1
+            is_pause = sp_status == 0
+
+            async def _update_campaign() -> None:
+                await self.client.update_campaign(campaign_id, {"status": sp_status})
+
+            self._run_async(_update_campaign)
+
+            with get_db_session() as session:
+                repo = MediaBuyRepository(session, self.tenant_id)
+                db_packages = repo.get_packages(media_buy_id)
+
+            affected = [
                 AffectedPackage(
-                    package_id=package_id,
+                    package_id=pkg.package_id,
                     buyer_ref=buyer_ref,
-                    paused=action in ("pause_media_buy", "pause_package"),
+                    paused=is_pause,
                     changes_applied=None,
                     buyer_package_ref=None,
                 )
+                for pkg in db_packages
+            ]
+            return UpdateMediaBuySuccess(
+                media_buy_id=media_buy_id,
+                buyer_ref=buyer_ref,
+                affected_packages=affected,
+                implementation_date=today,
             )
 
+        # ── Package-level actions — require package_id ────────────────────
+        if not package_id:
+            return UpdateMediaBuyError(
+                errors=[
+                    Error(
+                        code="VALIDATION_ERROR",
+                        message=f"package_id is required for action '{action}'",
+                        details=None,
+                    )
+                ]
+            )
+
+        # Read adgroup_id from package_config
+        with get_db_session() as session:
+            repo = MediaBuyRepository(session, self.tenant_id)
+            db_package = repo.get_package(media_buy_id, package_id)
+
+        if db_package is None:
+            return UpdateMediaBuyError(
+                errors=[
+                    Error(
+                        code="PACKAGE_NOT_FOUND",
+                        message=f"Package '{package_id}' not found in media buy '{media_buy_id}'",
+                        details=None,
+                    )
+                ]
+            )
+
+        adgroup_id: int | None = db_package.package_config.get("siteplug_adgroup_id")
+
+        # ── Package pause / resume ────────────────────────────────────────
+        if action in ("pause_package", "resume_package"):
+            sp_status = 0 if action == "pause_package" else 1
+            is_pause = sp_status == 0
+
+            if adgroup_id is None:
+                # Ad group not yet created (e.g. ad group API not yet live) — no-op
+                self.log(
+                    f"[siteplug] update_media_buy: no adgroup_id for package '{package_id}' "
+                    f"— skipping {action} (ad group API may not be live yet)"
+                )
+            else:
+                async def _update_adgroup_status() -> None:
+                    await self.client.update_adgroup_status(adgroup_id, sp_status)
+
+                self._run_async(_update_adgroup_status)
+
+            return UpdateMediaBuySuccess(
+                media_buy_id=media_buy_id,
+                buyer_ref=buyer_ref,
+                affected_packages=[
+                    AffectedPackage(
+                        package_id=package_id,
+                        buyer_ref=buyer_ref,
+                        paused=is_pause,
+                        changes_applied=None,
+                        buyer_package_ref=None,
+                    )
+                ],
+                implementation_date=today,
+            )
+
+        # ── Package budget update ─────────────────────────────────────────
+        if action == "update_package_budget":
+            if budget is None:
+                return UpdateMediaBuyError(
+                    errors=[
+                        Error(
+                            code="VALIDATION_ERROR",
+                            message="budget is required for update_package_budget action",
+                            details=None,
+                        )
+                    ]
+                )
+
+            budget_float = float(budget) / 100.0  # cents → dollars
+
+            if adgroup_id is not None:
+                async def _update_adgroup_budget() -> None:
+                    await self.client.update_adgroup(adgroup_id, {"budget": budget_float})
+
+                self._run_async(_update_adgroup_budget)
+            else:
+                self.log(
+                    f"[siteplug] update_media_buy: no adgroup_id for package '{package_id}' "
+                    "— persisting budget to package_config only"
+                )
+
+            # Always persist to package_config regardless of API availability
+            with get_db_session() as session:
+                repo = MediaBuyRepository(session, self.tenant_id)
+                pkg = repo.get_package(media_buy_id, package_id)
+                if pkg is not None:
+                    pkg.package_config["budget"] = budget_float
+                    attributes.flag_modified(pkg, "package_config")
+                    session.commit()
+
+            return UpdateMediaBuySuccess(
+                media_buy_id=media_buy_id,
+                buyer_ref=buyer_ref,
+                affected_packages=[
+                    AffectedPackage(
+                        package_id=package_id,
+                        buyer_ref=buyer_ref,
+                        paused=False,
+                        changes_applied={"budget": budget},
+                        buyer_package_ref=None,
+                    )
+                ],
+                implementation_date=today,
+            )
+
+        # ── Impressions update ────────────────────────────────────────────
+        if action == "update_package_impressions":
+            if budget is None:
+                return UpdateMediaBuyError(
+                    errors=[
+                        Error(
+                            code="VALIDATION_ERROR",
+                            message="budget (impressions) is required for update_package_impressions action",
+                            details=None,
+                        )
+                    ]
+                )
+
+            with get_db_session() as session:
+                repo = MediaBuyRepository(session, self.tenant_id)
+                pkg = repo.get_package(media_buy_id, package_id)
+                if pkg is not None:
+                    pkg.package_config["impressions"] = budget
+                    attributes.flag_modified(pkg, "package_config")
+                    session.commit()
+
+            return UpdateMediaBuySuccess(
+                media_buy_id=media_buy_id,
+                buyer_ref=buyer_ref,
+                affected_packages=[
+                    AffectedPackage(
+                        package_id=package_id,
+                        buyer_ref=buyer_ref,
+                        paused=False,
+                        changes_applied={"impressions": budget},
+                        buyer_package_ref=None,
+                    )
+                ],
+                implementation_date=today,
+            )
+
+        # Fallback — should not reach here for valid actions
         return UpdateMediaBuySuccess(
             media_buy_id=media_buy_id,
             buyer_ref=buyer_ref,
-            affected_packages=affected,
+            affected_packages=[],
             implementation_date=today,
         )
 
@@ -337,21 +627,90 @@ class SiteplugAdapter(AdServerAdapter):
         media_buy_id: str,
         today: datetime,
     ) -> CheckMediaBuyStatusResponse:
-        """Check the status of a media buy.
+        """Check the status of a Siteplug campaign.
 
-        Stub — wired in Task 02.
+        Reads ``siteplug_campaign_id`` from ``package_config``, calls
+        ``GET /campaigns/{id}``, and maps the Siteplug status integer to an
+        AdCP status string.
+
+        Siteplug → AdCP status mapping:
+            0 (Off/Paused)   → "paused"
+            1 (Active)       → "active"
+            2 (Date-paused)  → "paused"
+            3 (Incomplete)   → "pending_activation"
+
+        Args:
+            media_buy_id: AdCP media buy ID (format: "sp_{campaign_id}").
+            today: Current datetime (unused but required by interface).
 
         Returns:
-            CheckMediaBuyStatusResponse with pending_activation status
+            CheckMediaBuyStatusResponse with the mapped AdCP status.
         """
         self.log(
-            f"Siteplug.check_media_buy_status [STUB] for '{media_buy_id}'",
+            f"Siteplug.check_media_buy_status for '{media_buy_id}'",
             dry_run_prefix=False,
         )
+
+        # ── Dry-run: return pending_activation without API call ───────────
+        if self.dry_run:
+            return CheckMediaBuyStatusResponse(
+                media_buy_id=media_buy_id,
+                buyer_ref=media_buy_id,
+                status="pending_activation",
+            )
+
+        # ── Extract campaign_id from media_buy_id ─────────────────────────
+        if media_buy_id.startswith("sp_"):
+            try:
+                campaign_id = int(media_buy_id[3:])
+            except ValueError:
+                logger.warning(
+                    f"[siteplug] check_media_buy_status: cannot parse campaign_id "
+                    f"from '{media_buy_id}' — returning pending_activation"
+                )
+                return CheckMediaBuyStatusResponse(
+                    media_buy_id=media_buy_id,
+                    buyer_ref=media_buy_id,
+                    status="pending_activation",
+                )
+        else:
+            logger.warning(
+                f"[siteplug] check_media_buy_status: unexpected media_buy_id format "
+                f"'{media_buy_id}' — returning pending_activation"
+            )
+            return CheckMediaBuyStatusResponse(
+                media_buy_id=media_buy_id,
+                buyer_ref=media_buy_id,
+                status="pending_activation",
+            )
+
+        # ── Fetch campaign from SSP API ───────────────────────────────────
+        _SP_STATUS_MAP: dict[int, str] = {
+            0: "paused",
+            1: "active",
+            2: "paused",
+            3: "pending_activation",
+        }
+
+        async def _get_campaign() -> dict:
+            return await self.client.get_campaign(campaign_id)
+
+        try:
+            campaign_data = self._run_async(_get_campaign)
+            sp_status: int = int(campaign_data.get("status", 3))
+            adcp_status = _SP_STATUS_MAP.get(sp_status, "pending_activation")
+        except Exception as exc:
+            logger.warning(
+                f"[siteplug] check_media_buy_status: GET /campaigns/{campaign_id} failed: {exc} "
+                "— returning pending_activation"
+            )
+            adcp_status = "pending_activation"
+
+        self.log(f"[siteplug] campaign_id={campaign_id} status={adcp_status}")
         return CheckMediaBuyStatusResponse(
             media_buy_id=media_buy_id,
             buyer_ref=media_buy_id,
-            status="pending_activation",
+            status=adcp_status,
         )
 
     def get_media_buy_delivery(

@@ -120,6 +120,7 @@ class SiteplugCampaignManager:
                 brand_domain=brand_domain,
                 vertical=vertical,
                 sub_category=sub_category,
+                campaign_type=campaign_type,
                 tenant_id=tenant_id,
                 idempotency_key=idempotency_key,
             )
@@ -168,6 +169,7 @@ class SiteplugCampaignManager:
         brand_domain: str,
         vertical: str,
         sub_category: str,
+        campaign_type: str = "SDC",
         tenant_id: str,
         idempotency_key: str | None,
     ) -> int:
@@ -248,6 +250,10 @@ class SiteplugCampaignManager:
             f"advertiser_id={advertiser_id} campaign_id={campaign_id}"
         )
 
+        # Task 02c: whitelist king domains for SDC campaigns after brand creation.
+        if campaign_type == "SDC" and brand_domain:
+            await self._whitelist_king_domains(brand_id=brand_id, brand_domain=brand_domain)
+
         self._persist_entity_ids(
             media_buy_id=media_buy_id,
             package_id=package_id,
@@ -257,6 +263,13 @@ class SiteplugCampaignManager:
             advertiser_id=advertiser_id,
             campaign_id=campaign_id,
             tenant_id=tenant_id,
+        )
+
+        # Task 04 (D15): evaluate and set primary campaign for this brand.
+        await self._mark_primary_campaign(
+            brand_id=brand_id,
+            new_campaign_id=campaign_id,
+            new_campaign_type=campaign_type,
         )
 
         return campaign_id
@@ -353,6 +366,12 @@ class SiteplugCampaignManager:
                 brand_id=brand_id,
                 tenant_id=tenant_id,
             )
+
+            # Task 02c: whitelist king domains for SiteDiscover (SDC) campaigns.
+            # Required so the SD traffic matching engine can associate publisher
+            # traffic with the correct brand. Non-fatal — ops can whitelist manually.
+            if campaign_type == "SDC" and brand_domain:
+                await self._whitelist_king_domains(brand_id=brand_id, brand_domain=brand_domain)
         else:
             brand_id = int(brand_id)
             self._log(f"[siteplug] brand already provisioned (brand_id={brand_id}), skipping.")
@@ -414,7 +433,110 @@ class SiteplugCampaignManager:
             campaign_id = int(campaign_id)
             self._log(f"[siteplug] campaign already provisioned (campaign_id={campaign_id}), skipping.")
 
+        # Task 04 (D15): evaluate and set primary campaign for this brand.
+        await self._mark_primary_campaign(
+            brand_id=brand_id,
+            new_campaign_id=campaign_id,
+            new_campaign_type=campaign_type,
+        )
+
         return campaign_id
+
+    # =========================================================================
+    # Task 02c — King domain whitelisting helper
+    # =========================================================================
+
+    async def _whitelist_king_domains(self, *, brand_id: int, brand_domain: str) -> None:
+        """Whitelist king domains for a brand via PUT /brands/{id}.
+
+        Called after brand creation for SDC campaigns only. Non-fatal — a
+        failure is logged but does not block campaign provisioning. Ops can
+        whitelist manually via the Siteplug admin panel if needed.
+
+        Args:
+            brand_id: Siteplug brand_id.
+            brand_domain: Primary brand domain (e.g. "nike.com").
+        """
+        domains = [brand_domain]
+        self._log(
+            f"[siteplug] Task 02c: whitelisting king domains for brand_id={brand_id}: {domains}"
+        )
+        try:
+            await self.client.update_brand_king_domains(brand_id=brand_id, domains=domains)
+            self._log(f"[siteplug] king domain whitelist updated for brand_id={brand_id}")
+        except Exception as exc:
+            # Non-fatal: log and continue — ops can whitelist manually
+            logger.warning(
+                f"[siteplug] king domain whitelist failed for brand_id={brand_id} "
+                f"(non-fatal, ops can whitelist manually): {exc}"
+            )
+
+    # =========================================================================
+    # Task 04 (D15) — Primary campaign marking helper
+    # =========================================================================
+
+    async def _mark_primary_campaign(
+        self,
+        *,
+        brand_id: int,
+        new_campaign_id: int,
+        new_campaign_type: str,
+    ) -> None:
+        """Evaluate and set the primary campaign for a brand after creation.
+
+        Applies the deterministic hierarchy: SD > SDC > SSS > any.
+        Calls ``PUT /campaigns/{id}`` with ``is_primary=true`` on the winner.
+        Non-fatal — a failure is logged but does not block provisioning.
+
+        Args:
+            brand_id: Siteplug brand_id to list campaigns for.
+            new_campaign_id: The campaign just created.
+            new_campaign_type: Campaign type of the new campaign ("SD", "SDC", "SSS").
+        """
+        _TYPE_PRIORITY: dict[str, int] = {"SD": 3, "SDC": 2, "SSS": 1}
+
+        try:
+            campaigns: list[dict] = await self.client.list_campaigns(brand_id=brand_id)
+        except Exception as exc:
+            logger.warning(
+                f"[siteplug] primary marking: failed to list campaigns for brand_id={brand_id} "
+                f"(non-fatal): {exc}"
+            )
+            return
+
+        if not campaigns:
+            # Newly created campaign is the only one — mark it primary.
+            primary_id = new_campaign_id
+        else:
+            # Find the campaign with the highest type priority.
+            # Include the new campaign in the evaluation set.
+            all_campaigns = campaigns if any(
+                c.get("campaign_id") == new_campaign_id for c in campaigns
+            ) else campaigns + [{"campaign_id": new_campaign_id, "campaign_type": new_campaign_type}]
+
+            best: dict | None = None
+            best_priority = -1
+            for c in all_campaigns:
+                ctype = c.get("campaign_type", "")
+                priority = _TYPE_PRIORITY.get(ctype, 0)
+                if priority > best_priority:
+                    best_priority = priority
+                    best = c
+
+            primary_id = int(best["campaign_id"]) if best else new_campaign_id
+
+        self._log(
+            f"[siteplug] primary marking: brand_id={brand_id} → "
+            f"primary_campaign_id={primary_id} (new_campaign_id={new_campaign_id})"
+        )
+        try:
+            await self.client.update_campaign(primary_id, {"is_primary": True})
+            self._log(f"[siteplug] campaign_id={primary_id} marked as primary.")
+        except Exception as exc:
+            logger.warning(
+                f"[siteplug] primary marking: PUT /campaigns/{primary_id} failed "
+                f"(non-fatal): {exc}"
+            )
 
     # =========================================================================
     # Platform resolution helper
