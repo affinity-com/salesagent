@@ -73,6 +73,16 @@ def _build_creative_data(
         "height": getattr(creative, "height", None),
         "duration": getattr(creative, "duration", None),
     }
+    # Persist brand so downstream adapters (e.g. SiteplugCreativeManager) can
+    # read brand.domain without hitting the original CreativeAsset object.
+    brand = getattr(creative, "brand", None)
+    if brand is not None:
+        if hasattr(brand, "model_dump"):
+            data["brand"] = brand.model_dump(mode="json")
+        elif isinstance(brand, dict):
+            data["brand"] = brand
+        else:
+            data["brand"] = vars(brand)
     if creative.assets:
         data["assets"] = creative.assets
     snippet = getattr(creative, "snippet", None)

@@ -273,16 +273,21 @@ def tenant_settings(tenant_id, section=None):
             # Convert adapter_config to dict format for template compatibility
             adapter_config_dict = {}
             if adapter_config_obj:
-                adapter_config_dict = {
-                    "network_code": adapter_config_obj.gam_network_code or "",
-                    "refresh_token": adapter_config_obj.gam_refresh_token or "",
-                    "trafficker_id": adapter_config_obj.gam_trafficker_id or "",
-                    "application_name": getattr(adapter_config_obj, "gam_application_name", "") or "",
-                    "service_account_email": adapter_config_obj.gam_service_account_email or "",
-                    "network_currency": adapter_config_obj.gam_network_currency or "",
-                    "secondary_currencies": adapter_config_obj.gam_secondary_currencies or [],
-                    "network_timezone": adapter_config_obj.gam_network_timezone or "",
-                }
+                if adapter_config_obj.adapter_type == "siteplug":
+                    # Siteplug config is schema-driven — read from config_json
+                    adapter_config_dict = dict(adapter_config_obj.config_json or {})
+                else:
+                    # GAM and other legacy adapters use dedicated columns
+                    adapter_config_dict = {
+                        "network_code": adapter_config_obj.gam_network_code or "",
+                        "refresh_token": adapter_config_obj.gam_refresh_token or "",
+                        "trafficker_id": adapter_config_obj.gam_trafficker_id or "",
+                        "application_name": getattr(adapter_config_obj, "gam_application_name", "") or "",
+                        "service_account_email": adapter_config_obj.gam_service_account_email or "",
+                        "network_currency": adapter_config_obj.gam_network_currency or "",
+                        "secondary_currencies": adapter_config_obj.gam_secondary_currencies or [],
+                        "network_timezone": adapter_config_obj.gam_network_timezone or "",
+                    }
 
             # Get environment info for URL generation
             is_production = os.environ.get("PRODUCTION") == "true"

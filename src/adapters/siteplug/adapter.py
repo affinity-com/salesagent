@@ -164,6 +164,9 @@ class SiteplugAdapter(AdServerAdapter):
             log_func=self.log,
         )
         self.workflow_manager = SiteplugWorkflowManager(
+            tenant_id=tenant_id or "",
+            principal=principal,
+            audit_logger=self.audit_logger,
             log_func=self.log,
         )
 
@@ -276,6 +279,39 @@ class SiteplugAdapter(AdServerAdapter):
                 "Configure the product with the Siteplug network name (e.g. 'CJ', 'Awin')."
             )
 
+        # ── Branch on automation_mode BEFORE provisioning ─────────────────
+        # manual mode: the adapter must NOT create the campaign automatically.
+        # A provisional media_buy_id is generated from the package_id so the
+        # workflow step and DB records have a stable, unique identifier.
+        automation_mode: str = impl_config.get("automation_mode", "")
+
+        if automation_mode == "manual":
+            # Use package_id as the provisional media_buy_id — it is stable,
+            # known before any API call, and unique per media buy.
+            media_buy_id = f"sp_manual_{first_package.package_id}"
+            self.log(
+                f"[siteplug] manual mode: skipping provisioning, "
+                f"provisional media_buy_id={media_buy_id}"
+            )
+            campaign_data = {
+                "brand_name": brand_name,
+                "budget": float(request.get_total_budget()) if hasattr(request, "get_total_budget") else 0.0,
+                "campaign_type": campaign_type,
+                "platform_name": platform_name,
+                "vertical": vertical,
+                "sub_category": sub_category,
+            }
+            workflow_step_id = self.workflow_manager.create_manual_workflow_step(
+                media_buy_id=media_buy_id,
+                campaign_data=campaign_data,
+            )
+            self.log(
+                f"[siteplug] manual mode: created workflow step {workflow_step_id} for '{media_buy_id}'"
+            )
+            return self._build_create_success(
+                request, media_buy_id, packages, workflow_step_id=workflow_step_id
+            )
+
         # ── Provision entity stack (async → sync bridge) ──────────────────
         # provision_entity_stack is async; create_media_buy is called
         # synchronously by the core layer (which itself runs inside an async
@@ -323,6 +359,48 @@ class SiteplugAdapter(AdServerAdapter):
         media_buy_id = f"sp_{campaign_id}"
         self.log(f"Siteplug.create_media_buy: provisioned campaign_id={campaign_id} → media_buy_id={media_buy_id}")
 
+        if automation_mode == "confirmation_required":
+            # Pause the campaign immediately so it does not serve ads before
+            # the human reviewer approves it.  Non-fatal: if the pause call
+            # fails we still create the workflow step so the human can review.
+            try:
+                async def _pause_campaign() -> None:
+                    await self.client.update_campaign(campaign_id, {"status": 0})
+
+                self._run_async(_pause_campaign)
+                self.log(
+                    f"[siteplug] confirmation_required: paused campaign_id={campaign_id} (status=0)"
+                )
+            except Exception as _pause_exc:
+                logger.warning(
+                    f"[siteplug] confirmation_required: failed to pause campaign_id={campaign_id}: "
+                    f"{_pause_exc} — workflow step will still be created"
+                )
+
+            # Adapter created the campaign paused (status=0); human approves activation
+            campaign_data = {
+                "brand_name": brand_name,
+                "budget": float(request.get_total_budget()) if hasattr(request, "get_total_budget") else 0.0,
+                "campaign_type": campaign_type,
+                "platform_name": platform_name,
+                "vertical": vertical,
+                "sub_category": sub_category,
+                "siteplug_campaign_id": campaign_id,
+            }
+            workflow_step_id = self.workflow_manager.create_confirmation_workflow_step(
+                media_buy_id=media_buy_id,
+                campaign_id=campaign_id,
+                campaign_data=campaign_data,
+            )
+            self.log(
+                f"[siteplug] confirmation_required mode: created workflow step "
+                f"{workflow_step_id} for '{media_buy_id}'"
+            )
+            return self._build_create_success(
+                request, media_buy_id, packages, workflow_step_id=workflow_step_id
+            )
+
+        # Default: no workflow step — return normally
         return self._build_create_success(request, media_buy_id, packages)
 
     def update_media_buy(
@@ -707,6 +785,34 @@ class SiteplugAdapter(AdServerAdapter):
             adcp_status = "pending_activation"
 
         self.log(f"[siteplug] campaign_id={campaign_id} status={adcp_status}")
+
+        # ── Check for pending workflow step ───────────────────────────────
+        # If there's a pending HITL step, override status to pending_activation
+        # and surface the workflow details in the response packages field.
+        pending_step = self.workflow_manager.get_pending_workflow_step(media_buy_id)
+        if pending_step is not None:
+            self.log(
+                f"[siteplug] pending workflow step {pending_step['step_id']} "
+                f"found for '{media_buy_id}' — returning pending_activation"
+            )
+            return CheckMediaBuyStatusResponse(
+                media_buy_id=media_buy_id,
+                buyer_ref=media_buy_id,
+                status="pending_activation",
+                packages=[
+                    {
+                        "workflow_step_id": pending_step["step_id"],
+                        "workflow_status": pending_step["status"],
+                        "workflow_step_type": pending_step["step_type"],
+                        "workflow_tool": pending_step["tool_name"],
+                        "workflow_created_at": pending_step["created_at"],
+                        "automation_mode": pending_step["action_details"].get(
+                            "automation_mode", "unknown"
+                        ),
+                    }
+                ],
+            )
+
         return CheckMediaBuyStatusResponse(
             media_buy_id=media_buy_id,
             buyer_ref=media_buy_id,
@@ -899,6 +1005,48 @@ class SiteplugAdapter(AdServerAdapter):
     def get_adcp_capabilities(self) -> AdapterCapabilities:
         """Return full AdapterCapabilities for this adapter."""
         return self.capabilities
+
+    def execute_workflow_step_approval(self, step_id: str) -> bool:
+        """Execute the adapter-side action for an approved workflow step.
+
+        Called by the generic
+        :func:`~src.core.tools.workflow_approval.execute_approved_workflow_step`
+        after a human approves a HITL workflow step.
+
+        Dispatches based on the step's ``tool_name``:
+
+        - ``"activate_siteplug_campaign"`` → calls
+          :meth:`~src.adapters.siteplug.managers.workflow.SiteplugWorkflowManager.activate_campaign_from_step`
+          which calls ``PUT /campaigns/{id}`` with ``status=1``.
+
+        Args:
+            step_id: The workflow step ID that was approved.
+
+        Returns:
+            ``True`` if the action succeeded, ``False`` otherwise.
+        """
+        from src.core.database.database_session import get_db_session
+        from src.core.database.models import WorkflowStep
+
+        try:
+            with get_db_session() as db:
+                step = db.get(WorkflowStep, step_id)
+                tool_name = step.tool_name if step else None
+        except Exception as exc:
+            logger.error(f"[siteplug] execute_workflow_step_approval: DB error reading step '{step_id}': {exc}")
+            return False
+
+        if tool_name == "activate_siteplug_campaign":
+            logger.info(
+                f"[siteplug] execute_workflow_step_approval: activating campaign for step '{step_id}'"
+            )
+            return self.workflow_manager.activate_campaign_from_step(step_id)
+
+        logger.info(
+            f"[siteplug] execute_workflow_step_approval: no action for tool_name='{tool_name}' "
+            f"on step '{step_id}'"
+        )
+        return True
 
     def update_media_buy_performance_index(
         self,

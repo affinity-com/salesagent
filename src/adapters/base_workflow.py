@@ -5,6 +5,7 @@ ad server adapters. It handles common workflow operations like:
 - Creating workflow steps
 - Sending notifications
 - Managing workflow state
+- Reading back workflow step status
 
 Adapters extend this base class to add platform-specific workflow logic.
 """
@@ -13,6 +14,8 @@ import logging
 import uuid
 from datetime import UTC, datetime
 from typing import Any
+
+from sqlalchemy import select
 
 from src.core.config_loader import get_tenant_config
 from src.core.database.database_session import get_db_session
@@ -291,3 +294,88 @@ class BaseWorkflowManager:
             }
             for pkg in packages
         ]
+
+    # =========================================================================
+    # Workflow status readers (generic — usable by any adapter)
+    # =========================================================================
+
+    def check_workflow_status(self, workflow_step_id: str) -> str:
+        """Read a WorkflowStep from the DB and return its status string.
+
+        Args:
+            workflow_step_id: The workflow step ID to look up.
+
+        Returns:
+            Status string (e.g. ``"approval"``, ``"completed"``, ``"rejected"``,
+            ``"working"``, ``"pending"``).  Returns ``"unknown"`` if the step
+            cannot be found.
+        """
+        try:
+            with get_db_session() as db_session:
+                step = db_session.get(WorkflowStep, workflow_step_id)
+                if step is None:
+                    self.log(
+                        f"[yellow]check_workflow_status: step '{workflow_step_id}' not found[/yellow]"
+                    )
+                    return "unknown"
+                return step.status
+        except Exception as exc:
+            self.log(
+                f"[yellow]check_workflow_status: error reading step "
+                f"'{workflow_step_id}': {exc}[/yellow]"
+            )
+            return "unknown"
+
+    def get_pending_workflow_step(
+        self,
+        object_id: str,
+        object_type: str = "media_buy",
+    ) -> dict[str, Any] | None:
+        """Look up the most recent pending workflow step for an object.
+
+        Queries :class:`~src.core.database.models.ObjectWorkflowMapping` by
+        ``object_id`` and ``object_type``, then returns the first linked
+        :class:`~src.core.database.models.WorkflowStep` whose status is
+        ``"approval"``, ``"working"``, or ``"pending"``.
+
+        Args:
+            object_id: The object ID to look up (e.g. AdCP media buy ID).
+            object_type: The object type to filter on (default: ``"media_buy"``).
+
+        Returns:
+            Dict with ``step_id``, ``status``, ``step_type``, ``tool_name``,
+            ``created_at``, and ``action_details`` if a pending step exists;
+            ``None`` otherwise.
+        """
+        try:
+            with get_db_session() as db_session:
+                stmt = (
+                    select(ObjectWorkflowMapping)
+                    .where(
+                        ObjectWorkflowMapping.object_type == object_type,
+                        ObjectWorkflowMapping.object_id == object_id,
+                    )
+                    .order_by(ObjectWorkflowMapping.created_at.desc())
+                )
+                mappings = db_session.scalars(stmt).all()
+
+                for mapping in mappings:
+                    step = db_session.get(WorkflowStep, mapping.step_id)
+                    if step is None:
+                        continue
+                    # "approval" is the pending status used by create_workflow_step()
+                    if step.status in ("approval", "working", "pending"):
+                        return {
+                            "step_id": step.step_id,
+                            "status": step.status,
+                            "step_type": step.step_type,
+                            "tool_name": step.tool_name,
+                            "created_at": step.created_at.isoformat() if step.created_at else None,
+                            "action_details": step.request_data or {},
+                        }
+        except Exception as exc:
+            self.log(
+                f"[yellow]get_pending_workflow_step: error for {object_type} "
+                f"'{object_id}': {exc}[/yellow]"
+            )
+        return None

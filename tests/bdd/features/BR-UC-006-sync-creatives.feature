@@ -240,19 +240,16 @@ Feature: BR-UC-006 Sync Creative Assets
     And the error should include a "suggestion" field
     And the suggestion should contain "media_url"
     # POST-F2, POST-F3
-    # --- ext-i: CREATIVE_GEMINI_KEY_MISSING ---
+    # --- ext-i: CREATIVE_AGENT_ERROR ---
 
   @T-UC-006-ext-i @extension @ext-i @error
-  Scenario: Gemini key missing — generative creative without config
+  Scenario: Creative agent error — generative creative delegation fails
     Given the Buyer is authenticated with a valid principal_id
     And a creative with a generative format (output_format_ids present)
-    And the Seller Agent does not have GEMINI_API_KEY configured
+    And the creative-agent returns an error for build_creative
     When the Buyer Agent syncs the creative
     Then the creative should have action "failed"
-    And the error code should be "CREATIVE_GEMINI_KEY_MISSING"
-    And the error message should contain "GEMINI_API_KEY"
-    And the error should include a "suggestion" field
-    And the suggestion should contain "seller"
+    And the error code should be "CREATIVE_AGENT_ERROR"
     # POST-F2, POST-F3
     # --- ext-j: PACKAGE_NOT_FOUND (strict) ---
 
@@ -788,7 +785,7 @@ Feature: BR-UC-006 Sync Creative Assets
       | static_creative                 | no output_format_ids               | any assets                             | standard processing          |
       | generative_with_prompt          | output_format_ids present          | message asset with prompt text         | generative build with prompt |
       | generative_create_name_fallback | output_format_ids present (create) | no prompt assets or inputs             | generative build with name   |
-      | generative_no_gemini_key        | output_format_ids present          | message asset but no GEMINI_API_KEY    | CREATIVE_GEMINI_KEY_MISSING  |
+      | generative_agent_error          | output_format_ids present          | message asset but creative-agent fails | CREATIVE_AGENT_ERROR         |
 
   @T-UC-006-partition-assignment-pkg @partition @assignment-package
   Scenario Outline: Assignment package validation — <partition>

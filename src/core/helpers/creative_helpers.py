@@ -497,6 +497,7 @@ def process_and_upload_package_creatives(
     packages: list["PackageRequest"],
     context: "ResolvedIdentity | None" = None,
     testing_ctx: "TestingContext | None" = None,
+    media_buy_brand: dict | None = None,
 ) -> tuple[list["PackageRequest"], dict[str, list[str]]]:
     """Upload creatives from package.creatives arrays and return updated packages.
 
@@ -560,6 +561,7 @@ def process_and_upload_package_creatives(
                 validation_mode="lenient",
                 push_notification_config=None,
                 identity=context,  # ResolvedIdentity for principal_id extraction
+                media_buy_brand=media_buy_brand,
             )
 
             # Extract creative IDs from response

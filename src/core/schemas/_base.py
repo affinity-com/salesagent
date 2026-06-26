@@ -1541,6 +1541,7 @@ class MediaPackage(SalesAgentBaseModel):
     product_id: str | None = None  # Product ID for this package
     budget: float | None = None  # Budget allocation in the currency specified by the pricing option
     creative_ids: list[str] | None = None  # Creative IDs to assign to this package
+    implementation_config: dict[str, Any] | None = None  # Adapter-specific config (e.g. platform_name for Siteplug)
 
 
 class PackagePerformance(SalesAgentBaseModel):
