@@ -636,7 +636,7 @@ def seed_tmp_provider_acme_outdoor(conn, api_key: str | None):
 
 
 def seed_media_buy_and_packages(conn):
-    """Create the demo media buy and 10 catalog packages for acme-outdoor.
+    """Create the demo media buy and catalog packages for acme-outdoor.
 
     The package_config shape matches _build_package_payload() in
     src/services/tmp_provider_sync.py:
@@ -649,34 +649,38 @@ def seed_media_buy_and_packages(conn):
       package_config.creative_manifest → creative_manifest
 
     Source data: agents/tmp-provider/scripts/seed/data/packages.json
+
+    Idempotent: the media buy is created once (ON CONFLICT DO NOTHING); all
+    packages are upserted on every run so that new packages added to the seed
+    (e.g. Domainar Affilizz packages) are inserted even when the media buy
+    already exists.
     """
+    import json as _json
+
     MEDIA_BUY_ID = "mb-demo-q1"
     PRINCIPAL_ID = "acme-outdoor_principal"
 
+    # Always upsert the media buy (idempotent).
     n = count(conn, f"SELECT COUNT(*) FROM media_buys WHERE media_buy_id='{MEDIA_BUY_ID}' AND tenant_id='acme-outdoor'")
-    if n > 0:
-        pkg_n = count(conn, f"SELECT COUNT(*) FROM media_packages WHERE media_buy_id='{MEDIA_BUY_ID}'")
-        print(f"  ✓ Media buy '{MEDIA_BUY_ID}' already exists ({pkg_n} packages) — skipping")
-        return
-
-    print(f"  Creating media buy '{MEDIA_BUY_ID}' for acme-outdoor...")
-    run_sql(conn, f"""
-        INSERT INTO media_buys
-          (media_buy_id, tenant_id, principal_id, order_name, advertiser_name,
-           start_date, end_date, status, raw_request, created_at, updated_at)
-        VALUES
-          (
-            '{MEDIA_BUY_ID}', 'acme-outdoor', '{PRINCIPAL_ID}',
-            'Demo Catalog Q1', 'Acme Outdoor Demo',
-            CURRENT_DATE, CURRENT_DATE + INTERVAL '90 days',
-            'active',
-            '{{"brief": "Demo catalog packages for TMP context match testing"}}'::jsonb,
-            NOW(), NOW()
-          )
-        ON CONFLICT (media_buy_id) DO NOTHING
-    """, f"Media buy '{MEDIA_BUY_ID}' created")
-
-    import json as _json
+    if n == 0:
+        print(f"  Creating media buy '{MEDIA_BUY_ID}' for acme-outdoor...")
+        run_sql(conn, f"""
+            INSERT INTO media_buys
+              (media_buy_id, tenant_id, principal_id, order_name, advertiser_name,
+               start_date, end_date, status, raw_request, created_at, updated_at)
+            VALUES
+              (
+                '{MEDIA_BUY_ID}', 'acme-outdoor', '{PRINCIPAL_ID}',
+                'Demo Catalog Q1', 'Acme Outdoor Demo',
+                CURRENT_DATE, CURRENT_DATE + INTERVAL '90 days',
+                'active',
+                '{{"brief": "Demo catalog packages for TMP context match testing"}}'::jsonb,
+                NOW(), NOW()
+              )
+            ON CONFLICT (media_buy_id) DO NOTHING
+        """, f"Media buy '{MEDIA_BUY_ID}' created")
+    else:
+        print(f"  ✓ Media buy '{MEDIA_BUY_ID}' already exists — upserting packages")
 
     packages = [
         ("pkg-nespresso-q1",   1400.00, "Nespresso",    "nespresso.com",
@@ -746,9 +750,89 @@ def seed_media_buy_and_packages(conn):
             (MEDIA_BUY_ID, pkg_id, _json.dumps(pkg_config), budget),
         )
         inserted += cur.rowcount
+
+    # ---------------------------------------------------------------------------
+    # Domainar Affilizz search package (T5 — dynamic mediaId via package sync)
+    #
+    # package_id IS the placement_id for Affilizz-capable packages (compound key).
+    # The TMP Provider routes POST /context to Affilizz when:
+    #   1. AFFILIZZ_API_KEY is set on the provider, AND
+    #   2. placement_id has a mediaId mapping in the dynamic overlay.
+    #
+    # The overlay is populated at POST /packages/sync time when a package carries
+    # catalogs[].catalog_id == "affilizz-search" with selectors.media_id set.
+    #
+    # placement_id format: "{zone_id}_{format_indicator}"
+    # Domainar zone_id: 01916f3a-e7ba-7000-8000-000000000040 (property_rid)
+    # mediaId: 6a0b042b9c162a6471191704 (Affilizz MEDIA entity for domainar.com)
+    # ---------------------------------------------------------------------------
+    DOMAINAR_AFFILIZZ_PACKAGES = [
+        {
+            "package_id": "01916f3a-e7ba-7000-8000-000000000040_textad",
+            "budget": 500.00,
+            "config": {
+                "product_id": "01916f3a-e7ba-7000-8000-000000000040_textad",
+                "brand": {"name": "Domainar", "domain": "domainar.com"},
+                "keywords": [],
+                "topics": [],
+                "summary": "Domainar — Affilizz text ad search placement",
+                "price": {"amount": 0.0, "model": "cpc"},
+                "creative_manifest": {"format_id": "affilizz_text_ad", "catalog_id": "affilizz-search"},
+                "is_active": True,
+                "catalogs": [
+                    {
+                        "catalog_id": "affilizz-search",
+                        "type": "offering",
+                        "selectors": {
+                            "media_id": "6a0b042b9c162a6471191704",
+                            "supported_locales": ["de_DE", "en_US", "fr_FR"],
+                        },
+                    }
+                ],
+            },
+        },
+        {
+            "package_id": "01916f3a-e7ba-7000-8000-000000000040_pla",
+            "budget": 500.00,
+            "config": {
+                "product_id": "01916f3a-e7ba-7000-8000-000000000040_pla",
+                "brand": {"name": "Domainar", "domain": "domainar.com"},
+                "keywords": [],
+                "topics": [],
+                "summary": "Domainar — Affilizz product listing ad placement",
+                "price": {"amount": 0.0, "model": "cpc"},
+                "creative_manifest": {"format_id": "affilizz_pla", "catalog_id": "affilizz-search"},
+                "is_active": True,
+                "catalogs": [
+                    {
+                        "catalog_id": "affilizz-search",
+                        "type": "offering",
+                        "selectors": {
+                            "media_id": "6a0b042b9c162a6471191704",
+                            "supported_locales": ["de_DE", "en_US", "fr_FR"],
+                        },
+                    }
+                ],
+            },
+        },
+    ]
+
+    for entry in DOMAINAR_AFFILIZZ_PACKAGES:
+        cur.execute(
+            """
+            INSERT INTO media_packages (media_buy_id, package_id, package_config, budget)
+            VALUES (%s, %s, %s::json, %s)
+            ON CONFLICT (media_buy_id, package_id) DO UPDATE
+                SET package_config = EXCLUDED.package_config,
+                    budget = EXCLUDED.budget
+            """,
+            (MEDIA_BUY_ID, entry["package_id"], _json.dumps(entry["config"]), entry["budget"]),
+        )
+        inserted += cur.rowcount
+
     conn.commit()
     cur.close()
-    print(f"  ✓ {inserted} demo packages created for '{MEDIA_BUY_ID}' (0 = already existed)")
+    print(f"  ✓ {inserted} demo packages created/updated for '{MEDIA_BUY_ID}' (0 = already existed)")
 
 
 def sync_packages_to_tmp_provider(conn):
@@ -798,7 +882,7 @@ def sync_packages_to_tmp_provider(conn):
     payloads = []
     for pkg_id, pkg_config_raw in rows:
         cfg = pkg_config_raw if isinstance(pkg_config_raw, dict) else _json.loads(pkg_config_raw)
-        payloads.append({
+        payload = {
             "package_id": pkg_id,
             "media_buy_id": MEDIA_BUY_ID,
             "offering_id": cfg.get("product_id") or cfg.get("offering_id") or "",
@@ -810,7 +894,12 @@ def sync_packages_to_tmp_provider(conn):
             "price": cfg.get("price"),
             "si_agent_endpoint": SALESAGENT_AGENT_URL,
             "is_active": cfg.get("is_active", True),
-        })
+        }
+        # T5 — pass catalogs through when present (carries Affilizz mediaId for
+        # dynamic overlay population on the TMP Provider side).
+        if cfg.get("catalogs"):
+            payload["catalogs"] = cfg["catalogs"]
+        payloads.append(payload)
 
     # POST to each provider
     for endpoint, auth_credentials in providers:
