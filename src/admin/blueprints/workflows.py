@@ -172,6 +172,40 @@ def approve_workflow_step(tenant_id, workflow_id, step_id):
 
             db.commit()
 
+            # ── Adapter post-approval action (e.g. Siteplug campaign activation) ──
+            # Delegate to the generic executor which loads the adapter and calls
+            # adapter.execute_workflow_step_approval(step_id) if supported.
+            # This keeps the blueprint free of adapter-specific imports.
+            #
+            # "create_media_buy" is excluded here because it is handled by the
+            # existing path below (execute_approved_media_buy), which reconstructs
+            # the full CreateMediaBuyRequest, calls adapter.create_media_buy(), uploads
+            # creatives, and approves the order. That is a heavier, separate flow.
+            # All other tool_names (e.g. "activate_siteplug_campaign") go through
+            # execute_approved_workflow_step → adapter.execute_workflow_step_approval().
+            if step.tool_name and step.tool_name not in ("create_media_buy",):
+                from src.core.tools.workflow_approval import execute_approved_workflow_step
+
+                logger.info(
+                    f"[APPROVAL] Dispatching post-approval action for step '{step_id}' "
+                    f"(tool_name='{step.tool_name}')"
+                )
+                action_success, action_error = execute_approved_workflow_step(step_id, tenant_id)
+
+                if action_success:
+                    flash("Workflow step approved and action completed successfully", "success")
+                else:
+                    logger.error(
+                        f"[APPROVAL] Post-approval action failed for step '{step_id}': {action_error}"
+                    )
+                    flash(
+                        f"Workflow step approved but follow-up action failed: {action_error}. "
+                        "Please check the adapter logs or complete the action manually.",
+                        "warning",
+                    )
+                return jsonify({"success": True, "action_success": action_success}), 200
+
+            # ── Generic media buy creation path (GAM / other adapters) ───────
             # Check if this is a media buy creation workflow step
             mappings = workflow_repo.get_mappings_for_step(step_id)
             mapping = next((m for m in mappings if m.object_type == "media_buy"), None)
