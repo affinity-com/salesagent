@@ -473,6 +473,101 @@ class AdServerAdapter(ABC):
         """Updates a media buy with a specific action."""
         pass
 
+    def update_media_buy_keywords(
+        self,
+        media_buy_id: str,
+        package_id: str,
+        *,
+        keyword_targets_add: list | None = None,
+        keyword_targets_remove: list | None = None,
+        negative_keywords_add: list | None = None,
+        negative_keywords_remove: list | None = None,
+        today: datetime,
+    ) -> UpdateMediaBuyResponse:
+        """Add or remove keyword targets / negative keywords on a package.
+
+        Non-abstract default — returns ``UNSUPPORTED_FEATURE`` so existing
+        adapters that do not support keyword targeting do not need to override
+        this method.
+
+        Adapters that support keyword targeting (e.g. Siteplug) should override
+        this method to call the appropriate ad-server API.
+
+        Args:
+            media_buy_id: AdCP media buy ID.
+            package_id: AdCP package ID.
+            keyword_targets_add: Positive keyword targets to add (upsert by
+                ``(keyword, match_type)``). Each item has ``keyword``,
+                ``match_type``, and optional ``bid_price``.
+            keyword_targets_remove: Positive keyword targets to remove by
+                ``(keyword, match_type)`` tuple.
+            negative_keywords_add: Negative keywords to add.
+            negative_keywords_remove: Negative keywords to remove.
+            today: Current datetime.
+
+        Returns:
+            ``UpdateMediaBuyError`` with ``UNSUPPORTED_FEATURE`` by default.
+            Overriding adapters return ``UpdateMediaBuySuccess`` on success.
+        """
+        from src.core.schemas import Error, UpdateMediaBuyError
+
+        return UpdateMediaBuyError(
+            errors=[
+                Error(
+                    code="UNSUPPORTED_FEATURE",
+                    message=(
+                        f"Adapter '{getattr(self.__class__, 'adapter_name', self.__class__.__name__)}' "
+                        "does not support keyword targeting updates. "
+                        "Use targeting_overlay in create_media_buy to set keywords."
+                    ),
+                    details=None,
+                )
+            ]
+        )
+
+    def add_new_packages(
+        self,
+        media_buy_id: str,
+        new_packages: list,
+        *,
+        idempotency_key: str | None = None,
+        today: "datetime",
+    ) -> "UpdateMediaBuyResponse":
+        """Add new packages (ad groups) to an existing media buy mid-flight.
+
+        Non-abstract default — returns ``UNSUPPORTED_FEATURE`` so existing
+        adapters that do not support mid-flight package additions do not need
+        to override this method.
+
+        Adapters that support ``new_packages`` (e.g. Siteplug) should override
+        this method to create the corresponding ad-server entities.
+
+        Args:
+            media_buy_id: AdCP media buy ID.
+            new_packages: List of ``PackageRequest`` objects to add.
+            idempotency_key: Optional idempotency key from the AdCP request.
+            today: Current datetime.
+
+        Returns:
+            ``UpdateMediaBuyError`` with ``UNSUPPORTED_FEATURE`` by default.
+            Overriding adapters return ``UpdateMediaBuySuccess`` on success.
+        """
+        from src.core.schemas import Error, UpdateMediaBuyError
+
+        return UpdateMediaBuyError(
+            errors=[
+                Error(
+                    code="UNSUPPORTED_FEATURE",
+                    message=(
+                        f"Adapter '{getattr(self.__class__, 'adapter_name', self.__class__.__name__)}' "
+                        "does not support mid-flight package additions (new_packages). "
+                        "Create a new media buy for additional packages."
+                    ),
+                    details=None,
+                )
+            ]
+        )
+
     def get_config_ui_endpoint(self) -> str | None:
         """
         Returns the endpoint path for this adapter's configuration UI.

@@ -595,6 +595,34 @@ def _update_media_buy_impl(
                     )
                     return success_response
 
+            # Handle new_packages — mid-flight package additions
+            # (salesagent-9vgz.14) Dispatched to adapter.add_new_packages().
+            # Adapters that don't support this return UNSUPPORTED_FEATURE.
+            _new_pkgs = getattr(req, "new_packages", None)
+            if _new_pkgs:
+                np_result = adapter.add_new_packages(
+                    media_buy_id=req.media_buy_id,
+                    new_packages=_new_pkgs,
+                    idempotency_key=getattr(req, "idempotency_key", None),
+                    today=datetime.combine(today, datetime.min.time(), tzinfo=UTC),
+                )
+                if isinstance(np_result, UpdateMediaBuyError) and np_result.errors:
+                    error_message = (
+                        np_result.errors[0].message
+                        if np_result.errors
+                        else "new_packages creation failed"
+                    )
+                    ctx_manager.update_workflow_step(
+                        step.step_id,
+                        status="failed",
+                        response_data=np_result.model_dump(mode="json"),
+                        error_message=error_message,
+                    )
+                    return np_result
+                np_affected = getattr(np_result, "affected_packages", [])
+                if np_affected:
+                    affected_packages_list.extend(np_affected)
+
             # Handle package-level updates
             if req.packages:
                 for pkg_update in req.packages:
@@ -1163,6 +1191,70 @@ def _update_media_buy_impl(
                                 changes_applied={"creative_assignments_updated": updated_assignments},
                             )
                         )
+
+                    # Handle keyword_targets_add / keyword_targets_remove /
+                    # negative_keywords_add / negative_keywords_remove (salesagent-9vgz.14)
+                    # These are incremental keyword operations that bypass the full
+                    # targeting_overlay replacement. Dispatched to the adapter's
+                    # update_media_buy_keywords() method (non-abstract, defaults to
+                    # UNSUPPORTED_FEATURE for adapters that don't support keywords).
+                    _has_kw_op = (
+                        getattr(pkg_update, "keyword_targets_add", None) is not None
+                        or getattr(pkg_update, "keyword_targets_remove", None) is not None
+                        or getattr(pkg_update, "negative_keywords_add", None) is not None
+                        or getattr(pkg_update, "negative_keywords_remove", None) is not None
+                    )
+                    if _has_kw_op:
+                        if not pkg_update.package_id:
+                            error_msg = "package_id is required for keyword targeting updates"
+                            response_data = UpdateMediaBuyError(
+                                errors=[Error(code="VALIDATION_ERROR", message=error_msg)],
+                                context=req.context,
+                            )
+                            ctx_manager.update_workflow_step(
+                                step.step_id,
+                                status="failed",
+                                response_data=response_data.model_dump(mode="json"),
+                                error_message=error_msg,
+                            )
+                            return response_data
+
+                        kw_result = adapter.update_media_buy_keywords(
+                            media_buy_id=req.media_buy_id,
+                            package_id=pkg_update.package_id,
+                            keyword_targets_add=getattr(pkg_update, "keyword_targets_add", None),
+                            keyword_targets_remove=getattr(pkg_update, "keyword_targets_remove", None),
+                            negative_keywords_add=getattr(pkg_update, "negative_keywords_add", None),
+                            negative_keywords_remove=getattr(pkg_update, "negative_keywords_remove", None),
+                            today=datetime.combine(today, datetime.min.time(), tzinfo=UTC),
+                        )
+                        if isinstance(kw_result, UpdateMediaBuyError) and kw_result.errors:
+                            error_message = (
+                                kw_result.errors[0].message
+                                if kw_result.errors
+                                else "Keyword update failed"
+                            )
+                            ctx_manager.update_workflow_step(
+                                step.step_id,
+                                status="failed",
+                                response_data=kw_result.model_dump(mode="json"),
+                                error_message=error_message,
+                            )
+                            return kw_result
+
+                        # Track keyword update in affected_packages
+                        kw_affected = getattr(kw_result, "affected_packages", [])
+                        if kw_affected:
+                            affected_packages_list.extend(kw_affected)
+                        else:
+                            affected_packages_list.append(
+                                AffectedPackage(
+                                    package_id=pkg_update.package_id,
+                                    paused=False,
+                                    buyer_package_ref=pkg_update.package_id,
+                                    changes_applied={"keywords_updated": True},
+                                )
+                            )
 
                     # Handle targeting_overlay updates
                     if pkg_update.targeting_overlay is not None:
