@@ -7,6 +7,7 @@ Adapter for the Siteplug SSP Tech API supporting:
 - Inventory sync (Task 03)
 - Keyword targeting (Task 07)
 - HITL workflows (Task 08)
+- Ad group creation with keyword targeting (Task 04)
 
 Entity Mapping:
 - AdCP Media Buy → Siteplug Campaign
@@ -18,6 +19,7 @@ Entity Mapping:
 import asyncio
 import concurrent.futures
 import logging
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -169,6 +171,57 @@ class SiteplugAdapter(AdServerAdapter):
             audit_logger=self.audit_logger,
             log_func=self.log,
         )
+
+    # =========================================================================
+    # DB persistence helpers
+    # =========================================================================
+
+    def _persist_adgroup_id(
+        self,
+        *,
+        media_buy_id: str,
+        package_id: str,
+        adgroup_id: int,
+    ) -> None:
+        """Persist ``siteplug_adgroup_id`` to ``package_config`` JSONB.
+
+        Called after a successful ``POST /campaigns/{id}/adgroups`` to store
+        the new ad group ID so subsequent update/keyword operations can look
+        it up without an extra API call.
+
+        Args:
+            media_buy_id: AdCP media buy ID (used as the stable lookup key).
+            package_id: AdCP package ID.
+            adgroup_id: Siteplug ad group ID returned by the create endpoint.
+        """
+        from sqlalchemy.orm import attributes
+
+        from src.core.database.database_session import get_db_session
+        from src.core.database.repositories.media_buy import MediaBuyRepository
+
+        try:
+            with get_db_session() as session:
+                repo = MediaBuyRepository(session, self.tenant_id)
+                pkg = repo.get_package(media_buy_id, package_id)
+                if pkg is None:
+                    logger.error(
+                        f"[siteplug] _persist_adgroup_id: package '{package_id}' "
+                        f"not found in media buy '{media_buy_id}'"
+                    )
+                    return
+                pkg.package_config["siteplug_adgroup_id"] = adgroup_id
+                attributes.flag_modified(pkg, "package_config")
+                session.commit()
+                self.log(
+                    f"[siteplug] persisted siteplug_adgroup_id={adgroup_id} "
+                    f"for package '{package_id}'"
+                )
+        except Exception as exc:
+            logger.error(
+                f"[siteplug] _persist_adgroup_id: failed to persist "
+                f"adgroup_id={adgroup_id} for package '{package_id}': {exc}",
+                exc_info=True,
+            )
 
     # =========================================================================
     # Async → sync bridge helper
@@ -358,6 +411,164 @@ class SiteplugAdapter(AdServerAdapter):
 
         media_buy_id = f"sp_{campaign_id}"
         self.log(f"Siteplug.create_media_buy: provisioned campaign_id={campaign_id} → media_buy_id={media_buy_id}")
+
+        # ── Create ad groups for each package (Task 04) ───────────────────
+        # Each AdCP package maps to one Siteplug ad group within the campaign.
+        # Ad group name regex: /^[a-zA-Z0-9][a-zA-Z0-9 \-\_]*$/
+        _ADGROUP_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9 _\-]*$")
+
+        async def _create_adgroups_for_packages() -> None:
+            for pkg in packages:
+                # Determine bid amount from package.cpm (pricing field)
+                bid_amount: float = float(pkg.cpm) if pkg.cpm else 0.0
+                bid_type: str = "cpm"
+
+                # Check package_pricing_info for a more specific bid/type
+                if package_pricing_info and pkg.package_id in package_pricing_info:
+                    pricing = package_pricing_info[pkg.package_id]
+                    pricing_model = pricing.get("pricing_model", "cpm").lower()
+                    if pricing_model in ("cpc", "cpm"):
+                        bid_type = pricing_model
+                    rate = pricing.get("rate") or pricing.get("bid_price")
+                    if rate is not None:
+                        bid_amount = float(rate)
+
+                # Build ad group name from package name; validate against regex
+                adgroup_name: str | None = pkg.name or None
+                if adgroup_name and not _ADGROUP_NAME_RE.match(adgroup_name):
+                    # Sanitise: strip leading non-alphanumeric chars, replace
+                    # disallowed chars with underscores, truncate to 64 chars
+                    sanitised = re.sub(r"[^a-zA-Z0-9 _\-]", "_", adgroup_name)
+                    sanitised = re.sub(r"^[^a-zA-Z0-9]+", "", sanitised)
+                    adgroup_name = sanitised[:64] if sanitised else None
+                    self.log(
+                        f"[siteplug] ad group name sanitised for package "
+                        f"'{pkg.package_id}': {adgroup_name!r}"
+                    )
+
+                adgroup_payload: dict[str, Any] = {
+                    "bid_amount": bid_amount,
+                    "bid_type": bid_type,
+                }
+                if adgroup_name:
+                    adgroup_payload["name"] = adgroup_name
+
+                try:
+                    adgroup_data = await self.client.create_adgroup(
+                        campaign_id,
+                        adgroup_payload,
+                        idempotency_key=request.idempotency_key,
+                    )
+                    adgroup_id: int = int(
+                        adgroup_data.get("ad_group_id")
+                        or adgroup_data.get("adgroup_id")
+                        or 0
+                    )
+                    self.log(
+                        f"[siteplug] created adgroup_id={adgroup_id} "
+                        f"for package '{pkg.package_id}'"
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"[siteplug] create_adgroup failed for package "
+                        f"'{pkg.package_id}': {exc} — skipping ad group creation"
+                    )
+                    continue
+
+                if adgroup_id <= 0:
+                    logger.warning(
+                        f"[siteplug] create_adgroup returned invalid adgroup_id={adgroup_id} "
+                        f"for package '{pkg.package_id}' — skipping keyword wiring"
+                    )
+                    continue
+
+                # Persist adgroup_id to package_config
+                self.campaign_manager._persist_entity_ids(
+                    media_buy_id=stable_lookup_id,
+                    package_id=pkg.package_id,
+                    tenant_id=self.tenant_id,
+                )
+                # Persist adgroup_id separately (not a standard entity field)
+                self._persist_adgroup_id(
+                    media_buy_id=stable_lookup_id,
+                    package_id=pkg.package_id,
+                    adgroup_id=adgroup_id,
+                )
+
+                # ── Keyword targeting ─────────────────────────────────────
+                # Build keyword payload from targeting_overlay if present
+                overlay = pkg.targeting_overlay
+                if overlay is None:
+                    continue
+
+                kw_payload: dict[str, Any] = {}
+
+                # Positive keyword targets
+                keyword_targets = getattr(overlay, "keyword_targets", None)
+                if keyword_targets:
+                    kw_list = []
+                    for kw in keyword_targets:
+                        kw_text = getattr(kw, "keyword", None) or getattr(kw, "text", None)
+                        kw_match = getattr(kw, "match_type", "broad")
+                        # Resolve enum to string if needed
+                        if hasattr(kw_match, "value"):
+                            kw_match = kw_match.value
+                        kw_entry: dict[str, Any] = {
+                            "text": str(kw_text),
+                            "match_type": str(kw_match),
+                        }
+                        # Per-keyword bid_price → kw_max_cpc (K1)
+                        bid_price = getattr(kw, "bid_price", None)
+                        if bid_price is not None:
+                            kw_entry["kw_max_cpc"] = float(bid_price)
+                        kw_list.append(kw_entry)
+                    if kw_list:
+                        kw_payload["keywords"] = kw_list
+
+                # Negative keywords (no bid_price support)
+                negative_keywords = getattr(overlay, "negative_keywords", None)
+                if negative_keywords:
+                    neg_list = []
+                    for nkw in negative_keywords:
+                        nkw_text = getattr(nkw, "keyword", None) or getattr(nkw, "text", None)
+                        nkw_match = getattr(nkw, "match_type", "broad")
+                        if hasattr(nkw_match, "value"):
+                            nkw_match = nkw_match.value
+                        neg_list.append({
+                            "text": str(nkw_text),
+                            "match_type": str(nkw_match),
+                        })
+                    if neg_list:
+                        kw_payload["negative_keywords"] = neg_list
+
+                if kw_payload:
+                    try:
+                        await self.client.add_keywords(
+                            adgroup_id,
+                            kw_payload,
+                            idempotency_key=request.idempotency_key,
+                        )
+                        self.log(
+                            f"[siteplug] added keywords to adgroup_id={adgroup_id} "
+                            f"for package '{pkg.package_id}': "
+                            f"{len(kw_payload.get('keywords', []))} positive, "
+                            f"{len(kw_payload.get('negative_keywords', []))} negative"
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            f"[siteplug] add_keywords failed for adgroup_id={adgroup_id} "
+                            f"package '{pkg.package_id}': {exc} — keywords not added"
+                        )
+
+        try:
+            self._run_async(_create_adgroups_for_packages)
+        except Exception as exc:
+            # Ad group creation is non-fatal — campaign is already provisioned.
+            # Log and continue so the media buy is still returned successfully.
+            logger.warning(
+                f"[siteplug] create_media_buy: ad group creation failed "
+                f"(non-fatal): {exc}"
+            )
 
         if automation_mode == "confirmation_required":
             # Pause the campaign immediately so it does not serve ads before
@@ -1065,6 +1276,435 @@ class SiteplugAdapter(AdServerAdapter):
             dry_run_prefix=False,
         )
         return True
+
+    def add_new_packages(
+        self,
+        media_buy_id: str,
+        new_packages: list,
+        *,
+        idempotency_key: str | None = None,
+        today: datetime,
+    ) -> "UpdateMediaBuyResponse":
+        """Create new ad groups for packages added mid-flight to an existing campaign.
+
+        Reads ``siteplug_campaign_id`` from the media buy's ``package_config``,
+        then calls ``POST /ssp/v1/campaigns/{id}/adgroups`` for each new package.
+        Keywords from ``targeting_overlay`` are wired via ``add_keywords``.
+
+        Args:
+            media_buy_id: AdCP media buy ID (format: ``"sp_{campaign_id}"``).
+            new_packages: List of ``PackageRequest`` objects to add.
+            idempotency_key: Optional idempotency key forwarded on POST.
+            today: Current datetime (required by interface).
+
+        Returns:
+            ``UpdateMediaBuySuccess`` or ``UpdateMediaBuyError``.
+        """
+        self.log(
+            f"Siteplug.add_new_packages for '{media_buy_id}' "
+            f"({len(new_packages)} package(s))",
+            dry_run_prefix=False,
+        )
+
+        # ── Dry-run ───────────────────────────────────────────────────────────
+        if self.dry_run:
+            self.log(
+                f"[dry-run] Would create {len(new_packages)} new ad group(s) "
+                f"for '{media_buy_id}'"
+            )
+            return UpdateMediaBuySuccess(
+                media_buy_id=media_buy_id,
+                buyer_ref=media_buy_id,
+                affected_packages=[
+                    AffectedPackage(
+                        package_id=getattr(pkg, "package_id", str(i)),
+                        buyer_ref=media_buy_id,
+                        paused=False,
+                        changes_applied={"adgroup_created": True},
+                        buyer_package_ref=None,
+                    )
+                    for i, pkg in enumerate(new_packages)
+                ],
+                implementation_date=today,
+            )
+
+        # ── Extract campaign_id from media_buy_id ─────────────────────────────
+        if not media_buy_id.startswith("sp_"):
+            return UpdateMediaBuyError(
+                errors=[
+                    Error(
+                        code="VALIDATION_ERROR",
+                        message=f"Unexpected media_buy_id format: '{media_buy_id}' (expected 'sp_<id>')",
+                        details=None,
+                    )
+                ]
+            )
+        try:
+            campaign_id = int(media_buy_id[3:])
+        except ValueError:
+            return UpdateMediaBuyError(
+                errors=[
+                    Error(
+                        code="VALIDATION_ERROR",
+                        message=f"Cannot parse campaign_id from media_buy_id '{media_buy_id}'",
+                        details=None,
+                    )
+                ]
+            )
+
+        assert self.tenant_id is not None, "tenant_id required for add_new_packages"
+
+        created: list[AffectedPackage] = []
+
+        async def _create_new_adgroups() -> None:
+            for pkg in new_packages:
+                pkg_id: str = getattr(pkg, "package_id", "") or ""
+                bid_amount: float = float(getattr(pkg, "bid_price", None) or getattr(pkg, "cpm", None) or 0.0)
+                bid_type: str = "cpm"
+
+                # Build name
+                adgroup_name: str | None = getattr(pkg, "name", None)
+                if adgroup_name and not _ADGROUP_NAME_RE.match(adgroup_name):
+                    sanitised = re.sub(r"[^a-zA-Z0-9 _\-]", "_", adgroup_name)
+                    sanitised = re.sub(r"^[^a-zA-Z0-9]+", "", sanitised)
+                    adgroup_name = sanitised[:64] if sanitised else None
+
+                adgroup_payload: dict[str, Any] = {
+                    "bid_amount": bid_amount,
+                    "bid_type": bid_type,
+                }
+                if adgroup_name:
+                    adgroup_payload["name"] = adgroup_name
+                if getattr(pkg, "paused", False):
+                    adgroup_payload["status"] = 0
+
+                try:
+                    adgroup_data = await self.client.create_adgroup(
+                        campaign_id,
+                        adgroup_payload,
+                        idempotency_key=idempotency_key,
+                    )
+                    adgroup_id: int = int(
+                        adgroup_data.get("ad_group_id")
+                        or adgroup_data.get("adgroup_id")
+                        or 0
+                    )
+                    self.log(
+                        f"[siteplug] add_new_packages: created adgroup_id={adgroup_id} "
+                        f"for package '{pkg_id}'"
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"[siteplug] add_new_packages: create_adgroup failed for "
+                        f"package '{pkg_id}': {exc} — skipping"
+                    )
+                    continue
+
+                if adgroup_id > 0 and pkg_id:
+                    self._persist_adgroup_id(
+                        media_buy_id=media_buy_id,
+                        package_id=pkg_id,
+                        adgroup_id=adgroup_id,
+                    )
+
+                # Wire keywords from targeting_overlay
+                overlay = getattr(pkg, "targeting_overlay", None)
+                if overlay is not None and adgroup_id > 0:
+                    kw_payload: dict[str, Any] = {}
+                    keyword_targets = getattr(overlay, "keyword_targets", None)
+                    if keyword_targets:
+                        kw_list = []
+                        for kw in keyword_targets:
+                            kw_text = getattr(kw, "keyword", None) or getattr(kw, "text", None)
+                            kw_match = getattr(kw, "match_type", "broad")
+                            if hasattr(kw_match, "value"):
+                                kw_match = kw_match.value
+                            kw_entry: dict[str, Any] = {
+                                "text": str(kw_text),
+                                "match_type": str(kw_match),
+                            }
+                            bid_price = getattr(kw, "bid_price", None)
+                            if bid_price is not None:
+                                kw_entry["kw_max_cpc"] = float(bid_price)
+                            kw_list.append(kw_entry)
+                        if kw_list:
+                            kw_payload["keywords"] = kw_list
+                    negative_keywords = getattr(overlay, "negative_keywords", None)
+                    if negative_keywords:
+                        neg_list = []
+                        for nkw in negative_keywords:
+                            nkw_text = getattr(nkw, "keyword", None) or getattr(nkw, "text", None)
+                            nkw_match = getattr(nkw, "match_type", "broad")
+                            if hasattr(nkw_match, "value"):
+                                nkw_match = nkw_match.value
+                            neg_list.append({"text": str(nkw_text), "match_type": str(nkw_match)})
+                        if neg_list:
+                            kw_payload["negative_keywords"] = neg_list
+                    if kw_payload:
+                        try:
+                            await self.client.add_keywords(
+                                adgroup_id, kw_payload, idempotency_key=idempotency_key
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                f"[siteplug] add_new_packages: add_keywords failed for "
+                                f"adgroup_id={adgroup_id}: {exc}"
+                            )
+
+                created.append(
+                    AffectedPackage(
+                        package_id=pkg_id,
+                        buyer_ref=media_buy_id,
+                        paused=bool(getattr(pkg, "paused", False)),
+                        changes_applied={"adgroup_id": adgroup_id},
+                        buyer_package_ref=None,
+                    )
+                )
+
+        try:
+            self._run_async(_create_new_adgroups)
+        except Exception as exc:
+            logger.error(
+                f"[siteplug] add_new_packages: failed for '{media_buy_id}': {exc}",
+                exc_info=True,
+            )
+            return UpdateMediaBuyError(
+                errors=[
+                    Error(
+                        code="INTERNAL_ERROR",
+                        message=f"Failed to create new ad groups for '{media_buy_id}': {exc}",
+                        details=None,
+                    )
+                ]
+            )
+
+        return UpdateMediaBuySuccess(
+            media_buy_id=media_buy_id,
+            buyer_ref=media_buy_id,
+            affected_packages=created,
+            implementation_date=today,
+        )
+
+    def update_media_buy_keywords(
+        self,
+        media_buy_id: str,
+        package_id: str,
+        *,
+        keyword_targets_add: list | None = None,
+        keyword_targets_remove: list | None = None,
+        negative_keywords_add: list | None = None,
+        negative_keywords_remove: list | None = None,
+        today: datetime,
+    ) -> "UpdateMediaBuyResponse":
+        """Add or remove keyword targets / negative keywords on a Siteplug ad group.
+
+        Reads ``siteplug_adgroup_id`` from ``package_config``, then calls
+        ``POST /adgroups/{id}/keywords`` (add) and/or
+        ``DELETE /adgroups/{id}/keywords`` (remove) as appropriate.
+
+        Per-keyword ``bid_price`` is forwarded as ``kw_max_cpc`` on add (K1).
+        Negative keywords do not support ``bid_price``.
+
+        Args:
+            media_buy_id: AdCP media buy ID (format: ``"sp_{campaign_id}"``).
+            package_id: AdCP package ID.
+            keyword_targets_add: List of ``KeywordTargetsAddItem`` objects to add.
+            keyword_targets_remove: List of ``KeywordTargetsRemoveItem`` objects to remove.
+            negative_keywords_add: List of ``NegativeKeywordsAddItem`` objects to add.
+            negative_keywords_remove: List of ``NegativeKeywordsRemoveItem`` objects to remove.
+            today: Current datetime (required by interface).
+
+        Returns:
+            ``UpdateMediaBuySuccess`` or ``UpdateMediaBuyError``.
+        """
+        from src.core.database.database_session import get_db_session
+        from src.core.database.repositories.media_buy import MediaBuyRepository
+
+        self.log(
+            f"Siteplug.update_media_buy_keywords for '{media_buy_id}' "
+            f"package='{package_id}'",
+            dry_run_prefix=False,
+        )
+
+        # ── Dry-run: return success without API calls ─────────────────────
+        if self.dry_run:
+            self.log(
+                f"[dry-run] Would update keywords on '{media_buy_id}' "
+                f"package='{package_id}'"
+            )
+            return UpdateMediaBuySuccess(
+                media_buy_id=media_buy_id,
+                buyer_ref=media_buy_id,
+                affected_packages=[
+                    AffectedPackage(
+                        package_id=package_id,
+                        buyer_ref=media_buy_id,
+                        paused=False,
+                        changes_applied={"keywords_updated": True},
+                        buyer_package_ref=None,
+                    )
+                ],
+                implementation_date=today,
+            )
+
+        # ── Read adgroup_id from package_config ───────────────────────────
+        assert self.tenant_id is not None, "tenant_id required for keyword update"
+
+        with get_db_session() as session:
+            repo = MediaBuyRepository(session, self.tenant_id)
+            db_package = repo.get_package(media_buy_id, package_id)
+
+        if db_package is None:
+            return UpdateMediaBuyError(
+                errors=[
+                    Error(
+                        code="PACKAGE_NOT_FOUND",
+                        message=f"Package '{package_id}' not found in media buy '{media_buy_id}'",
+                        details=None,
+                    )
+                ]
+            )
+
+        adgroup_id: int | None = db_package.package_config.get("siteplug_adgroup_id")
+        if adgroup_id is None:
+            return UpdateMediaBuyError(
+                errors=[
+                    Error(
+                        code="UNSUPPORTED_FEATURE",
+                        message=(
+                            f"Package '{package_id}' has no Siteplug ad group ID — "
+                            "ad group may not have been created yet"
+                        ),
+                        details=None,
+                    )
+                ]
+            )
+
+        # ── Build add payload ─────────────────────────────────────────────
+        add_payload: dict[str, Any] = {}
+
+        if keyword_targets_add:
+            kw_list = []
+            for kw in keyword_targets_add:
+                kw_text = getattr(kw, "keyword", None) or getattr(kw, "text", None)
+                kw_match = getattr(kw, "match_type", "broad")
+                if hasattr(kw_match, "value"):
+                    kw_match = kw_match.value
+                kw_entry: dict[str, Any] = {
+                    "text": str(kw_text),
+                    "match_type": str(kw_match),
+                }
+                bid_price = getattr(kw, "bid_price", None)
+                if bid_price is not None:
+                    kw_entry["kw_max_cpc"] = float(bid_price)
+                kw_list.append(kw_entry)
+            if kw_list:
+                add_payload["keywords"] = kw_list
+
+        if negative_keywords_add:
+            neg_list = []
+            for nkw in negative_keywords_add:
+                nkw_text = getattr(nkw, "keyword", None) or getattr(nkw, "text", None)
+                nkw_match = getattr(nkw, "match_type", "broad")
+                if hasattr(nkw_match, "value"):
+                    nkw_match = nkw_match.value
+                neg_list.append({
+                    "text": str(nkw_text),
+                    "match_type": str(nkw_match),
+                })
+            if neg_list:
+                add_payload["negative_keywords"] = neg_list
+
+        # ── Build remove payload ──────────────────────────────────────────
+        remove_payload: dict[str, Any] = {}
+
+        if keyword_targets_remove:
+            kw_remove_list = []
+            for kw in keyword_targets_remove:
+                kw_text = getattr(kw, "keyword", None) or getattr(kw, "text", None)
+                kw_match = getattr(kw, "match_type", "broad")
+                if hasattr(kw_match, "value"):
+                    kw_match = kw_match.value
+                kw_remove_list.append({
+                    "text": str(kw_text),
+                    "match_type": str(kw_match),
+                })
+            if kw_remove_list:
+                remove_payload["keywords"] = kw_remove_list
+
+        if negative_keywords_remove:
+            neg_remove_list = []
+            for nkw in negative_keywords_remove:
+                nkw_text = getattr(nkw, "keyword", None) or getattr(nkw, "text", None)
+                nkw_match = getattr(nkw, "match_type", "broad")
+                if hasattr(nkw_match, "value"):
+                    nkw_match = nkw_match.value
+                neg_remove_list.append({
+                    "text": str(nkw_text),
+                    "match_type": str(nkw_match),
+                })
+            if neg_remove_list:
+                remove_payload["negative_keywords"] = neg_remove_list
+
+        # ── Execute API calls ─────────────────────────────────────────────
+        try:
+            if add_payload:
+                async def _add_kw() -> None:
+                    await self.client.add_keywords(adgroup_id, add_payload)
+
+                self._run_async(_add_kw)
+                self.log(
+                    f"[siteplug] added keywords to adgroup_id={adgroup_id}: "
+                    f"{len(add_payload.get('keywords', []))} positive, "
+                    f"{len(add_payload.get('negative_keywords', []))} negative"
+                )
+
+            if remove_payload:
+                async def _remove_kw() -> None:
+                    await self.client.remove_keywords(adgroup_id, remove_payload)
+
+                self._run_async(_remove_kw)
+                self.log(
+                    f"[siteplug] removed keywords from adgroup_id={adgroup_id}: "
+                    f"{len(remove_payload.get('keywords', []))} positive, "
+                    f"{len(remove_payload.get('negative_keywords', []))} negative"
+                )
+
+        except Exception as exc:
+            logger.error(
+                f"[siteplug] update_media_buy_keywords: API call failed "
+                f"for adgroup_id={adgroup_id}: {exc}",
+                exc_info=True,
+            )
+            return UpdateMediaBuyError(
+                errors=[
+                    Error(
+                        code="INTERNAL_ERROR",
+                        message=f"Keyword update failed for ad group {adgroup_id}: {exc}",
+                        details=None,
+                    )
+                ]
+            )
+
+        return UpdateMediaBuySuccess(
+            media_buy_id=media_buy_id,
+            buyer_ref=media_buy_id,
+            affected_packages=[
+                AffectedPackage(
+                    package_id=package_id,
+                    buyer_ref=media_buy_id,
+                    paused=False,
+                    changes_applied={
+                        "keywords_added": len(add_payload.get("keywords", [])),
+                        "negative_keywords_added": len(add_payload.get("negative_keywords", [])),
+                        "keywords_removed": len(remove_payload.get("keywords", [])),
+                        "negative_keywords_removed": len(remove_payload.get("negative_keywords", [])),
+                    },
+                    buyer_package_ref=None,
+                )
+            ],
+            implementation_date=today,
+        )
 
     async def get_available_inventory(self) -> dict[str, Any]:
         """Fetch available inventory zones from Siteplug.
