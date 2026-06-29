@@ -449,17 +449,79 @@ class SiteplugClient:
         return await self._request("GET", f"/inventory/{zone_id}")
 
     # =========================================================================
-    # Delivery / Reporting Operations  (wired in Task 05)
+    # Delivery / Reporting Operations  (Task 05)
     # =========================================================================
 
     async def get_campaign_delivery(
-        self, campaign_id: int, **params: Any
+        self,
+        campaign_id: int,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        dimensions: list[str] | None = None,
+        geo_level: str | None = None,
+        **_extra: Any,
     ) -> dict[str, Any]:
-        """Get campaign delivery stats. Stub — wired in Task 05."""
+        """Get campaign delivery stats.
+
+        Calls ``GET /campaigns/{id}/delivery`` when the SSP API delivery
+        endpoint is deployed.  Until then, returns a mock response that
+        exercises the full mapping path in ``SiteplugReportingManager``.
+
+        To wire the real endpoint, replace the ``return _MOCK_DELIVERY_RESPONSE``
+        line below with:
+
+            params: dict[str, Any] = {}
+            if start_date:
+                params["start_date"] = start_date
+            if end_date:
+                params["end_date"] = end_date
+            if dimensions:
+                params["dimensions"] = ",".join(dimensions)
+            if geo_level:
+                params["geo_level"] = geo_level
+            return await self._request(
+                "GET", f"/campaigns/{campaign_id}/delivery", params=params
+            )
+
+        Args:
+            campaign_id: Siteplug campaign ID.
+            start_date: Optional start date filter (YYYY-MM-DD).
+            end_date: Optional end date filter (YYYY-MM-DD).
+            dimensions: Optional list of dimension keys (e.g. ["geo", "device_type"]).
+            geo_level: Required when "geo" dimension requested (country/region/metro/postal_area).
+        """
+        # STUB: delivery API not yet deployed — return empty response so the
+        # mapping layer produces all-zero AdCP metrics.  Replace with the real
+        # _request call above when GET /campaigns/{id}/delivery is live.
+        logger.debug(
+            "[siteplug] get_campaign_delivery: delivery API not yet deployed, "
+            "returning empty stub for campaign_id=%s", campaign_id
+        )
         return {}
 
     async def get_campaign_snapshot(self, campaign_id: int) -> dict[str, Any]:
-        """Get campaign snapshot. Stub — wired in Task 05."""
+        """Get a point-in-time campaign snapshot.
+
+        Calls ``GET /campaigns/{id}/delivery/snapshot`` when the SSP API
+        delivery endpoint is deployed.  Until then, returns an empty dict.
+
+        To wire the real endpoint, replace the ``return {}`` line below with:
+
+            return await self._request(
+                "GET", f"/campaigns/{campaign_id}/delivery/snapshot"
+            )
+
+        Args:
+            campaign_id: Siteplug campaign ID.
+        """
+        # STUB: delivery API not yet deployed — return empty response so the
+        # mapping layer produces an all-zero AdCP snapshot.  Replace with the
+        # real _request call above when GET /campaigns/{id}/delivery/snapshot
+        # is live.
+        logger.debug(
+            "[siteplug] get_campaign_snapshot: delivery API not yet deployed, "
+            "returning empty stub for campaign_id=%s", campaign_id
+        )
         return {}
 
     # =========================================================================

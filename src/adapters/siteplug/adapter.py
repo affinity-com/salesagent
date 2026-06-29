@@ -125,6 +125,8 @@ class SiteplugAdapter(AdServerAdapter):
                 api_key=config.get("api_key", "dry-run-key"),
                 timeout=config.get("timeout", 30),
                 max_retries=config.get("max_retries", 3),
+                affilizz_internal_url=config.get("affilizz_internal_url", ""),
+                affilizz_api_key=config.get("affilizz_api_key", ""),
             )
         else:
             base_url = config.get("base_url", "")
@@ -138,6 +140,8 @@ class SiteplugAdapter(AdServerAdapter):
                 api_key=api_key,
                 timeout=config.get("timeout", 30),
                 max_retries=config.get("max_retries", 3),
+                affilizz_internal_url=config.get("affilizz_internal_url", ""),
+                affilizz_api_key=config.get("affilizz_api_key", ""),
             )
 
         # Initialize HTTP client
@@ -149,8 +153,8 @@ class SiteplugAdapter(AdServerAdapter):
             log_func=self.log,
         )
         self.creative_manager = SiteplugCreativeManager(
-            client=self.client,
-            log_func=self.log,
+            config=self.connection_config,
+            siteplug_client=self.client,
         )
         self.inventory_manager = SiteplugInventoryManager(
             client=self.client,
@@ -299,6 +303,33 @@ class SiteplugAdapter(AdServerAdapter):
         if self.dry_run:
             media_buy_id = f"sp_{request.po_number or int(datetime.now(UTC).timestamp())}"
             self.log(f"[dry-run] Would provision entity stack → media_buy_id={media_buy_id}")
+            return self._build_create_success(request, media_buy_id, packages)
+
+        # ── Text-ad-search gate (Task 04 / Affilizz) ─────────────────────
+        # When ALL packages carry only the ``text_ad_search`` format, the
+        # media buy is fulfilled entirely via the Affilizz API (no Siteplug
+        # SSP entity stack required).  Return a synthetic ID immediately so
+        # the core layer can proceed without waiting for SSP provisioning.
+        def _all_text_ad_search(pkgs: list) -> bool:
+            if not pkgs:
+                return False
+            for pkg in pkgs:
+                raw = getattr(pkg, "format_ids", None)
+                # Materialise to a plain list so MagicMock iterables (which
+                # yield nothing) are treated as empty rather than truthy.
+                fmt_ids: list = list(raw) if isinstance(raw, (list, tuple)) else []
+                if not fmt_ids:
+                    return False
+                if not all(getattr(f, "id", None) == "text_ad_search" for f in fmt_ids):
+                    return False
+            return True
+
+        if _all_text_ad_search(packages):
+            media_buy_id = f"sp_text_{request.po_number or int(datetime.now(UTC).timestamp())}"
+            self.log(
+                f"[siteplug] text_ad_search gate: all packages are text-only → "
+                f"synthetic media_buy_id={media_buy_id}, skipping SSP provisioning"
+            )
             return self._build_create_success(request, media_buy_id, packages)
 
         # ── Extract Siteplug config from the first package ────────────────
@@ -1036,45 +1067,207 @@ class SiteplugAdapter(AdServerAdapter):
         date_range: ReportingPeriod,
         today: datetime,
     ) -> AdapterGetMediaBuyDeliveryResponse:
-        """Get delivery data for a media buy.
+        """Get delivery data for a media buy from the Siteplug SSP API.
 
-        Stub — wired in Task 05.
+        Reads ``siteplug_campaign_id`` from the first package's ``package_config``
+        in the DB, calls the SSP API delivery endpoint via
+        ``SiteplugReportingManager.get_delivery()``, and maps the response to
+        an ``AdapterGetMediaBuyDeliveryResponse``.
+
+        The SSP API client is a stub until the delivery endpoint is deployed;
+        the mapping logic is fully implemented so switching to the real API
+        requires only a change in ``SiteplugClient.get_campaign_delivery()``.
+
+        Args:
+            media_buy_id: AdCP media buy ID (``sp_{campaign_id}`` format).
+            date_range: Reporting period with start/end datetimes.
+            today: Current datetime (unused — date_range is authoritative).
 
         Returns:
-            Empty delivery report
+            AdapterGetMediaBuyDeliveryResponse with delivery metrics.
         """
         self.log(
-            f"Siteplug.get_media_buy_delivery [STUB] for '{media_buy_id}'",
+            f"Siteplug.get_media_buy_delivery for '{media_buy_id}'",
             dry_run_prefix=False,
         )
+
+        assert self.tenant_id is not None, "tenant_id required for Siteplug delivery reporting"
+
+        # ── Dry-run: return empty report without DB/API calls ─────────────
+        if self.dry_run:
+            self.log(f"[dry-run] Would fetch delivery for media_buy_id={media_buy_id}")
+            return AdapterGetMediaBuyDeliveryResponse(
+                media_buy_id=media_buy_id,
+                reporting_period=date_range,
+                totals=DeliveryTotals(
+                    impressions=0,
+                    spend=0.0,
+                    clicks=0,
+                    ctr=0.0,
+                    video_completions=0,
+                    completion_rate=0.0,
+                ),
+                by_package=[],
+                currency="USD",
+            )
+
+        # ── Read siteplug_campaign_id from DB ─────────────────────────────
+        campaign_id = self._read_campaign_id(media_buy_id)
+        if campaign_id is None:
+            self.log(
+                f"[siteplug] get_media_buy_delivery: no siteplug_campaign_id found "
+                f"for media_buy_id={media_buy_id}, returning empty report"
+            )
+            return AdapterGetMediaBuyDeliveryResponse(
+                media_buy_id=media_buy_id,
+                reporting_period=date_range,
+                totals=DeliveryTotals(
+                    impressions=0,
+                    spend=0.0,
+                    clicks=0,
+                    ctr=0.0,
+                    video_completions=0,
+                    completion_rate=0.0,
+                ),
+                by_package=[],
+                currency="USD",
+            )
+
+        # ── Build date params from ReportingPeriod ────────────────────────
+        start_date: str | None = None
+        end_date: str | None = None
+        if date_range.start:
+            start_date = date_range.start.strftime("%Y-%m-%d")
+        if date_range.end:
+            end_date = date_range.end.strftime("%Y-%m-%d")
+
+        # ── Call reporting manager (async → sync bridge) ──────────────────
+        async def _run_delivery() -> dict:
+            return await self.reporting_manager.get_delivery(
+                campaign_id=campaign_id,
+                media_buy_id=media_buy_id,
+                tenant_id=self.tenant_id,
+                start_date=start_date,
+                end_date=end_date,
+            )
+
+        delivery_data = self._run_async(_run_delivery)
+
+        # ── Map to AdapterGetMediaBuyDeliveryResponse ─────────────────────
+        from src.core.schemas import AdapterPackageDelivery
+
+        by_package = [
+            AdapterPackageDelivery(
+                package_id=pkg["package_id"],
+                impressions=int(pkg.get("impressions", 0)),
+                spend=float(pkg.get("spend", 0.0)),
+            )
+            for pkg in delivery_data.get("by_package", [])
+        ]
+
         return AdapterGetMediaBuyDeliveryResponse(
             media_buy_id=media_buy_id,
             reporting_period=date_range,
             totals=DeliveryTotals(
-                impressions=0,
-                spend=0,
-                clicks=0,
-                ctr=0.0,
-                video_completions=0,
-                completion_rate=0.0,
+                impressions=delivery_data.get("impressions", 0),
+                spend=delivery_data.get("spend", 0.0),
+                clicks=delivery_data.get("clicks"),
+                ctr=delivery_data.get("ctr"),
+                video_completions=None,
+                completion_rate=None,
             ),
-            by_package=[],
+            by_package=by_package,
             currency="USD",
         )
 
     def get_packages_snapshot(self, media_buy_id: str) -> dict[str, Any]:
-        """Get a snapshot of package performance.
+        """Get a point-in-time snapshot of package performance.
 
-        Stub — wired in Task 05.
+        Reads ``siteplug_campaign_id`` from the first package's ``package_config``
+        in the DB, calls the SSP API snapshot endpoint via
+        ``SiteplugReportingManager.get_snapshot()``, and returns a dict of
+        per-package ``Snapshot`` objects keyed by ``package_id``.
+
+        The SSP API client is a stub until the delivery endpoint is deployed;
+        the mapping logic is fully implemented so switching to the real API
+        requires only a change in ``SiteplugClient.get_campaign_snapshot()``.
+
+        Args:
+            media_buy_id: AdCP media buy ID (``sp_{campaign_id}`` format).
 
         Returns:
-            Empty snapshot dict
+            Dict mapping package_id → Snapshot (or None if unavailable).
+            Returns empty dict if campaign_id not found or API not yet deployed.
         """
         self.log(
-            f"Siteplug.get_packages_snapshot [STUB] for '{media_buy_id}'",
+            f"Siteplug.get_packages_snapshot for '{media_buy_id}'",
             dry_run_prefix=False,
         )
-        return {}
+
+        assert self.tenant_id is not None, "tenant_id required for Siteplug snapshot"
+
+        # ── Dry-run: return empty snapshot without DB/API calls ───────────
+        if self.dry_run:
+            self.log(f"[dry-run] Would fetch snapshot for media_buy_id={media_buy_id}")
+            return {}
+
+        # ── Read siteplug_campaign_id from DB ─────────────────────────────
+        campaign_id = self._read_campaign_id(media_buy_id)
+        if campaign_id is None:
+            self.log(
+                f"[siteplug] get_packages_snapshot: no siteplug_campaign_id found "
+                f"for media_buy_id={media_buy_id}, returning empty snapshot"
+            )
+            return {}
+
+        # ── Call reporting manager (async → sync bridge) ──────────────────
+        async def _run_snapshot() -> dict:
+            return await self.reporting_manager.get_snapshot(
+                campaign_id=campaign_id,
+                media_buy_id=media_buy_id,
+                tenant_id=self.tenant_id,
+            )
+
+        snapshot_data = self._run_async(_run_snapshot)
+
+        # ── Map to per-package Snapshot objects ───────────────────────────
+        from src.core.schemas import DeliveryStatus, Snapshot
+
+        result: dict[str, Snapshot | None] = {}
+        as_of = snapshot_data.get("as_of") or datetime.now(UTC)
+
+        # Determine staleness from data_freshness latency tier (if available)
+        # realtime → 60s, daily → 3600s, delayed → 86400s
+        staleness_seconds = 3600  # default: daily aggregation
+
+        for pkg in snapshot_data.get("packages", []):
+            package_id = pkg.get("package_id")
+            if not package_id:
+                continue
+
+            # Map delivery_status string to DeliveryStatus enum
+            raw_status = pkg.get("delivery_status")
+            delivery_status: DeliveryStatus | None = None
+            if raw_status:
+                try:
+                    delivery_status = DeliveryStatus(raw_status)
+                except ValueError:
+                    logger.debug(
+                        "[siteplug] Unknown delivery_status value: %s", raw_status
+                    )
+
+            result[package_id] = Snapshot(
+                as_of=as_of,
+                impressions=float(pkg.get("impressions", 0)),
+                spend=float(pkg.get("spend", 0.0)),
+                clicks=pkg.get("clicks"),
+                pacing_index=pkg.get("pacing_index"),
+                delivery_status=delivery_status,
+                staleness_seconds=staleness_seconds,
+                currency="USD",
+            )
+
+        return result
 
     def add_creative_assets(
         self,
@@ -1084,16 +1277,17 @@ class SiteplugAdapter(AdServerAdapter):
     ) -> list[AssetStatus]:
         """Add creative assets to a media buy.
 
-        Stub — wired in Task 06.
+        Delegates to :class:`SiteplugCreativeManager` which handles
+        Affilizz text-ad upserts and any future SSP creative uploads.
 
         Returns:
-            Empty list of asset statuses
+            List of :class:`AssetStatus` objects from the creative manager.
         """
         self.log(
-            f"Siteplug.add_creative_assets [STUB] for '{media_buy_id}'",
+            f"Siteplug.add_creative_assets for '{media_buy_id}': {len(assets)} asset(s)",
             dry_run_prefix=False,
         )
-        return []
+        return self.creative_manager.add_creative_assets(media_buy_id, assets, today)
 
     def associate_creatives(
         self,
@@ -1721,3 +1915,71 @@ class SiteplugAdapter(AdServerAdapter):
         if not self.inventory_manager._zone_cache:
             await self.inventory_manager._warm_cache()
         return self.inventory_manager.build_inventory_response()
+
+    # =========================================================================
+    # Private helpers
+    # =========================================================================
+
+    def _read_campaign_id(self, media_buy_id: str) -> int | None:
+        """Read ``siteplug_campaign_id`` from the first package's package_config.
+
+        The campaign ID is stored by ``SiteplugCampaignManager.provision_entity_stack``
+        (Task 02) under the key ``siteplug_campaign_id`` in the JSONB
+        ``package_config`` column of the first package for this media buy.
+
+        Args:
+            media_buy_id: AdCP media buy ID (``sp_{campaign_id}`` format).
+
+        Returns:
+            Siteplug campaign ID as int, or None if not found.
+        """
+        from src.core.database.database_session import get_db_session
+        from src.core.database.repositories.media_buy import MediaBuyRepository
+
+        try:
+            with get_db_session() as session:
+                repo = MediaBuyRepository(session, self.tenant_id)
+                packages = repo.get_packages(media_buy_id)
+                for pkg in packages:
+                    cfg = pkg.package_config or {}
+                    campaign_id = cfg.get("siteplug_campaign_id")
+                    if campaign_id is not None:
+                        return int(campaign_id)
+        except Exception as exc:
+            logger.error(
+                "[siteplug] _read_campaign_id: failed to read campaign_id for "
+                "media_buy_id=%s: %s",
+                media_buy_id,
+                exc,
+                exc_info=True,
+            )
+        return None
+
+    def _run_async(self, coro_factory) -> Any:
+        """Run an async coroutine factory synchronously in a dedicated thread.
+
+        The sales agent core calls adapter methods synchronously from within
+        an async event loop.  ``asyncio.run()`` would raise
+        "event loop already running", so we spin up a dedicated thread with
+        its own event loop instead — the same pattern used in
+        ``create_media_buy``.
+
+        Args:
+            coro_factory: Zero-argument callable that returns a coroutine.
+
+        Returns:
+            The coroutine's return value.
+
+        Raises:
+            Any exception raised by the coroutine.
+        """
+        def _run_in_new_loop():
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(coro_factory())
+            finally:
+                loop.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run_in_new_loop)
+            return future.result()
