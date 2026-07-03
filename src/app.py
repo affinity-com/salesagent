@@ -104,6 +104,7 @@ async def app_lifespan(app: FastAPI):
 
 # Build the MCP sub-application.
 # path="/" because we mount it at /mcp — routes inside are relative.
+# i.e. Mount("/mcp", mcp_app) strips "/mcp", leaving "/" which the inner Route("/") then matches.
 mcp_app = mcp.http_app(path="/")
 
 # Create the root FastAPI app with combined lifespans so that both
@@ -118,6 +119,30 @@ app = FastAPI(
 
 # Mount MCP at /mcp
 app.mount("/mcp", mcp_app)
+
+_original_app_call = app.__class__.__call__
+
+
+async def _patched_app_call(self, scope, receive, send):
+    """Rewrite bare ``/mcp`` → ``/mcp/`` at the raw ASGI level.
+
+    Starlette's ``Mount("/mcp")`` only matches paths whose regex is
+    ``^/mcp`` followed by ``/`` or end-of-string, so a POST to ``/mcp``
+    (no trailing slash) falls through to the catch-all Flask mount and
+    returns 404 instead of reaching the MCP handler.
+
+    Patching ``__call__`` on the FastAPI class runs before any Starlette
+    middleware or routing, so the rewrite is invisible to the rest of the
+    stack and avoids issuing a 307 redirect to the client.
+    """
+    if scope.get("type") == "http" and scope.get("path") == "/mcp":
+        scope = dict(scope)
+        scope["path"] = "/mcp/"
+        scope["raw_path"] = b"/mcp/"
+    await _original_app_call(self, scope, receive, send)
+
+
+app.__class__.__call__ = _patched_app_call  # type: ignore[method-assign]
 
 
 # ---------------------------------------------------------------------------
