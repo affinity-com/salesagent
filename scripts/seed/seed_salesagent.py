@@ -17,6 +17,13 @@ Optional environment variables:
                             registration API (POST /seller-agents/register).
                             When unset, the registration step is skipped
                             (tmp-provider running in open/dev mode).
+  WEBHOOK_ROUTER_ENDPOINT   Base URL of the webhook-router service.
+                            When set, all tenants' slack_webhook_url and
+                            slack_audit_webhook_url are pointed at
+                            {WEBHOOK_ROUTER_ENDPOINT}/webhook/inbound so that
+                            every salesagent notification is routed through the
+                            webhook-router for email delivery.
+                            When unset, the webhook-router wiring step is skipped.
 
 The salesagent schema must already exist (alembic runs at startup).
 
@@ -44,6 +51,12 @@ TMP_PROVIDER_ADMIN_KEY = os.environ.get("TMP_PROVIDER_ADMIN_KEY", "")
 # When set, the seed script passes it in the registration body so the same
 # key can be used by seed_tmp_provider.sh without any write-back to GitLab.
 TMP_PROVIDER_SEED_API_KEY = os.environ.get("TMP_PROVIDER_SEED_API_KEY", "")
+
+# ---------------------------------------------------------------------------
+# Webhook-router endpoint — must be set explicitly by the caller
+# ---------------------------------------------------------------------------
+
+WEBHOOK_ROUTER_ENDPOINT: str | None = os.environ.get("WEBHOOK_ROUTER_ENDPOINT")
 
 missing = [v for v, val in [("DATABASE_URL", DATABASE_URL), ("TMP_PROVIDER_ENDPOINT", TMP_PROVIDER_ENDPOINT)] if not val]
 if missing:
@@ -920,6 +933,43 @@ def sync_packages_to_tmp_provider(conn):
 
 
 # ---------------------------------------------------------------------------
+# Webhook-router wiring
+# ---------------------------------------------------------------------------
+
+def seed_webhook_router(conn) -> None:
+    """Point every tenant's Slack webhook URLs at the webhook-router.
+
+    Sets slack_webhook_url and slack_audit_webhook_url on all tenants to
+    {WEBHOOK_ROUTER_ENDPOINT}/webhook/inbound so that every salesagent
+    notification (task approvals, media buy events, audit logs, creative
+    reviews) is routed through the webhook-router for email delivery.
+
+    Idempotent: always overwrites with the current endpoint value so that
+    URL changes (e.g. staging → prod promotion) are picked up on re-seed.
+
+    Skipped when WEBHOOK_ROUTER_ENDPOINT is not set (local dev without a
+    deployed webhook-router).
+    """
+    if not WEBHOOK_ROUTER_ENDPOINT:
+        print("  ⚠️  WEBHOOK_ROUTER_ENDPOINT not set — skipping webhook-router wiring")
+        print("     Set ENVIRONMENT=staging|production or WEBHOOK_ROUTER_ENDPOINT explicitly.")
+        return
+
+    inbound_url = f"{WEBHOOK_ROUTER_ENDPOINT.rstrip('/')}/webhook/inbound"
+    print(f"  Wiring all tenants → {inbound_url}")
+
+    tenant_ids = [t[0] for t in TENANTS]
+    for tenant_id in tenant_ids:
+        run_sql(conn, f"""
+            UPDATE tenants
+               SET slack_webhook_url       = '{inbound_url}',
+                   slack_audit_webhook_url = '{inbound_url}',
+                   updated_at              = NOW()
+             WHERE tenant_id = '{tenant_id}'
+        """, f"{tenant_id}: slack_webhook_url + slack_audit_webhook_url → webhook-router")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -987,10 +1037,14 @@ def main():
 
     print("Step 11: Syncing acme-outdoor packages to tmp-provider...")
     sync_packages_to_tmp_provider(conn)
+    print()
+
+    print("Step 12: Wiring tenant webhooks → webhook-router...")
+    seed_webhook_router(conn)
     conn.close()
     print()
 
-    print("Step 12: Verification...")
+    print("Step 13: Verification...")
     conn2 = get_conn()
     for tenant_id, name, *_ in TENANTS:
         prod_n     = count(conn2, f"SELECT COUNT(*) FROM products WHERE tenant_id='{tenant_id}'")
@@ -1002,8 +1056,10 @@ def main():
     tmp_siteplug_n = count(conn2, "SELECT COUNT(*) FROM tmp_providers WHERE tenant_id='siteplug' AND status='active'")
     tmp_acme_n     = count(conn2, "SELECT COUNT(*) FROM tmp_providers WHERE tenant_id='acme-outdoor' AND status='active'")
     pkg_n          = count(conn2, "SELECT COUNT(*) FROM media_packages WHERE media_buy_id='mb-demo-q1'")
+    wh_n           = count(conn2, f"SELECT COUNT(*) FROM tenants WHERE slack_webhook_url IS NOT NULL")
     print(f"  siteplug: {tmp_siteplug_n} active TMP provider(s)")
     print(f"  acme-outdoor: {tmp_acme_n} active TMP provider(s), {pkg_n} demo package(s) in mb-demo-q1")
+    print(f"  webhook-router: {wh_n} tenant(s) wired" + (f" → {WEBHOOK_ROUTER_ENDPOINT}/webhook/inbound" if WEBHOOK_ROUTER_ENDPOINT else " (skipped — no endpoint configured)"))
     conn2.close()
 
     print()
@@ -1015,6 +1071,10 @@ def main():
     print("  Each tenant seeded with: products, pricing, auth props, publisher partners,")
     print("  currency limits (USD/EUR/GBP — required for create_media_buy)")
     print("  acme-outdoor: mb-demo-q1 + 10 demo packages synced to tmp-provider")
+    if WEBHOOK_ROUTER_ENDPOINT:
+        print(f"  Webhook routing: all tenants → {WEBHOOK_ROUTER_ENDPOINT}/webhook/inbound")
+    else:
+        print("  Webhook routing: skipped (set ENVIRONMENT=staging|production or WEBHOOK_ROUTER_ENDPOINT)")
     print("  Well-known tokens (dev/staging only):")
     for tenant_id, _, __, ___, ____, token in TENANTS:
         print(f"    {tenant_id}: {token}")
