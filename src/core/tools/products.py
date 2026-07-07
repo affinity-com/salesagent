@@ -6,7 +6,9 @@ shared implementation pattern from CLAUDE.md.
 
 import logging
 import os
+import re
 import time
+from functools import lru_cache
 from typing import Annotated, Any, cast
 
 from adcp import FormatId, ProductFilters
@@ -40,32 +42,117 @@ from src.services.policy_check_service import PolicyCheckService, PolicyStatus
 logger = logging.getLogger(__name__)
 
 
+# Words that signal geo is intentionally unrestricted (not tied to any specific
+# ISO country). Kept separate from pycountry lookups since these aren't countries.
+_UNRESTRICTED_GEO_PHRASES = ("global", "worldwide", "all countries", "all markets")
+
+
+@lru_cache(maxsize=1)
+def _country_name_pattern() -> "re.Pattern[str]":
+    """Build a single compiled regex matching any ISO-3166-1 country name/variant.
+
+    Uses pycountry (the maintained ISO-3166-1 country database) instead of a
+    hand-rolled list, so all ~250 countries are recognised — not just the
+    handful someone remembered to type in. Cached at first call (module-level
+    memoisation) since building the name set and compiling the regex is not
+    free and this is called on every get_products request.
+
+    Word-boundary anchored (\\b...\\b) to avoid substring false positives
+    (e.g. matching "chad" inside "chadwick" or "oman" inside "woman").
+    """
+    import pycountry
+
+    names: set[str] = set()
+    for country in pycountry.countries:
+        names.add(country.name)
+        common = getattr(country, "common_name", None)
+        if common:
+            names.add(common)
+        official = getattr(country, "official_name", None)
+        if official:
+            names.add(official)
+
+    # Longest names first so e.g. "United States of America" matches before
+    # a shorter alias would truncate the match (regex alternation is greedy
+    # left-to-right, not longest-match, without this ordering).
+    sorted_names = sorted(names, key=len, reverse=True)
+    escaped = [re.escape(name) for name in sorted_names]
+    pattern = r"\b(?:" + "|".join(escaped) + r")\b"
+    return re.compile(pattern, re.IGNORECASE)
+
+
+def _brief_mentions_a_country(brief_lower: str) -> bool:
+    """Return True if brief_lower contains any ISO-3166-1 country name.
+
+    brief_lower must already be lowercased by the caller; matching is
+    case-insensitive regardless via re.IGNORECASE, but callers pass the
+    already-lowered brief for consistency with the other keyword checks
+    in this module.
+    """
+    return bool(_country_name_pattern().search(brief_lower))
+
+
+@lru_cache(maxsize=None)
+def _keyword_pattern(keywords: tuple[str, ...]) -> "re.Pattern[str]":
+    """Compile a word-boundary-anchored regex for a tuple of short keywords.
+
+    Plain substring matching on short tokens like "brand", "cpa", "cpm",
+    "eur", "reach" produces false positives: "brand" matches inside
+    "Brandon", "eur" matches inside "neuromarketing", "cpa" could match
+    inside a longer acronym, etc. Word-boundary anchoring (\\b) ensures
+    these only match as standalone words/acronyms.
+
+    lru_cache keys on the keywords tuple so each distinct keyword set
+    (KPI keywords vs. budget keywords) gets its own compiled pattern,
+    built once and reused across every get_products call.
+    """
+    escaped = [re.escape(w) for w in keywords]
+    pattern = r"\b(?:" + "|".join(escaped) + r")\b"
+    return re.compile(pattern, re.IGNORECASE)
+
+
+def _contains_any_keyword(text_lower: str, keywords: tuple[str, ...]) -> bool:
+    """Word-boundary-safe check for any keyword in text_lower.
+
+    text_lower must already be lowercased; matching is case-insensitive
+    regardless via re.IGNORECASE (kept for consistency with the rest of
+    this module's calling convention).
+    """
+    return bool(_keyword_pattern(keywords).search(text_lower))
+
+
 def _check_brief_completeness(brief_text: str, req: Any) -> list:
-    """Return a list of IncompleteItem-shaped objects if the brief is too thin.
+    """Return a list of IncompleteItem-shaped dicts if the brief is too thin.
 
     Empty list means the brief is sufficient — no incomplete[] will be emitted.
     Scope is always "products": we signal that curation quality is limited.
 
     Uses keyword heuristics only — no LLM call.
 
+    NOTE: Returns plain dicts, not adcp.types.IncompleteItem instances.
+    IncompleteItem is defined in adcp's internal generated_poc/_generated
+    modules but is NOT re-exported from the public `adcp.types` package
+    (the module explicitly warns against importing from those internal
+    paths). Pydantic coerces these dicts into the correct IncompleteItem
+    type automatically when GetProductsResponse validates the `incomplete`
+    field — see GetProductsResponse(incomplete=...) call site below.
+
     Args:
         brief_text: The raw brief string passed to get_products.
         req: The GetProductsRequest object (used to read structured filters.countries).
 
     Returns:
-        List of IncompleteItem objects (may be empty).
+        List of dicts shaped like IncompleteItem (may be empty).
     """
-    from adcp.types import IncompleteItem  # local import — adcp is always available
-
     if not brief_text or len(brief_text.strip()) < 20:
         return [
-            IncompleteItem(
-                scope="products",
-                description=(
+            {
+                "scope": "products",
+                "description": (
                     "Brief is too short to curate relevant products. "
                     "Please describe your campaign objective, target geography, and KPI."
                 ),
-            )
+            }
         ]
 
     brief_lower = brief_text.lower()
@@ -73,42 +160,34 @@ def _check_brief_completeness(brief_text: str, req: Any) -> list:
 
     # Geo check: prefer structured filters.countries (ISO-3166-1 alpha-2 list set by
     # buyer agent). Keyword fallback is a last-resort heuristic for free-text briefs
-    # where the buyer agent did not extract a structured country list.
-    # "global" / "worldwide" are accepted as a signal that geo is intentionally unrestricted.
+    # where the buyer agent did not extract a structured country list. Uses the
+    # full pycountry ISO-3166-1 database (~250 countries + common/official name
+    # variants) rather than a hand-picked subset, so briefs mentioning e.g. Spain,
+    # Mexico, Singapore, or the UAE are recognised just as well as India or the US.
+    # "global" / "worldwide" are accepted separately as a signal that geo is
+    # intentionally unrestricted (these are not ISO country names).
     structured_countries = getattr(getattr(req, "filters", None), "countries", None) or []
     has_geo = bool(
         structured_countries
-        or any(
-            w in brief_lower
-            for w in (
-                "india",
-                "united states",
-                "united kingdom",
-                "germany",
-                "france",
-                "netherlands",
-                "australia",
-                "canada",
-                "brazil",
-                "japan",
-                "global",
-                "worldwide",
-                "all countries",
-                "all markets",
-            )
-        )
+        or any(phrase in brief_lower for phrase in _UNRESTRICTED_GEO_PHRASES)
+        or _brief_mentions_a_country(brief_lower)
     )
 
-    has_kpi = any(
-        w in brief_lower
-        for w in (
+    # KPI check: word-boundary matched to avoid false positives like "brand"
+    # inside "Brandon" or "cpa" as a substring of an unrelated acronym.
+    has_kpi = _contains_any_keyword(
+        brief_lower,
+        (
             "install",
+            "installs",
             "cpi",
             "conversion",
+            "conversions",
             "cpa",
             "awareness",
             "reach",
             "click",
+            "clicks",
             "ctr",
             "cpc",
             "traffic",
@@ -116,17 +195,19 @@ def _check_brief_completeness(brief_text: str, req: Any) -> list:
             "brand",
             "roas",
             "cpm",
-        )
+        ),
     )
 
     # Budget check: package.budget is required in AdCP — if the brief carries no budget
     # signal the buyer agent cannot call create_media_buy.
+    # "$" is checked separately via plain substring match — it's a non-word
+    # character with no reliable word boundary, and unambiguous as a currency signal.
     extracted_budget = getattr(req, "extracted_budget_usd", None)
     has_budget = bool(
         extracted_budget is not None
-        or any(
-            w in brief_lower
-            for w in ("budget", "$", "usd", "eur", "gbp", "spend", "investment")
+        or "$" in brief_lower
+        or _contains_any_keyword(
+            brief_lower, ("budget", "usd", "eur", "gbp", "spend", "investment")
         )
     )
 
@@ -141,14 +222,14 @@ def _check_brief_completeness(brief_text: str, req: Any) -> list:
 
     if missing:
         return [
-            IncompleteItem(
-                scope="products",
-                description=(
+            {
+                "scope": "products",
+                "description": (
                     "Brief is missing: "
                     + ", ".join(missing)
                     + ". Products returned may not be well-matched to your campaign."
                 ),
-            )
+            }
         ]
 
     return []
@@ -912,11 +993,13 @@ async def _get_products_impl(
     # Check brief completeness — emit incomplete[] if brief is thin (task-03b).
     # Advisory only: products are still returned; incomplete[] guides the buyer agent
     # to prompt the advertiser for missing fields before calling create_media_buy.
+    # _check_brief_completeness returns plain dicts (see its docstring for why) —
+    # GetProductsResponse coerces them into IncompleteItem via Pydantic validation.
     incomplete_items = _check_brief_completeness(brief_text, req)
     if incomplete_items:
         logger.info(
             "[GET_PRODUCTS] Brief thin — emitting incomplete[]: %s",
-            incomplete_items[0].description[:80],
+            incomplete_items[0]["description"][:80],
         )
 
     resp = GetProductsResponse(

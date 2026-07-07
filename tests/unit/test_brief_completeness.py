@@ -1,5 +1,15 @@
 """Unit tests for task-03b: _check_brief_completeness() in products.py.
 
+REGRESSION NOTE: An earlier version of this test file only tested a local
+mirror of the completeness logic and never imported or called the real
+_check_brief_completeness() function. That mirror used
+`adcp.types.IncompleteItem` directly, masking a real bug: IncompleteItem is
+defined in adcp's internal generated_poc/_generated modules but is NOT
+re-exported from the public `adcp.types` package, so the real function
+raised ImportError at runtime. TestRealCheckBriefCompletenessImport below
+imports and calls the actual function from src.core.tools.products to
+guard against this class of bug recurring.
+
 Acceptance criteria from task-03b-salesagent-incomplete-handling.md:
 - get_products(brief="") → incomplete: [{scope: "products", description: "..."}]
 - get_products(brief="CPI campaign for food delivery app, India, budget $50k") → no incomplete[]
@@ -46,7 +56,14 @@ class _IncompleteItem:
 
 
 def _check_brief_completeness(brief_text: str, req: MagicMock) -> list:
-    """Replicate the logic from products.py for isolated unit testing."""
+    """Replicate the logic from products.py for isolated unit testing.
+
+    Geo check delegates to the real _brief_mentions_a_country() (pycountry-backed)
+    so this mirror stays in sync with the production ISO-3166-1 matching behaviour
+    instead of drifting with its own hand-rolled country list.
+    """
+    from src.core.tools.products import _brief_mentions_a_country, _contains_any_keyword
+
     if not brief_text or len(brief_text.strip()) < 20:
         return [
             _IncompleteItem(
@@ -64,30 +81,28 @@ def _check_brief_completeness(brief_text: str, req: MagicMock) -> list:
     structured_countries = getattr(getattr(req, "filters", None), "countries", None) or []
     has_geo = bool(
         structured_countries
-        or any(
-            w in brief_lower
-            for w in (
-                "india", "united states", "united kingdom", "germany", "france",
-                "netherlands", "australia", "canada", "brazil", "japan",
-                "global", "worldwide", "all countries", "all markets",
-            )
-        )
+        or any(phrase in brief_lower for phrase in ("global", "worldwide", "all countries", "all markets"))
+        or _brief_mentions_a_country(brief_lower)
     )
 
-    has_kpi = any(
-        w in brief_lower
-        for w in (
-            "install", "cpi", "conversion", "cpa", "awareness", "reach",
-            "click", "ctr", "cpc", "traffic", "purchase", "brand", "roas", "cpm",
-        )
+    # Word-boundary matched (delegates to the real _contains_any_keyword) to
+    # avoid false positives like "brand" inside "Brandon" or "cpa" as a
+    # substring of an unrelated acronym.
+    has_kpi = _contains_any_keyword(
+        brief_lower,
+        (
+            "install", "installs", "cpi", "conversion", "conversions", "cpa",
+            "awareness", "reach", "click", "clicks", "ctr", "cpc", "traffic",
+            "purchase", "brand", "roas", "cpm",
+        ),
     )
 
     extracted_budget = getattr(req, "extracted_budget_usd", None)
     has_budget = bool(
         extracted_budget is not None
-        or any(
-            w in brief_lower
-            for w in ("budget", "$", "usd", "eur", "gbp", "spend", "investment")
+        or "$" in brief_lower
+        or _contains_any_keyword(
+            brief_lower, ("budget", "usd", "eur", "gbp", "spend", "investment")
         )
     )
 
@@ -348,3 +363,222 @@ class TestCheckBriefCompletenessDisplayCampaign:
         result = _check_brief_completeness(brief, req)
         assert len(result) == 1
         assert "missing" in result[0].description
+
+
+# ---------------------------------------------------------------------------
+# Regression: import and call the REAL function, and validate it round-trips
+# through the real GetProductsResponse Pydantic model. This is the test that
+# would have caught the ImportError bug (adcp.types.IncompleteItem is not
+# importable — the real function used to raise ImportError on every call).
+# ---------------------------------------------------------------------------
+
+class TestRealCheckBriefCompletenessImport:
+    """Import and exercise the actual products.py implementation.
+
+    Unlike the mirror-based tests above (which duplicate the logic locally
+    for fast, dependency-free testing), these tests import the real
+    _check_brief_completeness from src.core.tools.products and construct a
+    real GetProductsResponse to confirm the returned items are accepted by
+    Pydantic validation end-to-end.
+    """
+
+    def test_real_function_importable(self):
+        """The real function must be importable without raising ImportError."""
+        from src.core.tools.products import _check_brief_completeness as real_fn
+        assert callable(real_fn)
+
+    def test_real_function_short_brief_returns_dict_shaped_item(self):
+        from src.core.tools.products import _check_brief_completeness as real_fn
+
+        req = _make_req()
+        result = real_fn("", req)
+        assert len(result) == 1
+        # Must be dict-shaped (not an unimportable class instance) so it can
+        # be passed straight into GetProductsResponse(incomplete=...).
+        assert isinstance(result[0], dict)
+        assert result[0]["scope"] == "products"
+        assert "too short" in result[0]["description"]
+
+    def test_real_function_complete_brief_returns_empty_list(self):
+        from src.core.tools.products import _check_brief_completeness as real_fn
+
+        req = _make_req()
+        result = real_fn("CPI campaign for food delivery app, India, budget $50k", req)
+        assert result == []
+
+    def test_real_function_result_coerces_into_get_products_response(self):
+        """The critical regression check: incomplete_items must be accepted
+        by the real GetProductsResponse Pydantic model without raising.
+
+        Before the fix, _check_brief_completeness raised ImportError before
+        ever returning — this test would have failed with that error.
+        """
+        from src.core.schemas import GetProductsResponse
+        from src.core.tools.products import _check_brief_completeness as real_fn
+
+        req = _make_req()
+        incomplete_items = real_fn("too short", req)
+        assert incomplete_items  # non-empty — "too short" is < 20 chars
+
+        # Must not raise — Pydantic coerces the list[dict] into list[IncompleteItem]
+        resp = GetProductsResponse(
+            products=[],
+            errors=None,
+            context=None,
+            incomplete=incomplete_items or None,
+        )
+        assert resp.incomplete is not None
+        assert len(resp.incomplete) == 1
+        assert resp.incomplete[0].scope.value == "products"
+
+    def test_real_function_empty_result_passes_none_to_response(self):
+        """When the brief is complete, incomplete=None must round-trip as None."""
+        from src.core.schemas import GetProductsResponse
+        from src.core.tools.products import _check_brief_completeness as real_fn
+
+        req = _make_req()
+        incomplete_items = real_fn(
+            "CPI campaign for food delivery app, India, budget $50k", req
+        )
+        assert incomplete_items == []
+
+        resp = GetProductsResponse(
+            products=[],
+            errors=None,
+            context=None,
+            incomplete=incomplete_items or None,
+        )
+        assert resp.incomplete is None
+
+
+# ---------------------------------------------------------------------------
+# pycountry-backed geo matching — replaces the old hand-rolled 14-country list.
+# Regression coverage: the old list only recognised India, US, UK, Germany,
+# France, Netherlands, Australia, Canada, Brazil, Japan — missing Spain,
+# Mexico, Singapore, UAE, Indonesia, Italy, China, South Korea, and ~230 more.
+# ---------------------------------------------------------------------------
+
+class TestPycountryGeoMatching:
+    """Verify the full ISO-3166-1 country database is recognised, not just
+    the handful of countries that happened to be hand-typed into a list."""
+
+    @pytest.mark.parametrize(
+        "country_phrase",
+        [
+            "Spain", "Mexico", "Singapore", "United Arab Emirates", "Indonesia",
+            "Italy", "China", "South Korea", "Sweden", "Poland", "Vietnam",
+            "Nigeria", "Argentina", "Thailand", "Philippines", "Egypt",
+        ],
+    )
+    def test_previously_unrecognised_countries_now_satisfy_geo(self, country_phrase):
+        """Countries absent from the old hardcoded list must now be recognised."""
+        req = _make_req()
+        brief = f"CPI campaign targeting {country_phrase}, budget $25k"
+        result = _check_brief_completeness(brief, req)
+        assert result == [], f"{country_phrase} should satisfy the geo check"
+
+    def test_word_boundary_chad_not_matched_inside_chadwick(self):
+        """'Chad' (a real country) must not false-match inside 'Chadwick'."""
+        req = _make_req()
+        brief = "Chadwick brand awareness campaign for our new product line"
+        result = _check_brief_completeness(brief, req)
+        assert len(result) == 1
+        assert "geography" in result[0].description.lower()
+
+    def test_word_boundary_oman_not_matched_inside_woman(self):
+        """'Oman' (a real country) must not false-match inside 'woman'."""
+        req = _make_req()
+        brief = "Woman-focused fashion campaign, budget $15k, awareness goal"
+        result = _check_brief_completeness(brief, req)
+        assert len(result) == 1
+        assert "geography" in result[0].description.lower()
+
+    def test_actual_chad_and_oman_are_recognised(self):
+        """Sanity check: Chad and Oman as standalone words ARE recognised."""
+        req = _make_req()
+        brief = "CPI campaign targeting Chad and Oman markets, budget $10k"
+        result = _check_brief_completeness(brief, req)
+        assert result == []
+
+    def test_case_insensitive_country_matching(self):
+        """Country matching must be case-insensitive."""
+        req = _make_req()
+        brief = "cpc campaign targeting SPAIN, budget $5k"
+        result = _check_brief_completeness(brief, req)
+        assert result == []
+
+    def test_real_function_recognises_expanded_country_set(self):
+        """Import the real function and confirm it also uses the expanded set
+        (not just the local mirror in this test file)."""
+        from src.core.tools.products import _check_brief_completeness as real_fn
+
+        req = _make_req()
+        result = real_fn("CPA campaign targeting Vietnam, budget $8k", req)
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# Word-boundary KPI/budget keyword matching — replaces fragile substring checks.
+# Regression coverage: "brand" used to match inside "Brandon", "eur" used to
+# match inside "neuromarketing", producing false positives that made
+# _check_brief_completeness() think a KPI/budget signal was present when it
+# was actually just a coincidental substring of an unrelated word.
+# ---------------------------------------------------------------------------
+
+class TestWordBoundaryKeywordMatching:
+    """Verify KPI and budget keyword checks use word boundaries, not raw substrings."""
+
+    def test_brandon_does_not_false_match_brand_kpi_keyword(self):
+        """'Brandon' must not satisfy the KPI check via substring match on 'brand'."""
+        req = _make_req()
+        brief = "We are targeting fans of Brandon in this campaign, India, budget $5k"
+        result = _check_brief_completeness(brief, req)
+        # Geo (India) + budget ($5k) present, but no real KPI keyword -> incomplete[]
+        assert len(result) == 1
+        assert "KPI" in result[0].description or "objective" in result[0].description
+
+    def test_neuromarketing_does_not_false_match_eur_budget_keyword(self):
+        """'neuromarketing' must not satisfy the budget check via substring match on 'eur'."""
+        req = _make_req()
+        brief = "Neuromarketing research campaign targeting India, CPC goal"
+        result = _check_brief_completeness(brief, req)
+        # Geo (India) + KPI (CPC) present, but no real budget keyword -> incomplete[]
+        assert len(result) == 1
+        assert "budget" in result[0].description.lower()
+
+    def test_real_brand_keyword_still_matches_as_standalone_word(self):
+        """A genuine standalone 'brand' keyword must still satisfy the KPI check."""
+        req = _make_req()
+        brief = "Brand awareness campaign in India, budget $10k"
+        result = _check_brief_completeness(brief, req)
+        assert result == []
+
+    def test_real_eur_currency_still_matches_as_standalone_word(self):
+        """A genuine standalone 'EUR' currency code must still satisfy the budget check."""
+        req = _make_req()
+        brief = "CPC campaign in Germany, spend EUR 5000"
+        result = _check_brief_completeness(brief, req)
+        assert result == []
+
+    def test_dollar_sign_still_satisfies_budget_check(self):
+        """The '$' symbol (non-word character) must still be recognised via
+        plain substring match since word-boundary regex can't anchor to it."""
+        req = _make_req()
+        brief = "CPI campaign for food delivery app, India, $50,000 total"
+        result = _check_brief_completeness(brief, req)
+        assert result == []
+
+    def test_real_function_word_boundary_regression(self):
+        """Import the real function to confirm the fix applies end-to-end."""
+        from src.core.tools.products import _check_brief_completeness as real_fn
+
+        req = _make_req()
+        brief = "Neuromarketing campaign for Brandon's brand in India"
+        result = real_fn(brief, req)
+        # Geo present (India); "brand" IS a real standalone word here so KPI
+        # is satisfied; but no budget signal -> incomplete[] for budget only.
+        # The real function returns plain dicts (see _check_brief_completeness
+        # docstring for why), not objects with a .description attribute.
+        assert len(result) == 1
+        assert "budget" in result[0]["description"].lower()
+        assert "geography" not in result[0]["description"].lower()
