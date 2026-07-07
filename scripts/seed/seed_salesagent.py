@@ -58,6 +58,18 @@ TMP_PROVIDER_SEED_API_KEY = os.environ.get("TMP_PROVIDER_SEED_API_KEY", "")
 
 WEBHOOK_ROUTER_ENDPOINT: str | None = os.environ.get("WEBHOOK_ROUTER_ENDPOINT")
 
+# ---------------------------------------------------------------------------
+# Brand-agent connection config — optional, seeded into adapter_config.config_json
+# for the siteplug tenant so that king-domain whitelisting can fetch related
+# domains from the brand-agent at provisioning time (task02c).
+#
+# Resolution: env vars set by the seed CI job (BRAND_AGENT_URL / BRAND_AGENT_API_KEY).
+# When unset the seed step is skipped — the fields can be set manually via Admin UI.
+# ---------------------------------------------------------------------------
+SITEPLUG_BRAND_AGENT_URL: str = os.environ.get("BRAND_AGENT_URL", "")
+SITEPLUG_BRAND_AGENT_API_KEY: str = os.environ.get("BRAND_AGENT_API_KEY", "")
+SITEPLUG_BRAND_AGENT_TENANT_ID: str = os.environ.get("BRAND_AGENT_TENANT_ID", "siteplug")
+
 missing = [v for v, val in [("DATABASE_URL", DATABASE_URL), ("TMP_PROVIDER_ENDPOINT", TMP_PROVIDER_ENDPOINT)] if not val]
 if missing:
     print(f"❌ Missing required environment variables: {', '.join(missing)}", file=sys.stderr)
@@ -936,6 +948,40 @@ def sync_packages_to_tmp_provider(conn):
 # Webhook-router wiring
 # ---------------------------------------------------------------------------
 
+def seed_siteplug_connection_config(conn) -> None:
+    """Seed brand-agent connection fields into adapter_config.config_json for siteplug.
+
+    Merges BRAND_AGENT_URL / BRAND_AGENT_API_KEY / BRAND_AGENT_TENANT_ID into the
+    existing config_json JSONB without overwriting other fields (base_url, api_key, etc.).
+
+    Idempotent: safe to re-run — always overwrites the brand-agent sub-fields with the
+    current env var values so that URL changes (e.g. staging → prod promotion) are
+    picked up on re-seed.
+
+    Skipped when BRAND_AGENT_URL is not set (local dev without a deployed brand-agent,
+    or when the fields are managed manually via Admin UI).
+    """
+    if not SITEPLUG_BRAND_AGENT_URL:
+        print("  ⚠️  BRAND_AGENT_URL not set — skipping siteplug brand-agent connection config seed")
+        print("     Set BRAND_AGENT_URL (and optionally BRAND_AGENT_API_KEY, BRAND_AGENT_TENANT_ID)")
+        print("     or configure via Admin UI → Ad Server → Siteplug → Connection Config.")
+        return
+
+    print(f"  Seeding siteplug brand-agent connection config → {SITEPLUG_BRAND_AGENT_URL}")
+    # Use jsonb_set / || merge so we never clobber base_url / api_key / timeout etc.
+    run_sql(conn, f"""
+        UPDATE adapter_config
+           SET config_json = COALESCE(config_json, '{{}}'::jsonb) || jsonb_build_object(
+                   'brand_agent_url',       '{SITEPLUG_BRAND_AGENT_URL}',
+                   'brand_agent_api_key',   '{SITEPLUG_BRAND_AGENT_API_KEY}',
+                   'brand_agent_tenant_id', '{SITEPLUG_BRAND_AGENT_TENANT_ID}'
+               ),
+               updated_at = NOW()
+         WHERE tenant_id = 'siteplug'
+           AND adapter_type = 'siteplug'
+    """, f"siteplug adapter_config.config_json brand-agent fields seeded (tenant_id={SITEPLUG_BRAND_AGENT_TENANT_ID})")
+
+
 def seed_webhook_router(conn) -> None:
     """Point every tenant's Slack webhook URLs at the webhook-router.
 
@@ -1041,10 +1087,14 @@ def main():
 
     print("Step 12: Wiring tenant webhooks → webhook-router...")
     seed_webhook_router(conn)
+    print()
+
+    print("Step 13: Seeding siteplug brand-agent connection config (task02c)...")
+    seed_siteplug_connection_config(conn)
     conn.close()
     print()
 
-    print("Step 13: Verification...")
+    print("Step 14: Verification...")
     conn2 = get_conn()
     for tenant_id, name, *_ in TENANTS:
         prod_n     = count(conn2, f"SELECT COUNT(*) FROM products WHERE tenant_id='{tenant_id}'")
@@ -1075,6 +1125,10 @@ def main():
         print(f"  Webhook routing: all tenants → {WEBHOOK_ROUTER_ENDPOINT}/webhook/inbound")
     else:
         print("  Webhook routing: skipped (set ENVIRONMENT=staging|production or WEBHOOK_ROUTER_ENDPOINT)")
+    if SITEPLUG_BRAND_AGENT_URL:
+        print(f"  Siteplug brand-agent: {SITEPLUG_BRAND_AGENT_URL} (tenant_id={SITEPLUG_BRAND_AGENT_TENANT_ID})")
+    else:
+        print("  Siteplug brand-agent: skipped (set BRAND_AGENT_URL or configure via Admin UI)")
     print("  Well-known tokens (dev/staging only):")
     for tenant_id, _, __, ___, ____, token in TENANTS:
         print(f"    {tenant_id}: {token}")

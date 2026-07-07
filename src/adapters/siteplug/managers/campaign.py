@@ -64,6 +64,7 @@ class SiteplugCampaignManager:
         budget_type: int | None = None,
         tenant_id: str,
         idempotency_key: str | None = None,
+        related_domains: list[str] | None = None,
     ) -> int:
         """Provision the full entity stack and return the Siteplug campaign_id.
 
@@ -92,6 +93,9 @@ class SiteplugCampaignManager:
             budget_type: Budget type int (1–5) — required for non-RTB.
             tenant_id: Tenant ID for DB session.
             idempotency_key: Optional idempotency key forwarded to the SSP API.
+            related_domains: Optional additional TLD/geo domains from brand agent
+                enrichment (e.g. ["nike.fr", "nike.com.au"]). Merged with
+                brand_domain when whitelisting king domains for SDC campaigns.
 
         Returns:
             Siteplug campaign_id (int).
@@ -123,6 +127,7 @@ class SiteplugCampaignManager:
                 campaign_type=campaign_type,
                 tenant_id=tenant_id,
                 idempotency_key=idempotency_key,
+                related_domains=related_domains,
             )
             return campaign_id
 
@@ -153,6 +158,7 @@ class SiteplugCampaignManager:
             budget_type=budget_type,
             tenant_id=tenant_id,
             idempotency_key=idempotency_key,
+            related_domains=related_domains,
         )
 
     # =========================================================================
@@ -172,6 +178,7 @@ class SiteplugCampaignManager:
         campaign_type: str = "SDC",
         tenant_id: str,
         idempotency_key: str | None,
+        related_domains: list[str] | None = None,
     ) -> int:
         """Call POST /onboard and parse the 207 response.
 
@@ -252,7 +259,11 @@ class SiteplugCampaignManager:
 
         # Task 02c: whitelist king domains for SDC campaigns after brand creation.
         if campaign_type == "SDC" and brand_domain:
-            await self._whitelist_king_domains(brand_id=brand_id, brand_domain=brand_domain)
+            await self._whitelist_king_domains(
+                brand_id=brand_id,
+                brand_domain=brand_domain,
+                related_domains=related_domains,
+            )
 
         self._persist_entity_ids(
             media_buy_id=media_buy_id,
@@ -295,6 +306,7 @@ class SiteplugCampaignManager:
         budget_type: int | None,
         tenant_id: str,
         idempotency_key: str | None,
+        related_domains: list[str] | None = None,
     ) -> int:
         """Provision entities sequentially: Platform → Brand → Advertiser → Campaign.
 
@@ -371,7 +383,11 @@ class SiteplugCampaignManager:
             # Required so the SD traffic matching engine can associate publisher
             # traffic with the correct brand. Non-fatal — ops can whitelist manually.
             if campaign_type == "SDC" and brand_domain:
-                await self._whitelist_king_domains(brand_id=brand_id, brand_domain=brand_domain)
+                await self._whitelist_king_domains(
+                    brand_id=brand_id,
+                    brand_domain=brand_domain,
+                    related_domains=related_domains,
+                )
         else:
             brand_id = int(brand_id)
             self._log(f"[siteplug] brand already provisioned (brand_id={brand_id}), skipping.")
@@ -446,7 +462,13 @@ class SiteplugCampaignManager:
     # Task 02c — King domain whitelisting helper
     # =========================================================================
 
-    async def _whitelist_king_domains(self, *, brand_id: int, brand_domain: str) -> None:
+    async def _whitelist_king_domains(
+        self,
+        *,
+        brand_id: int,
+        brand_domain: str,
+        related_domains: list[str] | None = None,
+    ) -> None:
         """Whitelist king domains for a brand via PUT /brands/{id}.
 
         Called after brand creation for SDC campaigns only. Non-fatal — a
@@ -456,8 +478,17 @@ class SiteplugCampaignManager:
         Args:
             brand_id: Siteplug brand_id.
             brand_domain: Primary brand domain (e.g. "nike.com").
+            related_domains: Optional additional TLD/geo domains from brand agent
+                enrichment (e.g. ["nike.fr", "nike.com.au"]). Deduplicated and
+                merged with brand_domain before sending to the SSP API.
         """
-        domains = [brand_domain]
+        # Deduplicate: primary domain first, then any related domains not already present
+        seen: set[str] = {brand_domain}
+        domains: list[str] = [brand_domain]
+        for d in (related_domains or []):
+            if d and d not in seen:
+                seen.add(d)
+                domains.append(d)
         self._log(
             f"[siteplug] Task 02c: whitelisting king domains for brand_id={brand_id}: {domains}"
         )

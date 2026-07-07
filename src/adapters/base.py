@@ -331,6 +331,33 @@ class AdServerAdapter(ABC):
         """
         return {"cpm"}
 
+    def enrich_products(
+        self,
+        products: list,
+        brand_domain: str | None,
+    ) -> list:
+        """Enrich products with adapter-specific ext data before returning from get_products.
+
+        Called after product assembly and filtering in _get_products_impl, before the
+        GetProductsResponse is constructed. Allows adapters to set product.ext fields
+        that the buyer-agent should pass through to create_media_buy unchanged.
+
+        Default implementation is a no-op (returns products unchanged).
+        Override in adapter subclasses to add adapter-specific enrichment.
+
+        Fail-open contract: implementations MUST catch their own exceptions and return
+        the (possibly partially enriched) product list rather than propagating errors.
+        A brand-agent outage must never block get_products.
+
+        Args:
+            products: List of Product objects after filtering/ranking.
+            brand_domain: Brand domain from req.brand.domain (may be None).
+
+        Returns:
+            The same list (mutated in-place is fine) with ext fields populated.
+        """
+        return products
+
     def get_targeting_capabilities(self) -> TargetingCapabilities:
         """Return targeting capabilities this adapter supports.
 
