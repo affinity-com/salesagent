@@ -40,6 +40,120 @@ from src.services.policy_check_service import PolicyCheckService, PolicyStatus
 logger = logging.getLogger(__name__)
 
 
+def _check_brief_completeness(brief_text: str, req: Any) -> list:
+    """Return a list of IncompleteItem-shaped objects if the brief is too thin.
+
+    Empty list means the brief is sufficient — no incomplete[] will be emitted.
+    Scope is always "products": we signal that curation quality is limited.
+
+    Uses keyword heuristics only — no LLM call.
+
+    Args:
+        brief_text: The raw brief string passed to get_products.
+        req: The GetProductsRequest object (used to read structured filters.countries).
+
+    Returns:
+        List of IncompleteItem objects (may be empty).
+    """
+    from adcp.types import IncompleteItem  # local import — adcp is always available
+
+    if not brief_text or len(brief_text.strip()) < 20:
+        return [
+            IncompleteItem(
+                scope="products",
+                description=(
+                    "Brief is too short to curate relevant products. "
+                    "Please describe your campaign objective, target geography, and KPI."
+                ),
+            )
+        ]
+
+    brief_lower = brief_text.lower()
+    missing: list[str] = []
+
+    # Geo check: prefer structured filters.countries (ISO-3166-1 alpha-2 list set by
+    # buyer agent). Keyword fallback is a last-resort heuristic for free-text briefs
+    # where the buyer agent did not extract a structured country list.
+    # "global" / "worldwide" are accepted as a signal that geo is intentionally unrestricted.
+    structured_countries = getattr(getattr(req, "filters", None), "countries", None) or []
+    has_geo = bool(
+        structured_countries
+        or any(
+            w in brief_lower
+            for w in (
+                "india",
+                "united states",
+                "united kingdom",
+                "germany",
+                "france",
+                "netherlands",
+                "australia",
+                "canada",
+                "brazil",
+                "japan",
+                "global",
+                "worldwide",
+                "all countries",
+                "all markets",
+            )
+        )
+    )
+
+    has_kpi = any(
+        w in brief_lower
+        for w in (
+            "install",
+            "cpi",
+            "conversion",
+            "cpa",
+            "awareness",
+            "reach",
+            "click",
+            "ctr",
+            "cpc",
+            "traffic",
+            "purchase",
+            "brand",
+            "roas",
+            "cpm",
+        )
+    )
+
+    # Budget check: package.budget is required in AdCP — if the brief carries no budget
+    # signal the buyer agent cannot call create_media_buy.
+    extracted_budget = getattr(req, "extracted_budget_usd", None)
+    has_budget = bool(
+        extracted_budget is not None
+        or any(
+            w in brief_lower
+            for w in ("budget", "$", "usd", "eur", "gbp", "spend", "investment")
+        )
+    )
+
+    if not has_geo:
+        missing.append("target geography (e.g. India, United States)")
+    if not has_kpi:
+        missing.append("campaign objective or KPI (e.g. app installs, brand awareness, conversions)")
+    if not has_budget:
+        missing.append(
+            "campaign budget (required to create a media buy — e.g. $10,000 total or $5,000/month)"
+        )
+
+    if missing:
+        return [
+            IncompleteItem(
+                scope="products",
+                description=(
+                    "Brief is missing: "
+                    + ", ".join(missing)
+                    + ". Products returned may not be well-matched to your campaign."
+                ),
+            )
+        ]
+
+    return []
+
+
 def get_recommended_cpm(product: Product) -> float | None:
     """Extract recommended CPM from product's pricing_options.
 
@@ -794,10 +908,22 @@ async def _get_products_impl(
     # while dicts lose this type information during serialization
     # adcp 2.16.0+ accepts subclass lists at runtime via BeforeValidator coercion,
     # but mypy still needs cast() due to list invariance in static typing
+
+    # Check brief completeness — emit incomplete[] if brief is thin (task-03b).
+    # Advisory only: products are still returned; incomplete[] guides the buyer agent
+    # to prompt the advertiser for missing fields before calling create_media_buy.
+    incomplete_items = _check_brief_completeness(brief_text, req)
+    if incomplete_items:
+        logger.info(
+            "[GET_PRODUCTS] Brief thin — emitting incomplete[]: %s",
+            incomplete_items[0].description[:80],
+        )
+
     resp = GetProductsResponse(
         products=cast(list[LibraryProduct], eligible_products),
         errors=None,
         context=req.context,
+        incomplete=incomplete_items or None,  # None when list is empty (spec: absent when complete)
     )
 
     # Log successful get_products call
