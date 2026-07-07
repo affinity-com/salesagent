@@ -1016,6 +1016,49 @@ def seed_webhook_router(conn) -> None:
 
 
 # ---------------------------------------------------------------------------
+# seed_product_ranking_prompt: sets a generic default product_ranking_prompt
+# for all tenants that don't already have a custom one.
+# Uses ON CONFLICT DO UPDATE with a WHERE clause so tenant-specific overrides
+# (set manually in the DB) are never overwritten by the seed.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_PRODUCT_RANKING_PROMPT = (
+    "You are a media planning assistant for a publisher ad network.\n\n"
+    "Rank the following products by relevance to the buyer's campaign brief. Prioritise:\n"
+    "- Vertical alignment: match product audience/context to the advertiser's industry\n"
+    "- KPI match: performance/CPI briefs -> direct-response placements;"
+    " CPM/awareness briefs -> broad reach placements\n"
+    "- Geo match: prefer products with explicit country coverage matching the brief's target geography\n"
+    "- Audience scale: large-budget briefs -> high-reach products;"
+    " niche briefs -> targeted/contextual products\n\n"
+    "Score each product 0.0-1.0. Write a 1-2 sentence brief_relevance explaining why this"
+    " product matches (or does not match) the brief. Reference specific brief elements."
+    " Do NOT invent capabilities the product does not have."
+)
+
+
+def seed_product_ranking_prompt(conn):
+    """Set a generic default product_ranking_prompt for the siteplug tenant where it is NULL.
+
+    Idempotent: only updates the row where product_ranking_prompt IS NULL, so any
+    custom prompt set manually in the DB is never overwritten.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE tenants SET product_ranking_prompt = %s, updated_at = NOW()"
+        " WHERE tenant_id = 'siteplug' AND product_ranking_prompt IS NULL",
+        (_DEFAULT_PRODUCT_RANKING_PROMPT,),
+    )
+    updated = cur.rowcount
+    conn.commit()
+    cur.close()
+    if updated:
+        print(f"  ✓ product_ranking_prompt set for siteplug (was NULL)")
+    else:
+        print("  ✓ siteplug product_ranking_prompt already set — no changes")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1091,10 +1134,14 @@ def main():
 
     print("Step 13: Seeding siteplug brand-agent connection config (task02c)...")
     seed_siteplug_connection_config(conn)
+    print()
+
+    print("Step 14: Seeding default product_ranking_prompt for AI-powered ranking...")
+    seed_product_ranking_prompt(conn)
     conn.close()
     print()
 
-    print("Step 14: Verification...")
+    print("Step 15: Verification...")
     conn2 = get_conn()
     for tenant_id, name, *_ in TENANTS:
         prod_n     = count(conn2, f"SELECT COUNT(*) FROM products WHERE tenant_id='{tenant_id}'")

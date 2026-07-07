@@ -705,6 +705,14 @@ async def _get_products_impl(
                 # Filter out products with very low relevance (score < 0.1)
                 eligible_products = [p for p in eligible_products if ranking_map.get(p.product_id, (0.0, ""))[0] >= 0.1]
 
+                # Task-02: Wire ranking reason → product.brief_relevance (AdCP core/product.json field).
+                # brief_relevance is a plain string explaining why this product matches the brief.
+                # The buyer agent surfaces it in the discovery UI alongside the product card.
+                for product in eligible_products:
+                    _, reason = ranking_map.get(product.product_id, (0.0, ""))
+                    if reason:
+                        product.brief_relevance = reason  # type: ignore[attr-defined]
+
                 # Log the ranking results
                 for r in ranking_result.rankings:
                     logger.info(f"[AI_RANKING] {r.product_id}: score={r.relevance_score:.2f}, reason={r.reason}")
