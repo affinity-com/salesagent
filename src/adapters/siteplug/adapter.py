@@ -63,6 +63,10 @@ from src.core.schemas import (
 
 logger = logging.getLogger(__name__)
 
+# Ad group name validation regex (Siteplug requirement).
+# Hoisted to module level so both create_media_buy and add_new_packages can use it.
+_ADGROUP_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9 _\-]*$")
+
 
 class SiteplugAdapter(AdServerAdapter):
     """Adapter for interacting with the Siteplug SSP Tech API.
@@ -356,6 +360,33 @@ class SiteplugAdapter(AdServerAdapter):
         budget_type: int | None = (
             int(impl_config.get("budget_type")) if impl_config.get("budget_type") is not None else None
         )
+        # Task 02c Phase 2: king_domains resolved at get_products time and passed
+        # back by the buyer-agent via package.ext.affinity.king_domains.
+        #
+        # Priority order:
+        #   1. ext.affinity.king_domains — set by get_products enrichment hook;
+        #      buyer-agent passes through unchanged (may review/modify before submit).
+        #   2. Static impl_config["related_domains"] — ops-controlled fallback.
+        #
+        # For SDC campaigns: if neither source provides domains, reject with a
+        # validation error (fail-closed) to prevent zero-impression campaigns.
+        _first_pkg_ext = getattr(first_package, "ext", None)
+        _ext_king_domains, related_domains = self._merge_king_domains(
+            pkg_ext=_first_pkg_ext,
+            impl_config=impl_config,
+            brand_domain=brand_domain,
+        )
+
+        # Fail-closed for SDC: king_domains must be present (set by get_products
+        # enrichment) so the Siteplug traffic matching engine can associate
+        # publisher traffic with the correct brand.
+        if campaign_type == "SDC" and not _ext_king_domains and not related_domains:
+            raise AdCPValidationError(
+                "SDC campaign requires king_domains to be set. "
+                "Ensure get_products was called with a brand.domain so the seller-agent "
+                "can resolve related domains and return them in product.ext.affinity.king_domains. "
+                "The buyer-agent must pass package.ext through to create_media_buy unchanged."
+            )
 
         if not platform_name:
             raise AdCPValidationError(
@@ -423,19 +454,11 @@ class SiteplugAdapter(AdServerAdapter):
                 budget_type=budget_type,
                 tenant_id=self.tenant_id,
                 idempotency_key=request.idempotency_key,
+                related_domains=related_domains,
             )
 
-        def _run_in_new_loop() -> int:
-            loop = asyncio.new_event_loop()
-            try:
-                return loop.run_until_complete(_run_provision())
-            finally:
-                loop.close()
-
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(_run_in_new_loop)
-                campaign_id: int = future.result()
+            campaign_id: int = self._run_async(_run_provision)
         except Exception as exc:
             logger.error(f"Siteplug.create_media_buy: provisioning failed: {exc}", exc_info=True)
             raise AdCPValidationError(f"Siteplug entity provisioning failed: {exc}") from exc
@@ -445,9 +468,6 @@ class SiteplugAdapter(AdServerAdapter):
 
         # ── Create ad groups for each package (Task 04) ───────────────────
         # Each AdCP package maps to one Siteplug ad group within the campaign.
-        # Ad group name regex: /^[a-zA-Z0-9][a-zA-Z0-9 \-\_]*$/
-        _ADGROUP_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9 _\-]*$")
-
         async def _create_adgroups_for_packages() -> None:
             for pkg in packages:
                 # Determine bid amount from package.cpm (pricing field)
@@ -532,45 +552,7 @@ class SiteplugAdapter(AdServerAdapter):
                 if overlay is None:
                     continue
 
-                kw_payload: dict[str, Any] = {}
-
-                # Positive keyword targets
-                keyword_targets = getattr(overlay, "keyword_targets", None)
-                if keyword_targets:
-                    kw_list = []
-                    for kw in keyword_targets:
-                        kw_text = getattr(kw, "keyword", None) or getattr(kw, "text", None)
-                        kw_match = getattr(kw, "match_type", "broad")
-                        # Resolve enum to string if needed
-                        if hasattr(kw_match, "value"):
-                            kw_match = kw_match.value
-                        kw_entry: dict[str, Any] = {
-                            "text": str(kw_text),
-                            "match_type": str(kw_match),
-                        }
-                        # Per-keyword bid_price → kw_max_cpc (K1)
-                        bid_price = getattr(kw, "bid_price", None)
-                        if bid_price is not None:
-                            kw_entry["kw_max_cpc"] = float(bid_price)
-                        kw_list.append(kw_entry)
-                    if kw_list:
-                        kw_payload["keywords"] = kw_list
-
-                # Negative keywords (no bid_price support)
-                negative_keywords = getattr(overlay, "negative_keywords", None)
-                if negative_keywords:
-                    neg_list = []
-                    for nkw in negative_keywords:
-                        nkw_text = getattr(nkw, "keyword", None) or getattr(nkw, "text", None)
-                        nkw_match = getattr(nkw, "match_type", "broad")
-                        if hasattr(nkw_match, "value"):
-                            nkw_match = nkw_match.value
-                        neg_list.append({
-                            "text": str(nkw_text),
-                            "match_type": str(nkw_match),
-                        })
-                    if neg_list:
-                        kw_payload["negative_keywords"] = neg_list
+                kw_payload = self._build_keyword_payload(overlay)
 
                 if kw_payload:
                     try:
@@ -1384,6 +1366,81 @@ class SiteplugAdapter(AdServerAdapter):
         """
         return {"cpc", "cpm", "flat_rate"}
 
+    def enrich_products(
+        self,
+        products: list,
+        brand_domain: str | None,
+    ) -> list:
+        """Enrich SDC products with king_domains resolved from the brand-agent.
+
+        Implements the Phase 2 AdCP pattern: seller-resolved configuration via
+        ``ext.affinity.king_domains`` on the ``get_products`` response.
+
+        For each SDC product (``impl_config.campaign_type == "SDC"``):
+        - Calls ``GET /api/brands/resolve?domain={brand_domain}`` on the brand-agent
+        - Merges the result with any static ``impl_config["related_domains"]``
+        - Sets ``product.ext = {"affinity": {"king_domains": [...]}}``
+
+        Fail-open per BR-RULE-079: any exception is caught and logged; products
+        still return (with empty ``king_domains``) rather than blocking get_products.
+
+        Args:
+            products: List of Product objects after filtering/ranking.
+            brand_domain: Brand domain from req.brand.domain (may be None).
+
+        Returns:
+            The same list with ext.affinity.king_domains set on SDC products.
+        """
+        if not brand_domain or not products:
+            return products
+
+        try:
+            from src.adapters.siteplug.brand_agent_client import fetch_brand_related_domains
+
+            _king_domains: list[str] = []
+            if self.connection_config.brand_agent_url:
+                _king_domains = fetch_brand_related_domains(
+                    brand_agent_url=self.connection_config.brand_agent_url,
+                    brand_agent_api_key=self.connection_config.brand_agent_api_key,
+                    brand_agent_tenant_id=self.connection_config.brand_agent_tenant_id,
+                    domain=brand_domain,
+                )
+
+            # Always include the brand domain itself (deduplicated)
+            _all_domains: list[str] = list(dict.fromkeys([brand_domain] + _king_domains))
+
+            for product in products:
+                _impl = getattr(product, "implementation_config", None) or {}
+                _camp_type: str = str(_impl.get("campaign_type", "")).upper()
+                if _camp_type == "SDC":
+                    # Merge brand-agent domains with static related_domains from impl_config
+                    # using the shared helper so the deduplication logic stays in one place.
+                    _fake_ext = {"affinity": {"king_domains": _all_domains}}
+                    _, _merged_or_none = self._merge_king_domains(
+                        pkg_ext=_fake_ext,
+                        impl_config=_impl,
+                        brand_domain=brand_domain,
+                    )
+                    _merged_domains: list[str] = _merged_or_none or _all_domains
+                    # Set ext.affinity.king_domains — buyer passes this back in create_media_buy
+                    _existing_ext: dict = dict(getattr(product, "ext", None) or {})
+                    _existing_affinity: dict = dict(_existing_ext.get("affinity", {}))
+                    _existing_affinity["king_domains"] = _merged_domains
+                    _existing_ext["affinity"] = _existing_affinity
+                    product.ext = _existing_ext  # type: ignore[assignment]
+                    self.log(
+                        f"[siteplug] enrich_products: set ext.affinity.king_domains="
+                        f"{_merged_domains} on product {product.product_id}",
+                        dry_run_prefix=False,
+                    )
+        except (ImportError, RuntimeError, OSError, ValueError) as exc:
+            logger.warning(
+                "[siteplug] enrich_products: king_domains enrichment failed "
+                "(fail-open, continuing): %s", exc
+            )
+
+        return products
+
     def get_targeting_capabilities(self) -> TargetingCapabilities:
         """Return targeting capabilities.
 
@@ -1604,36 +1661,7 @@ class SiteplugAdapter(AdServerAdapter):
                 # Wire keywords from targeting_overlay
                 overlay = getattr(pkg, "targeting_overlay", None)
                 if overlay is not None and adgroup_id > 0:
-                    kw_payload: dict[str, Any] = {}
-                    keyword_targets = getattr(overlay, "keyword_targets", None)
-                    if keyword_targets:
-                        kw_list = []
-                        for kw in keyword_targets:
-                            kw_text = getattr(kw, "keyword", None) or getattr(kw, "text", None)
-                            kw_match = getattr(kw, "match_type", "broad")
-                            if hasattr(kw_match, "value"):
-                                kw_match = kw_match.value
-                            kw_entry: dict[str, Any] = {
-                                "text": str(kw_text),
-                                "match_type": str(kw_match),
-                            }
-                            bid_price = getattr(kw, "bid_price", None)
-                            if bid_price is not None:
-                                kw_entry["kw_max_cpc"] = float(bid_price)
-                            kw_list.append(kw_entry)
-                        if kw_list:
-                            kw_payload["keywords"] = kw_list
-                    negative_keywords = getattr(overlay, "negative_keywords", None)
-                    if negative_keywords:
-                        neg_list = []
-                        for nkw in negative_keywords:
-                            nkw_text = getattr(nkw, "keyword", None) or getattr(nkw, "text", None)
-                            nkw_match = getattr(nkw, "match_type", "broad")
-                            if hasattr(nkw_match, "value"):
-                                nkw_match = nkw_match.value
-                            neg_list.append({"text": str(nkw_text), "match_type": str(nkw_match)})
-                        if neg_list:
-                            kw_payload["negative_keywords"] = neg_list
+                    kw_payload = self._build_keyword_payload(overlay)
                     if kw_payload:
                         try:
                             await self.client.add_keywords(
@@ -1778,34 +1806,12 @@ class SiteplugAdapter(AdServerAdapter):
         add_payload: dict[str, Any] = {}
 
         if keyword_targets_add:
-            kw_list = []
-            for kw in keyword_targets_add:
-                kw_text = getattr(kw, "keyword", None) or getattr(kw, "text", None)
-                kw_match = getattr(kw, "match_type", "broad")
-                if hasattr(kw_match, "value"):
-                    kw_match = kw_match.value
-                kw_entry: dict[str, Any] = {
-                    "text": str(kw_text),
-                    "match_type": str(kw_match),
-                }
-                bid_price = getattr(kw, "bid_price", None)
-                if bid_price is not None:
-                    kw_entry["kw_max_cpc"] = float(bid_price)
-                kw_list.append(kw_entry)
+            kw_list = [self._kw_entry(kw, include_bid=True) for kw in keyword_targets_add]
             if kw_list:
                 add_payload["keywords"] = kw_list
 
         if negative_keywords_add:
-            neg_list = []
-            for nkw in negative_keywords_add:
-                nkw_text = getattr(nkw, "keyword", None) or getattr(nkw, "text", None)
-                nkw_match = getattr(nkw, "match_type", "broad")
-                if hasattr(nkw_match, "value"):
-                    nkw_match = nkw_match.value
-                neg_list.append({
-                    "text": str(nkw_text),
-                    "match_type": str(nkw_match),
-                })
+            neg_list = [self._kw_entry(nkw, include_bid=False) for nkw in negative_keywords_add]
             if neg_list:
                 add_payload["negative_keywords"] = neg_list
 
@@ -1813,30 +1819,12 @@ class SiteplugAdapter(AdServerAdapter):
         remove_payload: dict[str, Any] = {}
 
         if keyword_targets_remove:
-            kw_remove_list = []
-            for kw in keyword_targets_remove:
-                kw_text = getattr(kw, "keyword", None) or getattr(kw, "text", None)
-                kw_match = getattr(kw, "match_type", "broad")
-                if hasattr(kw_match, "value"):
-                    kw_match = kw_match.value
-                kw_remove_list.append({
-                    "text": str(kw_text),
-                    "match_type": str(kw_match),
-                })
+            kw_remove_list = [self._kw_entry(kw, include_bid=False) for kw in keyword_targets_remove]
             if kw_remove_list:
                 remove_payload["keywords"] = kw_remove_list
 
         if negative_keywords_remove:
-            neg_remove_list = []
-            for nkw in negative_keywords_remove:
-                nkw_text = getattr(nkw, "keyword", None) or getattr(nkw, "text", None)
-                nkw_match = getattr(nkw, "match_type", "broad")
-                if hasattr(nkw_match, "value"):
-                    nkw_match = nkw_match.value
-                neg_remove_list.append({
-                    "text": str(nkw_text),
-                    "match_type": str(nkw_match),
-                })
+            neg_remove_list = [self._kw_entry(nkw, include_bid=False) for nkw in negative_keywords_remove]
             if neg_remove_list:
                 remove_payload["negative_keywords"] = neg_remove_list
 
@@ -1919,6 +1907,110 @@ class SiteplugAdapter(AdServerAdapter):
     # =========================================================================
     # Private helpers
     # =========================================================================
+
+    def _merge_king_domains(
+        self,
+        *,
+        pkg_ext: dict | None,
+        impl_config: dict,
+        brand_domain: str | None,
+    ) -> tuple[list[str], list[str] | None]:
+        """Merge ext.affinity.king_domains with static impl_config related_domains.
+
+        Single source of truth for the king_domains merge used by both
+        ``create_media_buy`` and ``enrich_products``.
+
+        Priority order:
+          1. ``pkg_ext["affinity"]["king_domains"]`` — set by get_products enrichment.
+          2. ``impl_config["related_domains"]`` — ops-controlled static fallback.
+
+        ``brand_domain`` is excluded from the merged list (it is always added
+        separately by the Siteplug whitelist endpoint).
+
+        Args:
+            pkg_ext: The ``ext`` dict from the package / product (may be None).
+            impl_config: The product's ``implementation_config`` dict.
+            brand_domain: The brand domain string (excluded from merged list).
+
+        Returns:
+            A 2-tuple of:
+              - ``ext_king_domains``: the raw list from ext (may be empty).
+              - ``merged``: deduplicated merged list, or None if empty.
+        """
+        ext_king_domains: list[str] = []
+        if isinstance(pkg_ext, dict):
+            _affinity = pkg_ext.get("affinity") or {}
+            if isinstance(_affinity, dict):
+                ext_king_domains = list(_affinity.get("king_domains") or [])
+
+        static_related: list[str] = list(impl_config.get("related_domains") or [])
+
+        # Deduplicate: ext domains first (buyer-reviewed), then static fallback.
+        # brand_domain is excluded here — the Siteplug whitelist endpoint adds it.
+        seen: set[str] = {brand_domain} if brand_domain else set()
+        merged: list[str] = []
+        for domain in ext_king_domains + static_related:
+            if domain and domain not in seen:
+                seen.add(domain)
+                merged.append(domain)
+
+        return ext_king_domains, merged or None
+
+    def _kw_entry(self, kw: Any, *, include_bid: bool) -> dict[str, Any]:
+        """Build a single keyword dict for the Siteplug keywords API.
+
+        Args:
+            kw: A keyword object with ``keyword``/``text``, ``match_type``,
+                and optionally ``bid_price`` attributes.
+            include_bid: When True, forward ``bid_price`` as ``kw_max_cpc`` (K1).
+
+        Returns:
+            Dict with ``text``, ``match_type``, and optionally ``kw_max_cpc``.
+        """
+        kw_text = getattr(kw, "keyword", None) or getattr(kw, "text", None)
+        kw_match = getattr(kw, "match_type", "broad")
+        # Resolve enum to string if needed
+        if hasattr(kw_match, "value"):
+            kw_match = kw_match.value
+        entry: dict[str, Any] = {
+            "text": str(kw_text),
+            "match_type": str(kw_match),
+        }
+        if include_bid:
+            bid_price = getattr(kw, "bid_price", None)
+            if bid_price is not None:
+                entry["kw_max_cpc"] = float(bid_price)
+        return entry
+
+    def _build_keyword_payload(self, overlay: Any) -> dict[str, Any]:
+        """Build the keyword payload dict from a targeting overlay object.
+
+        Handles both positive keyword targets (with optional per-keyword bid)
+        and negative keywords (no bid support).
+
+        Args:
+            overlay: A targeting overlay object with optional ``keyword_targets``
+                     and ``negative_keywords`` attributes.
+
+        Returns:
+            Dict with ``keywords`` and/or ``negative_keywords`` lists,
+            or an empty dict if the overlay has no keywords.
+        """
+        payload: dict[str, Any] = {}
+
+        keyword_targets = getattr(overlay, "keyword_targets", None)
+        if keyword_targets:
+            kw_list = [self._kw_entry(kw, include_bid=True) for kw in keyword_targets]
+            if kw_list:
+                payload["keywords"] = kw_list
+
+        negative_keywords = getattr(overlay, "negative_keywords", None)
+        if negative_keywords:
+            neg_list = [self._kw_entry(nkw, include_bid=False) for nkw in negative_keywords]
+            if neg_list:
+                payload["negative_keywords"] = neg_list
+
+        return payload
 
     def _read_campaign_id(self, media_buy_id: str) -> int | None:
         """Read ``siteplug_campaign_id`` from the first package's package_config.

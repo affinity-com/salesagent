@@ -748,6 +748,28 @@ async def _get_products_impl(
         except (ImportError, RuntimeError, OSError, ValueError) as e:
             logger.warning(f"Failed to annotate pricing options with adapter support: {e}")
 
+    # ── Adapter product enrichment hook ──────────────────────────────────────
+    # Allows adapters to set product.ext fields (e.g. ext.affinity.king_domains
+    # for Siteplug SDC campaigns) that the buyer-agent should pass through to
+    # create_media_buy unchanged.  Fail-open: the adapter is responsible for
+    # catching its own exceptions (see AdServerAdapter.enrich_products docstring).
+    if principal and eligible_products:
+        try:
+            from src.core.helpers.adapter_helpers import get_adapter
+
+            _enrich_adapter = get_adapter(principal, dry_run=True, tenant=tenant)
+            _enrich_brand_domain: str | None = (
+                getattr(req.brand, "domain", None) if req.brand else None
+            )
+            eligible_products = _enrich_adapter.enrich_products(
+                eligible_products, _enrich_brand_domain
+            )
+        except (ImportError, RuntimeError, OSError, ValueError) as _enrich_err:
+            logger.warning(
+                "get_products: adapter.enrich_products failed (fail-open, continuing): %s",
+                _enrich_err,
+            )
+
     # Filter pricing data for anonymous users
     # Do this BEFORE serialization to avoid reconstruction issues
     if principal_id is None:  # Anonymous user

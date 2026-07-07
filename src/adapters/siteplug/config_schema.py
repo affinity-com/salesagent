@@ -36,6 +36,14 @@ class SiteplugConnectionConfig(BaseConnectionConfig):
     affilizz_internal_url: str = ""  # e.g. "https://api.affilizz.com/v1/ads-aura"
     affilizz_api_key: str = ""  # ApiKey header value (INTERNAL_API-scoped token)
 
+    # Brand-agent integration — optional; used to fetch related TLD/geo domains
+    # (T10 brand.json enrichment) for king domain whitelisting on SDC campaigns.
+    # When set, the adapter calls GET /api/brands/{brand_id} on the brand-agent
+    # and extracts website properties as additional king domains.
+    brand_agent_url: str = ""   # e.g. "https://brand-agent.internal/api"
+    brand_agent_api_key: str = ""  # X-API-Key for brand-agent REST API
+    brand_agent_tenant_id: str = ""  # Tenant scope for brand-agent queries
+
 
 class SiteplugProductConfig(BaseProductConfig):
     """Product-level configuration for Siteplug campaigns."""
