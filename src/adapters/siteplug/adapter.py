@@ -303,6 +303,35 @@ class SiteplugAdapter(AdServerAdapter):
 
         assert self.tenant_id is not None, "tenant_id required for Siteplug provisioning"
 
+        # ── Validate targeting overlays (Task 07) ─────────────────────────
+        # Reject unsupported capability-gated fields before any provisioning.
+        # Silent ignore is non-conformant for named, capability-gated fields.
+        targeting_errors: list[str] = []
+        for pkg in packages:
+            overlay = getattr(pkg, "targeting_overlay", None)
+            if overlay is not None:
+                overlay_dict = (
+                    overlay.model_dump(exclude_none=True)
+                    if hasattr(overlay, "model_dump")
+                    else (overlay if isinstance(overlay, dict) else {})
+                )
+                pkg_errors = self.targeting_manager.validate_targeting(overlay_dict)
+                if pkg_errors:
+                    targeting_errors.extend(pkg_errors)
+
+        if targeting_errors:
+            error_msg = f"Targeting validation failed: {'; '.join(targeting_errors)}"
+            self.log(f"[siteplug] {error_msg}")
+            return CreateMediaBuyError(
+                errors=[
+                    Error(
+                        code="UNSUPPORTED_FEATURE",
+                        message=error_msg,
+                        details=None,
+                    )
+                ]
+            )
+
         # ── Dry-run: return a synthetic media_buy_id without API calls ────
         if self.dry_run:
             media_buy_id = f"sp_{request.po_number or int(datetime.now(UTC).timestamp())}"
@@ -551,6 +580,27 @@ class SiteplugAdapter(AdServerAdapter):
                 overlay = pkg.targeting_overlay
                 if overlay is None:
                     continue
+
+                # Apply geo/device targeting parameters to the campaign
+                # (Task 07: country_codes, device_targeting)
+                targeting_params = self.targeting_manager.build_targeting(
+                    overlay.model_dump(exclude_none=True) if hasattr(overlay, "model_dump") else (overlay or {})
+                )
+                if targeting_params:
+                    try:
+                        async def _apply_targeting(cid=campaign_id, params=targeting_params) -> None:
+                            await self.client.update_campaign(cid, params)
+
+                        await _apply_targeting()
+                        self.log(
+                            f"[siteplug] applied targeting to campaign_id={campaign_id}: "
+                            f"{list(targeting_params.keys())}"
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            f"[siteplug] apply targeting failed for campaign_id={campaign_id}: "
+                            f"{exc} — targeting not applied"
+                        )
 
                 kw_payload = self._build_keyword_payload(overlay)
 
@@ -1444,10 +1494,11 @@ class SiteplugAdapter(AdServerAdapter):
     def get_targeting_capabilities(self) -> TargetingCapabilities:
         """Return targeting capabilities.
 
-        Siteplug supports keyword targeting with broad/phrase/exact match types,
-        plus geographic targeting at country and region level.
+        Task 07: geo_countries enabled; geo_regions set to False (blocked on
+        SSP API enhancement — Task 13).
 
-        Keyword capabilities (K2 + K3 — AdCP 3.0 rc.3 compliance):
+        Keyword capabilities (K2 + K3 — AdCP 3.0 rc.3 compliance) are
+        unchanged from Task 01 skeleton and will be updated in Task 12:
         - keyword_targets: broad/phrase/exact match types supported via adgroup_kw_mapping
         - negative_keywords: broad/exact match types supported (no negative phrase in Siteplug)
         Both are declared as list[str] here and serialized to KeywordTargets/NegativeKeywords
@@ -1455,12 +1506,10 @@ class SiteplugAdapter(AdServerAdapter):
         """
         return TargetingCapabilities(
             geo_countries=True,
-            geo_regions=True,
-            # Keyword targeting: all three match types supported
-            # Maps to AdCP KeywordTargets.supported_match_types in get_adcp_capabilities()
+            geo_regions=False,   # Task 13 — blocked on SSP API geo region enhancement
+            # Keyword targeting: all three match types supported (Task 12)
             keyword_targets=["broad", "phrase", "exact"],
             # Negative keywords: broad and exact only (Siteplug type IDs 4 and 7; no phrase)
-            # Maps to AdCP NegativeKeywords.supported_match_types in get_adcp_capabilities()
             negative_keywords=["broad", "exact"],
         )
 
