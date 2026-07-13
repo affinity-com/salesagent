@@ -21,10 +21,15 @@
 
         <div class="form-group">
             <label for="siteplug_api_key">API Key *</label>
-            <input type="password" id="siteplug_api_key" name="siteplug_api_key"
-                   value=""
-                   placeholder="{{ '••••••••' if adapter_config and adapter_config.get('api_key') else 'Your Siteplug X-API-Key' }}"
-                   class="form-control">
+            <div style="position: relative;">
+                <input type="password" id="siteplug_api_key" name="siteplug_api_key"
+                       value=""
+                       placeholder="{{ '••••••••' if adapter_config and adapter_config.get('api_key') else 'Your Siteplug X-API-Key' }}"
+                       class="form-control" style="padding-right: 2.5rem;">
+                <button type="button" onclick="toggleVisibility('siteplug_api_key', this)"
+                        style="position: absolute; right: 0.5rem; top: 50%; transform: translateY(-50%); background: none; border: none; cursor: pointer; color: #6b7280; padding: 0.25rem;"
+                        title="Show API key"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button>
+            </div>
             <small style="color: #6b7280;">X-API-Key header value for SSP API authentication. Leave blank to keep the existing key.</small>
         </div>
 
@@ -38,6 +43,16 @@
             <small style="display: block; margin-top: 0.25rem; color: #6b7280;">
                 When enabled, media buys will require human approval before being activated in Siteplug
             </small>
+        </div>
+
+        <div style="display: flex; gap: 1rem; margin-top: 1rem; align-items: center; flex-wrap: wrap;">
+            <button type="button" onclick="testSiteplugSSP()" class="btn btn-secondary">
+                Test SSP Connection
+            </button>
+            <button type="button" onclick="saveSiteplugSSPConfig()" class="btn btn-primary">
+                Save SSP Config
+            </button>
+            <span id="siteplug-ssp-status" style="font-size: 0.875rem;"></span>
         </div>
     </div>
 
@@ -62,68 +77,65 @@
 
         <div class="form-group">
             <label for="affilizz_api_key">Affilizz Internal API Key</label>
-            <input type="password" id="affilizz_api_key" name="affilizz_api_key"
-                   value=""
-                   placeholder="{{ '••••••••' if adapter_config and adapter_config.get('affilizz_api_key') else 'INTERNAL_API-scoped token' }}"
-                   class="form-control">
+            <div style="position: relative;">
+                <input type="password" id="affilizz_api_key" name="affilizz_api_key"
+                       value=""
+                       placeholder="{{ '••••••••' if adapter_config and adapter_config.get('affilizz_api_key') else 'INTERNAL_API-scoped token' }}"
+                       class="form-control" style="padding-right: 2.5rem;">
+                <button type="button" onclick="toggleVisibility('affilizz_api_key', this)"
+                        style="position: absolute; right: 0.5rem; top: 50%; transform: translateY(-50%); background: none; border: none; cursor: pointer; color: #6b7280; padding: 0.25rem;"
+                        title="Show API key"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button>
+            </div>
             <small style="color: #6b7280;">
                 ApiKey header value for Affilizz Internal Text Ads API authentication.
                 Leave blank to keep the existing key.
             </small>
         </div>
-    </div>
 
-    <div style="display: flex; gap: 1rem; margin-top: 1.5rem; align-items: center; flex-wrap: wrap;">
-        <button type="button" onclick="saveSiteplugConfig()" class="btn btn-primary">
-            Save Configuration
-        </button>
-        <span id="siteplug-connection-status" style="font-size: 0.875rem;"></span>
-    </div>
-    <div style="display: flex; gap: 1rem; margin-top: 0.75rem; align-items: center; flex-wrap: wrap;">
-        <button type="button" onclick="testSiteplugConnection()" class="btn btn-secondary">
-            Test Connection
-        </button>
-        <span id="siteplug-ssp-status" style="font-size: 0.875rem;"></span>
-        <span id="siteplug-affilizz-status" style="font-size: 0.875rem;"></span>
+        <div style="display: flex; gap: 1rem; margin-top: 1rem; align-items: center; flex-wrap: wrap;">
+            <button type="button" onclick="testAffilizzConnection()" class="btn btn-secondary">
+                Test Affilizz Connection
+            </button>
+            <button type="button" onclick="saveSiteplugAffilizzConfig()" class="btn btn-primary">
+                Save Affilizz Config
+            </button>
+            <span id="siteplug-affilizz-status" style="font-size: 0.875rem;"></span>
+        </div>
     </div>
 </div>
 
 <script>
 const scriptRoot = window.scriptRoot || '';
 
-function saveSiteplugConfig() {
+function toggleVisibility(inputId, btn) {
+    const input = document.getElementById(inputId);
+    if (input.type === 'password') {
+        input.type = 'text';
+        btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
+        btn.title = 'Hide API key';
+    } else {
+        input.type = 'password';
+        btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+        btn.title = 'Show API key';
+    }
+}
+
+
+function _saveSiteplugConfig(config, statusElId) {
     const tenantId = '{{ tenant_id }}';
-    const affilizzApiKey = document.getElementById('affilizz_api_key').value;
-    const siteplugApiKey = document.getElementById('siteplug_api_key').value;
-    const config = {
-        base_url: document.getElementById('siteplug_base_url').value,
-        manual_approval_required: document.getElementById('siteplug_manual_approval_required').checked,
-        affilizz_internal_url: document.getElementById('affilizz_internal_url').value,
-    };
-
-    // Only include api_key if user typed something (empty = preserve existing)
-    if (siteplugApiKey) {
-        config.api_key = siteplugApiKey;
-    }
-
-    // Only include affilizz_api_key if user typed something (empty = preserve existing)
-    if (affilizzApiKey) {
-        config.affilizz_api_key = affilizzApiKey;
-    }
+    const el = document.getElementById(statusElId);
+    el.textContent = '⏳ Saving...';
+    el.style.color = '#6b7280';
 
     fetch(scriptRoot + '/api/tenant/' + tenantId + '/adapters/siteplug/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            adapter_type: 'siteplug',
-            config: config,
-        }),
+        body: JSON.stringify({ adapter_type: 'siteplug', config: config }),
     })
     .then(r => r.json())
     .then(data => {
-        const el = document.getElementById('siteplug-connection-status');
         if (data.success) {
-            el.textContent = '✅ Configuration saved';
+            el.textContent = '✅ Saved';
             el.style.color = '#10b981';
         } else {
             el.textContent = '❌ ' + (data.error || 'Save failed');
@@ -131,72 +143,97 @@ function saveSiteplugConfig() {
         }
     })
     .catch(err => {
-        const el = document.getElementById('siteplug-connection-status');
-        el.textContent = '❌ Error: ' + err.message;
+        el.textContent = '❌ ' + err.message;
         el.style.color = '#ef4444';
     });
 }
 
-function testSiteplugConnection() {
+function saveSiteplugSSPConfig() {
+    const siteplugApiKey = document.getElementById('siteplug_api_key').value;
+    const config = {
+        base_url: document.getElementById('siteplug_base_url').value,
+        manual_approval_required: document.getElementById('siteplug_manual_approval_required').checked,
+    };
+    if (siteplugApiKey) {
+        config.api_key = siteplugApiKey;
+    }
+    _saveSiteplugConfig(config, 'siteplug-ssp-status');
+}
+
+function saveSiteplugAffilizzConfig() {
+    const affilizzApiKey = document.getElementById('affilizz_api_key').value;
+    const config = {
+        affilizz_internal_url: document.getElementById('affilizz_internal_url').value,
+    };
+    if (affilizzApiKey) {
+        config.affilizz_api_key = affilizzApiKey;
+    }
+    _saveSiteplugConfig(config, 'siteplug-affilizz-status');
+}
+
+function testSiteplugSSP() {
     const tenantId = '{{ tenant_id }}';
     const sspStatusEl = document.getElementById('siteplug-ssp-status');
-    const affilizzStatusEl = document.getElementById('siteplug-affilizz-status');
 
-    // Read current form values (may be empty — backend falls back to stored credentials)
     const baseUrl = document.getElementById('siteplug_base_url').value;
     const apiKey = document.getElementById('siteplug_api_key').value;
-    const affilizzUrl = document.getElementById('affilizz_internal_url').value;
-    const affilizzKey = document.getElementById('affilizz_api_key').value;
 
     sspStatusEl.textContent = '⏳ Testing Siteplug SSP...';
     sspStatusEl.style.color = '#6b7280';
-    affilizzStatusEl.textContent = '⏳ Testing Affilizz...';
-    affilizzStatusEl.style.color = '#6b7280';
 
-    const sspCheck = fetch(scriptRoot + '/api/tenant/' + tenantId + '/adapters/siteplug/test-connection', {
+    fetch(scriptRoot + '/api/tenant/' + tenantId + '/adapters/siteplug/test-connection', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ base_url: baseUrl, api_key: apiKey }),
-    }).then(r => r.json());
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.success) {
+            sspStatusEl.textContent = '✅ Siteplug SSP: ' + (data.message || 'Connected');
+            sspStatusEl.style.color = '#10b981';
+        } else {
+            sspStatusEl.textContent = '❌ Siteplug SSP: ' + (data.error || 'Connection failed');
+            sspStatusEl.style.color = '#ef4444';
+        }
+    })
+    .catch(err => {
+        sspStatusEl.textContent = '❌ Siteplug SSP: ' + (err.message || 'Network error');
+        sspStatusEl.style.color = '#ef4444';
+    });
+}
 
-    const affilizzCheck = fetch(scriptRoot + '/api/tenant/' + tenantId + '/adapters/siteplug/test-affilizz-connection', {
+function testAffilizzConnection() {
+    const tenantId = '{{ tenant_id }}';
+    const affilizzStatusEl = document.getElementById('siteplug-affilizz-status');
+
+    const affilizzUrl = document.getElementById('affilizz_internal_url').value;
+    const affilizzKey = document.getElementById('affilizz_api_key').value;
+
+    affilizzStatusEl.textContent = '⏳ Testing Affilizz...';
+    affilizzStatusEl.style.color = '#6b7280';
+
+    fetch(scriptRoot + '/api/tenant/' + tenantId + '/adapters/siteplug/test-affilizz-connection', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ affilizz_internal_url: affilizzUrl, affilizz_api_key: affilizzKey }),
-    }).then(r => r.json());
-
-    Promise.allSettled([sspCheck, affilizzCheck]).then(([sspResult, affilizzResult]) => {
-        // SSP result
-        if (sspResult.status === 'fulfilled' && sspResult.value.success) {
-            sspStatusEl.textContent = '✅ Siteplug SSP: ' + (sspResult.value.message || 'Connected');
-            sspStatusEl.style.color = '#10b981';
-        } else {
-            const err = sspResult.status === 'fulfilled'
-                ? (sspResult.value.error || 'Connection failed')
-                : (sspResult.reason?.message || 'Network error');
-            sspStatusEl.textContent = '❌ Siteplug SSP: ' + err;
-            sspStatusEl.style.color = '#ef4444';
-        }
-
-        // Affilizz result
-        if (affilizzResult.status === 'fulfilled' && affilizzResult.value.success) {
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.success) {
             affilizzStatusEl.textContent = '✅ Affilizz: Connected';
             affilizzStatusEl.style.color = '#10b981';
-        } else if (
-            affilizzResult.status === 'fulfilled' &&
-            affilizzResult.value.error &&
-            affilizzResult.value.error.includes('required')
-        ) {
+        } else if (data.error && data.error.includes('required')) {
             // Not configured — this is OK, Affilizz is optional
             affilizzStatusEl.textContent = '⚠️ Affilizz: Not configured (optional)';
             affilizzStatusEl.style.color = '#f59e0b';
         } else {
-            const err = affilizzResult.status === 'fulfilled'
-                ? (affilizzResult.value.error || 'Connection failed')
-                : (affilizzResult.reason?.message || 'Network error');
-            affilizzStatusEl.textContent = '❌ Affilizz: ' + err;
+            affilizzStatusEl.textContent = '❌ Affilizz: ' + (data.error || 'Connection failed');
             affilizzStatusEl.style.color = '#ef4444';
         }
+    })
+    .catch(err => {
+        affilizzStatusEl.textContent = '❌ Affilizz: ' + (err.message || 'Network error');
+        affilizzStatusEl.style.color = '#ef4444';
     });
 }
 </script>
