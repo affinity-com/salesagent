@@ -343,23 +343,32 @@ def save_siteplug_config(tenant_id, **kwargs):
             if existing:
                 existing_config = existing.config_json or {}
 
-        # Preserve existing SSP api_key if new value is empty or placeholder
+        # Merge: start from existing config, overlay only the fields present in config_data.
+        # This allows per-section saves (SSP-only or Affilizz-only) without clobbering
+        # fields that belong to the other section.
+        merged: dict = dict(existing_config)
+
+        # Scalar fields: only overwrite when the key is explicitly present in config_data
+        for field in ("base_url", "manual_approval_required", "affilizz_internal_url"):
+            if field in config_data:
+                merged[field] = config_data[field]
+
+        # Secret fields: only overwrite when a non-empty, non-placeholder value is provided
         new_api_key = config_data.get("api_key", "").strip()
-        if not new_api_key or new_api_key == "••••••••":
-            config_data["api_key"] = existing_config.get("api_key", "")
+        if new_api_key and new_api_key != "••••••••":
+            merged["api_key"] = new_api_key
 
-        # Preserve existing affilizz_api_key if new value is empty or placeholder
         new_affilizz_api_key = config_data.get("affilizz_api_key", "").strip()
-        if not new_affilizz_api_key or new_affilizz_api_key == "••••••••":
-            config_data["affilizz_api_key"] = existing_config.get("affilizz_api_key", "")
+        if new_affilizz_api_key and new_affilizz_api_key != "••••••••":
+            merged["affilizz_api_key"] = new_affilizz_api_key
 
-        # Build validated config dict
+        # Build validated config dict from merged result
         config = {
-            "base_url": config_data.get("base_url", ""),
-            "api_key": config_data.get("api_key", ""),
-            "manual_approval_required": config_data.get("manual_approval_required", True),
-            "affilizz_internal_url": config_data.get("affilizz_internal_url", ""),
-            "affilizz_api_key": config_data.get("affilizz_api_key", ""),
+            "base_url": merged.get("base_url", ""),
+            "api_key": merged.get("api_key", ""),
+            "manual_approval_required": merged.get("manual_approval_required", True),
+            "affilizz_internal_url": merged.get("affilizz_internal_url", ""),
+            "affilizz_api_key": merged.get("affilizz_api_key", ""),
         }
 
         from src.adapters.siteplug.config_schema import SiteplugConnectionConfig
