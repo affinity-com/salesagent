@@ -339,10 +339,21 @@ class SiteplugAdapter(AdServerAdapter):
             return self._build_create_success(request, media_buy_id, packages)
 
         # ── Text-ad-search gate (Task 04 / Affilizz) ─────────────────────
-        # When ALL packages carry only the ``text_ad_search`` format, the
-        # media buy is fulfilled entirely via the Affilizz API (no Siteplug
-        # SSP entity stack required).  Return a synthetic ID immediately so
-        # the core layer can proceed without waiting for SSP provisioning.
+        # When ALL packages carry only the ``text_ad_search`` format AND no
+        # SSP campaign_type is configured in implementation_config, the media
+        # buy is fulfilled entirely via the Affilizz API (no Siteplug SSP
+        # entity stack required).
+        #
+        # IMPORTANT: ``text_ad_search`` is the Affilizz *creative format* —
+        # it describes how ad content is delivered, not whether a campaign
+        # entity exists in the SSP.  SSS campaigns use ``text_ad_search``
+        # creatives but still require SSP provisioning (AX/IC) with
+        # campaign_type="SSS", kd_auto_status=1, sss_auto_status=1.
+        #
+        # Gate fires only when BOTH conditions are true:
+        #   1. All packages are text_ad_search format (Affilizz creative)
+        #   2. No campaign_type is set in implementation_config (truly
+        #      Affilizz-only — no SSP campaign entity needed)
         def _all_text_ad_search(pkgs: list) -> bool:
             if not pkgs:
                 return False
@@ -357,11 +368,24 @@ class SiteplugAdapter(AdServerAdapter):
                     return False
             return True
 
-        if _all_text_ad_search(packages):
+        def _has_ssp_campaign_type(pkgs: list) -> bool:
+            """Return True if any package has campaign_type set in implementation_config.
+
+            A positive campaign_type (e.g. "SSS", "SDC", "SD") means the product
+            requires an SSP campaign entity in AX/IC regardless of creative format.
+            """
+            for pkg in pkgs:
+                impl = getattr(pkg, "implementation_config", None) or {}
+                if impl.get("campaign_type"):
+                    return True
+            return False
+
+        if _all_text_ad_search(packages) and not _has_ssp_campaign_type(packages):
             media_buy_id = f"sp_text_{request.po_number or int(datetime.now(UTC).timestamp())}"
             self.log(
-                f"[siteplug] text_ad_search gate: all packages are text-only → "
-                f"synthetic media_buy_id={media_buy_id}, skipping SSP provisioning"
+                f"[siteplug] text_ad_search gate: all packages are text-only with no "
+                f"SSP campaign_type → synthetic media_buy_id={media_buy_id}, "
+                f"skipping SSP provisioning"
             )
             return self._build_create_success(request, media_buy_id, packages)
 
@@ -417,10 +441,29 @@ class SiteplugAdapter(AdServerAdapter):
                 "The buyer-agent must pass package.ext through to create_media_buy unchanged."
             )
 
-        if not platform_name:
+        # platform_id (numeric) may be pre-provisioned by ops via Admin UI.
+        # When present it takes precedence over platform_name — the platform
+        # already exists in AX and does not need to be resolved/created.
+        platform_id_from_config: int | None = (
+            int(impl_config["platform_id"])
+            if impl_config.get("platform_id") is not None
+            else None
+        )
+        brand_id_from_config: int | None = (
+            int(impl_config["brand_id"])
+            if impl_config.get("brand_id") is not None
+            else None
+        )
+
+        # platform_name is required only when platform_id is not pre-provisioned.
+        if not platform_name and platform_id_from_config is None:
             raise AdCPValidationError(
-                "Siteplug product implementation_config is missing 'platform_name'. "
-                "Configure the product with the Siteplug network name (e.g. 'CJ', 'Awin')."
+                "Siteplug product implementation_config is missing 'platform_name' "
+                "and 'platform_id'. Configure the product with either:\n"
+                "  • platform_name: the Siteplug network name (e.g. 'CJ', 'Awin') "
+                "to resolve/create the platform via POST /onboard, OR\n"
+                "  • platform_id: the numeric ID of an existing platform in AX "
+                "(set via Admin UI → Siteplug Campaign Configuration)."
             )
 
         # ── Branch on automation_mode BEFORE provisioning ─────────────────
@@ -466,6 +509,51 @@ class SiteplugAdapter(AdServerAdapter):
         # the idempotency guard. This key is known before provisioning and
         # never changes, so retries correctly find the already-stored IDs.
         stable_lookup_id = first_package.package_id
+
+        # ── Pre-seed pre-provisioned platform_id / brand_id ──────────────
+        # If ops has set platform_id and/or brand_id on the product via Admin
+        # UI, inject them into package_config BEFORE calling provision_entity_stack
+        # so the sequential path's per-step idempotency guards skip those
+        # creation steps and go straight to POST /advertisers + POST /campaigns.
+        #
+        # Finny review note: validate that pre-seeded IDs are non-zero to catch
+        # stale Admin UI values early (a wrong platform_id would cause a cryptic
+        # foreign-key error from the SSP API further down).
+        if platform_id_from_config is not None and platform_id_from_config > 0:
+            self.log(
+                f"[siteplug] pre-seeding platform_id={platform_id_from_config} "
+                f"from impl_config into package_config (skipping POST /platforms)"
+            )
+            self.campaign_manager._persist_entity_ids(
+                media_buy_id=stable_lookup_id,
+                package_id=first_package.package_id,
+                platform_id=platform_id_from_config,
+                tenant_id=self.tenant_id,
+            )
+        elif platform_id_from_config is not None and platform_id_from_config <= 0:
+            raise AdCPValidationError(
+                f"Siteplug product implementation_config has invalid platform_id="
+                f"{platform_id_from_config}. "
+                "Set a valid numeric platform ID via Admin UI → Siteplug Campaign Configuration."
+            )
+
+        if brand_id_from_config is not None and brand_id_from_config > 0:
+            self.log(
+                f"[siteplug] pre-seeding brand_id={brand_id_from_config} "
+                f"from impl_config into package_config (skipping POST /brands)"
+            )
+            self.campaign_manager._persist_entity_ids(
+                media_buy_id=stable_lookup_id,
+                package_id=first_package.package_id,
+                brand_id=brand_id_from_config,
+                tenant_id=self.tenant_id,
+            )
+        elif brand_id_from_config is not None and brand_id_from_config <= 0:
+            raise AdCPValidationError(
+                f"Siteplug product implementation_config has invalid brand_id="
+                f"{brand_id_from_config}. "
+                "Set a valid numeric brand ID via Admin UI → Siteplug Campaign Configuration."
+            )
 
         async def _run_provision() -> int:
             return await self.campaign_manager.provision_entity_stack(

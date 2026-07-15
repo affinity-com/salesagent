@@ -452,7 +452,32 @@ def seed_siteplug_extra_products(conn):
         else:
             print(f"  ✓ superseded product '{old_id}' not present — skipping cleanup")
 
-    # (product_id, name, description, format_ids_json, format_id)
+    # SSS implementation_config — ops-controlled SSP provisioning fields.
+    #
+    # campaign_type: "SSS" — SiteSuggest (kd_auto_status=1, sss_auto_status=1 in AX).
+    # sol_id: 1 — default Source of Lead ID (must exist in ss_source_of_lead_master).
+    # deal_type: "CPC" — cost-per-click (SSS is affiliate/CPC traffic, not CPM).
+    # budget_type: 1 — default budget type for non-RTB campaigns.
+    # automation_mode: "confirmation_required" — HITL: campaign created paused in AX,
+    #   human approves activation via Slack/Admin UI (Task 08 workflow).
+    #
+    # platform_id / brand_id: NOT seeded here — ops must set these via
+    #   Admin UI → Products → Siteplug Campaign Configuration after deployment.
+    #   platform_id: numeric ID of the affiliate network platform in staging AX
+    #     (e.g. the ID for CJ, Awin, Impact — ask Siteplug ops).
+    #   brand_id: leave blank to create a new brand per media buy from the
+    #     buyer's brand info, OR set to an existing brand_id to reuse it.
+    #
+    # Without platform_id set, the adapter falls back to POST /onboard using
+    # platform_name — which will also fail until platform_name is set.
+    # Either platform_id OR platform_name must be configured before SSS
+    # campaigns can be provisioned in AX.
+    SSS_IMPL_CONFIG = (
+        '{"campaign_type": "SSS", "sol_id": 1, "deal_type": "CPC", '
+        '"budget_type": 1, "automation_mode": "confirmation_required"}'
+    )
+
+    # (product_id, name, description, format_ids_json, format_id, impl_config_json)
     EXTRA_PRODUCTS = [
         (
             "siteplug_sss_homepage",
@@ -464,6 +489,7 @@ def seed_siteplug_extra_products(conn):
             ),
             '[{"id": "text_ad_search", "agent_url": "http://creative-agent.localhost:8080"}]',
             "text_ad_search",
+            SSS_IMPL_CONFIG,
         ),
         (
             "siteplug_sss_category",
@@ -475,6 +501,7 @@ def seed_siteplug_extra_products(conn):
             ),
             '[{"id": "text_ad_search", "agent_url": "http://creative-agent.localhost:8080"}]',
             "text_ad_search",
+            SSS_IMPL_CONFIG,
         ),
         (
             "siteplug_sss_product",
@@ -486,6 +513,7 @@ def seed_siteplug_extra_products(conn):
             ),
             '[{"id": "text_ad_search", "agent_url": "http://creative-agent.localhost:8080"}]',
             "text_ad_search",
+            SSS_IMPL_CONFIG,
         ),
         (
             "opinary_survey_ad",
@@ -493,6 +521,7 @@ def seed_siteplug_extra_products(conn):
             "Opinary first-party interactive poll widget for addressable audiences",
             '[{"id": "survey_ad", "agent_url": "http://creative-agent.localhost:8080"}]',
             "survey_ad",
+            None,
         ),
     ]
 
@@ -504,17 +533,32 @@ def seed_siteplug_extra_products(conn):
     ]
     SSS_PRODUCT_IDS = {"siteplug_sss_homepage", "siteplug_sss_category", "siteplug_sss_product"}
 
-    for product_id, name, description, format_ids, format_id in EXTRA_PRODUCTS:
+    for product_id, name, description, format_ids, format_id, impl_config_json in EXTRA_PRODUCTS:
         n = count(conn, f"SELECT COUNT(*) FROM products WHERE tenant_id='siteplug' AND product_id='{product_id}'")
         if n > 0:
             print(f"  ✓ siteplug product '{product_id}' already exists — skipping")
+            # Backfill implementation_config if the product exists but has no config yet.
+            # This handles re-runs of the seed on existing environments where the product
+            # was seeded before implementation_config was added (idempotent: only updates
+            # when implementation_config IS NULL so existing ops-set values are preserved).
+            if impl_config_json is not None:
+                run_sql(conn, f"""
+                    UPDATE products
+                    SET implementation_config = '{impl_config_json}'::jsonb
+                    WHERE tenant_id = 'siteplug'
+                      AND product_id = '{product_id}'
+                      AND implementation_config IS NULL
+                """, f"siteplug product '{product_id}' implementation_config backfilled (if missing)")
         else:
             print(f"  Seeding siteplug product '{product_id}'...")
+            impl_config_clause = (
+                f"'{impl_config_json}'::jsonb" if impl_config_json is not None else "NULL"
+            )
             run_sql(conn, f"""
                 INSERT INTO products (
                     tenant_id, product_id, name, description,
                     format_ids, targeting_template, delivery_type,
-                    delivery_measurement, property_tags
+                    delivery_measurement, property_tags, implementation_config
                 ) VALUES (
                     'siteplug',
                     '{product_id}',
@@ -524,7 +568,8 @@ def seed_siteplug_extra_products(conn):
                     '{{"geo": {{}}, "audience": {{}}}}'::jsonb,
                     'non_guaranteed',
                     '{{"provider": "publisher"}}'::jsonb,
-                    '["all_inventory"]'::jsonb
+                    '["all_inventory"]'::jsonb,
+                    {impl_config_clause}
                 ) ON CONFLICT (tenant_id, product_id) DO NOTHING
             """, f"siteplug product '{product_id}' seeded")
 

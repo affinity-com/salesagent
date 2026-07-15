@@ -185,12 +185,13 @@ class TestCreateMediaBuyTextAdGate:
     def test_mixed_packages_does_not_skip_provisioning(self):
         """Mixed formats (text_ad_search + other) → provision_entity_stack is called."""
         adapter = _make_adapter()
-        # First package carries the required implementation_config (platform_name)
+        # First package carries the required implementation_config.
+        # Use campaign_type="SSS" (not "SDC") to avoid the king_domains fail-closed check.
         packages = [
             _make_package(
                 "pkg-001",
                 format_ids=[_make_format_id("text_ad_search")],
-                implementation_config={"platform_name": "TestPlatform"},
+                implementation_config={"platform_name": "TestPlatform", "campaign_type": "SSS"},
             ),
             _make_package("pkg-002", format_ids=[_make_format_id("siteplug_native_display")]),
         ]
@@ -224,8 +225,8 @@ class TestCreateMediaBuyTextAdGate:
             mock_future.result.return_value = 99
             mock_executor.submit.return_value = mock_future
 
-            # Needs platform_name in impl_config to avoid AdCPValidationError
-            packages[0].implementation_config = {"platform_name": "TestPlatform"}
+            # Use campaign_type="SSS" to avoid the SDC king_domains fail-closed check.
+            packages[0].implementation_config = {"platform_name": "TestPlatform", "campaign_type": "SSS"}
             result = self._call(adapter, packages)
 
         assert result.media_buy_id == "sp_99"
@@ -249,6 +250,80 @@ class TestCreateMediaBuyTextAdGate:
 
         assert isinstance(result, CreateMediaBuySuccess)
         assert result.packages is not None
+
+    def test_text_ad_with_campaign_type_bypasses_gate_and_provisions_ssp(self):
+        """text_ad_search format + campaign_type in impl_config → gate does NOT fire.
+
+        SSS products use text_ad_search as their creative format but still require
+        SSP provisioning (AX/IC) with campaign_type="SSS". The gate must not fire
+        when campaign_type is explicitly set in implementation_config.
+        """
+        adapter = _make_adapter()
+        # Mock workflow step to return a string (confirmation_required mode)
+        adapter.workflow_manager.create_confirmation_workflow_step.return_value = "step-001"
+        packages = [
+            _make_package(
+                format_ids=[_make_format_id("text_ad_search")],
+                implementation_config={
+                    "campaign_type": "SSS",
+                    "platform_id": 42,
+                    "sol_id": 1,
+                    "deal_type": "CPC",
+                    "budget_type": 1,
+                    "automation_mode": "confirmation_required",
+                },
+            )
+        ]
+
+        with patch("src.adapters.siteplug.adapter.concurrent.futures.ThreadPoolExecutor") as mock_pool:
+            mock_executor = MagicMock()
+            mock_pool.return_value.__enter__ = MagicMock(return_value=mock_executor)
+            mock_pool.return_value.__exit__ = MagicMock(return_value=False)
+            mock_future = MagicMock()
+            mock_future.result.return_value = 99  # campaign_id from SSP
+            mock_executor.submit.return_value = mock_future
+
+            result = self._call(adapter, packages)
+
+        # Gate did NOT fire → SSP provisioned → sp_{campaign_id} not sp_text_
+        assert isinstance(result, CreateMediaBuySuccess)
+        assert result.media_buy_id == "sp_99"
+        assert not result.media_buy_id.startswith("sp_text_")
+
+    def test_text_ad_without_campaign_type_still_fires_gate(self):
+        """text_ad_search format + no campaign_type → gate fires (Affilizz-only path).
+
+        Products with text_ad_search format and no campaign_type in impl_config
+        are pure Affilizz-only — no SSP campaign entity needed. Gate must still fire.
+        """
+        adapter = _make_adapter()
+        packages = [
+            _make_package(
+                format_ids=[_make_format_id("text_ad_search")],
+                implementation_config=None,  # no campaign_type → gate fires
+            )
+        ]
+
+        result = self._call(adapter, packages, po_number="PO-GATE")
+
+        assert isinstance(result, CreateMediaBuySuccess)
+        assert result.media_buy_id == "sp_text_PO-GATE"
+        adapter.campaign_manager.provision_entity_stack.assert_not_called()
+
+    def test_text_ad_with_empty_impl_config_still_fires_gate(self):
+        """text_ad_search + empty impl_config dict → gate fires (no campaign_type key)."""
+        adapter = _make_adapter()
+        packages = [
+            _make_package(
+                format_ids=[_make_format_id("text_ad_search")],
+                implementation_config={},  # empty dict, no campaign_type
+            )
+        ]
+
+        result = self._call(adapter, packages, po_number="PO-EMPTY")
+
+        assert result.media_buy_id == "sp_text_PO-EMPTY"
+        adapter.campaign_manager.provision_entity_stack.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
