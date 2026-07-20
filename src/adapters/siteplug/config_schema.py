@@ -75,6 +75,24 @@ class SiteplugProductConfig(BaseProductConfig):
         description="Default campaign budget",
     )
 
+    # Task 11 — Starting bid derivation (D17)
+    # Volume thresholds for bid multiplier adjustment.
+    # When None, defaults of 10_000 (low) and 1_000_000 (high) are used.
+    bid_volume_low_threshold: int | None = Field(
+        default=None,
+        description=(
+            "Zone query-volume threshold below which the adapter bids more "
+            "aggressively (×1.5). Defaults to 10 000 when None."
+        ),
+    )
+    bid_volume_high_threshold: int | None = Field(
+        default=None,
+        description=(
+            "Zone query-volume threshold above which the adapter bids more "
+            "conservatively (×0.7). Defaults to 1 000 000 when None."
+        ),
+    )
+
     @field_validator("pricing_model")
     @classmethod
     def validate_pricing_model(cls, v: str) -> str:

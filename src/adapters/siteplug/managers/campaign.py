@@ -29,6 +29,23 @@ from src.adapters.siteplug.client import SiteplugAPIError
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Task 11 — Starting bid derivation (D17)
+# ---------------------------------------------------------------------------
+
+# Geo tier country sets (ISO 3166-1 alpha-2, upper-case)
+GEO_TIER_1: frozenset[str] = frozenset({"US", "CA", "GB", "DE", "FR", "IT", "ES"})
+GEO_TIER_2: frozenset[str] = frozenset(
+    {"AU", "AT", "BE", "CH", "DK", "FI", "NL", "NO", "PL", "PT", "SE"}
+)
+
+# Base bid table: (tier, campaign_type) → USD bid
+BASE_BIDS: dict[tuple[int, str], float] = {
+    (1, "SD"): 0.10, (1, "SSS"): 0.05, (1, "SDC"): 0.10,
+    (2, "SD"): 0.05, (2, "SSS"): 0.05, (2, "SDC"): 0.05,
+    (3, "SD"): 0.01, (3, "SSS"): 0.01, (3, "SDC"): 0.01,
+}
+
 
 class SiteplugCampaignManager:
     """Manages Siteplug entity provisioning and campaign CRUD operations."""
@@ -827,6 +844,134 @@ class SiteplugCampaignManager:
                 self._log(f"[siteplug] persisted to package_config: {updates}")
         except Exception as exc:
             logger.error(f"[siteplug] Failed to persist entity IDs: {exc}", exc_info=True)
+
+    # =========================================================================
+    # Task 11 — Starting bid derivation (D17)
+    # =========================================================================
+
+    def _derive_starting_bid(
+        self,
+        request: Any,
+        package: Any,
+        campaign_type: str,
+        product_config: Any = None,
+    ) -> float:
+        """Derive a starting bid from geo tier and product type.
+
+        Called during ad group creation when the buyer has not supplied an
+        explicit ``bid_price``.  An explicit ``package.bid_price`` always
+        takes precedence over the derived value.
+
+        Geo tier classification:
+            Tier 1 — US, CA, GB, DE, FR, IT, ES
+            Tier 2 — AU, AT, BE, CH, DK, FI, NL, NO, PL, PT, SE
+            Tier 3 — IN, BR, MX (and all other countries)
+
+        Multi-country targeting uses the highest tier (lowest number) present.
+        No geo targeting defaults to Tier 2.
+
+        Volume adjustment (from ProductInventoryMapping zone stats):
+            Low  (< bid_volume_low_threshold)  → ×1.5  (bid aggressively)
+            High (> bid_volume_high_threshold) → ×0.7  (bid conservatively)
+            Normal / no data                   → ×1.0
+
+        Args:
+            request: AdCP ``create_media_buy`` request object.
+            package: AdCP package (line item) object.
+            campaign_type: Siteplug campaign type string ("SD" | "SSS" | "SDC").
+            product_config: Optional product config object with
+                ``bid_volume_low_threshold`` / ``bid_volume_high_threshold``
+                fields (falls back to defaults when None or absent).
+
+        Returns:
+            Bid amount in USD, rounded to 4 decimal places.
+        """
+        # Explicit bid always wins
+        explicit_bid = getattr(package, "bid_price", None)
+        if explicit_bid is not None:
+            return float(explicit_bid)
+
+        # ── Geo tier ─────────────────────────────────────────────────────────
+        geo = getattr(request, "targeting", None)
+        geo_obj = getattr(geo, "geo", None) if geo else None
+        raw_countries = getattr(geo_obj, "countries", None) if geo_obj else None
+        countries: frozenset[str] = frozenset(
+            c.upper() for c in (raw_countries or []) if c
+        )
+
+        if countries & GEO_TIER_1:
+            tier = 1
+        elif countries & GEO_TIER_2:
+            tier = 2
+        else:
+            # No geo specified → Tier 2 default; any other country → Tier 3
+            tier = 3 if countries else 2
+
+        base = BASE_BIDS.get((tier, campaign_type), 0.05)
+
+        # ── Volume adjustment ─────────────────────────────────────────────────
+        product_id: str | None = getattr(request, "product_id", None)
+        volume = self._get_zone_volume(product_id) if product_id else None
+
+        low_thresh: int = (
+            getattr(product_config, "bid_volume_low_threshold", None) or 10_000
+        )
+        high_thresh: int = (
+            getattr(product_config, "bid_volume_high_threshold", None) or 1_000_000
+        )
+
+        if volume is not None and volume < low_thresh:
+            multiplier = 1.5
+        elif volume is not None and volume > high_thresh:
+            multiplier = 0.7
+        else:
+            multiplier = 1.0
+
+        bid = round(base * multiplier, 4)
+        self._log(
+            f"[siteplug] _derive_starting_bid: tier={tier} campaign_type={campaign_type!r} "
+            f"base={base} volume={volume} multiplier={multiplier} → bid={bid}"
+        )
+        return bid
+
+    def _get_zone_volume(self, product_id: str) -> int | None:
+        """Return total query volume for the product's zones from ProductInventoryMapping.
+
+        Reads ``zone_stats.query_volume`` from each mapping row.  Returns
+        ``None`` when no mappings exist or when no row carries zone_stats
+        (the column is not yet present on the model — volume adjustment will
+        be skipped and the ×1.0 multiplier applied).
+
+        Args:
+            product_id: AdCP product ID to look up.
+
+        Returns:
+            Total query volume (int) or None if unavailable.
+        """
+        try:
+            from src.core.database.database_session import get_db_session
+            from src.core.database.models import ProductInventoryMapping
+
+            with get_db_session() as session:
+                mappings = (
+                    session.query(ProductInventoryMapping)
+                    .filter(ProductInventoryMapping.product_id == product_id)
+                    .all()
+                )
+            if not mappings:
+                return None
+            total = sum(
+                (m.zone_stats or {}).get("query_volume", 0)
+                for m in mappings
+                if hasattr(m, "zone_stats")
+            )
+            return total if total > 0 else None
+        except Exception as exc:
+            logger.debug(
+                f"[siteplug] _get_zone_volume: could not read zone stats for "
+                f"product_id={product_id!r}: {exc}"
+            )
+            return None
 
     # =========================================================================
     # Legacy campaign CRUD (used by other tasks)
