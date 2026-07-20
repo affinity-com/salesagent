@@ -497,12 +497,17 @@ def seed_siteplug_extra_products(conn):
     ]
 
     # Pricing rows per SSS product: CPC $0.10 and CPA $0.20 (ops transcript defaults).
-    # survey_ad keeps its original CPM $5.00 placeholder.
+    # min_spend_per_package = $100 USD for SSS (low-query start, US market).
+    # survey_ad keeps its original CPM $5.00 placeholder with min_spend_per_package = $500.
     SSS_PRICING = [
         ("cpc", 0.10),
         ("cpa", 0.20),
     ]
     SSS_PRODUCT_IDS = {"siteplug_sss_homepage", "siteplug_sss_category", "siteplug_sss_product"}
+    # Minimum spend per package for each product type (USD).
+    # Required so the buyer-agent budget input renders with a sensible default value.
+    SSS_MIN_SPEND = 100.00
+    SURVEY_AD_MIN_SPEND = 500.00
 
     for product_id, name, description, format_ids, format_id in EXTRA_PRODUCTS:
         n = count(conn, f"SELECT COUNT(*) FROM products WHERE tenant_id='siteplug' AND product_id='{product_id}'")
@@ -532,33 +537,39 @@ def seed_siteplug_extra_products(conn):
         if po_n > 0:
             print(f"  ✓ siteplug pricing for '{product_id}' already exists — skipping")
         elif product_id in SSS_PRODUCT_IDS:
-            # SSS products: CPC + CPA pricing (no CPM — SSS is affiliate/CPC traffic)
+            # SSS products: CPC + CPA pricing (no CPM — SSS is affiliate/CPC traffic).
+            # min_spend_per_package is set so the buyer-agent budget input renders with
+            # a sensible default value instead of appearing blank.
             for pricing_model, rate in SSS_PRICING:
                 run_sql(conn, f"""
                     INSERT INTO pricing_options (
-                        tenant_id, product_id, pricing_model, rate, currency, is_fixed, price_guidance
+                        tenant_id, product_id, pricing_model, rate, currency, is_fixed,
+                        price_guidance, min_spend_per_package
                     )
                     SELECT 'siteplug', '{product_id}', '{pricing_model}', {rate}, 'USD', false,
-                           jsonb_build_object('floor', {rate}::numeric)
+                           jsonb_build_object('floor', {rate}::numeric), {SSS_MIN_SPEND}
                     WHERE NOT EXISTS (
                         SELECT 1 FROM pricing_options
                         WHERE tenant_id='siteplug'
                           AND product_id='{product_id}'
                           AND pricing_model='{pricing_model}'
                     )
-                """, f"siteplug pricing for '{product_id}' seeded ({pricing_model.upper()} ${rate:.2f})")
+                """, f"siteplug pricing for '{product_id}' seeded ({pricing_model.upper()} ${rate:.2f}, min_spend ${SSS_MIN_SPEND:.2f})")
         else:
-            # Non-SSS products (survey_ad): keep CPM placeholder
+            # Non-SSS products (survey_ad): CPM $5.00 with min_spend_per_package = $500.
+            # min_spend_per_package is set so the buyer-agent budget input renders with
+            # a sensible default value instead of appearing blank.
             run_sql(conn, f"""
                 INSERT INTO pricing_options (
-                    tenant_id, product_id, pricing_model, rate, currency, is_fixed
+                    tenant_id, product_id, pricing_model, rate, currency, is_fixed,
+                    min_spend_per_package
                 )
-                SELECT 'siteplug', '{product_id}', 'cpm', 5.00, 'USD', true
+                SELECT 'siteplug', '{product_id}', 'cpm', 5.00, 'USD', true, {SURVEY_AD_MIN_SPEND}
                 WHERE NOT EXISTS (
                     SELECT 1 FROM pricing_options
                     WHERE tenant_id='siteplug' AND product_id='{product_id}'
                 )
-            """, f"siteplug pricing for '{product_id}' seeded (CPM $5.00 placeholder)")
+            """, f"siteplug pricing for '{product_id}' seeded (CPM $5.00, min_spend ${SURVEY_AD_MIN_SPEND:.2f})")
 
         # Append format_id to auto_approve_format_ids if not already present
         run_sql(conn, f"""

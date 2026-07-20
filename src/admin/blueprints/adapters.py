@@ -537,8 +537,15 @@ def list_siteplug_inventory(tenant_id, **kwargs):
         client = SiteplugClient(sp_config)
         result = asyncio.run(client.list_inventory(page=page, limit=limit, status=1))
 
-        zones = result.get("data", [])
-        pagination = result.get("pagination", {})
+        # _handle_response already unwraps body["data"], so result is either:
+        #   - a list  (SSP returned {"data": [...], "pagination": {...}})
+        #   - a dict  (unexpected envelope shape — handle gracefully)
+        if isinstance(result, list):
+            zones = result
+            pagination = {}
+        else:
+            zones = result.get("data", [])
+            pagination = result.get("pagination", {})
 
         return jsonify({"zones": zones, "pagination": pagination, "total": len(zones)})
 
