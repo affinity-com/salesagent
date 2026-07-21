@@ -772,9 +772,7 @@ async def _get_products_impl(
             eligible_products = _enrich_adapter.enrich_products(
                 eligible_products, _enrich_brand_domain
             )
-        except Exception as _enrich_err:
-            # Broad catch: enrich_products is fail-open (BR-RULE-079).
-            # Must never block product discovery regardless of adapter errors.
+        except (ImportError, RuntimeError, OSError, ValueError) as _enrich_err:
             logger.warning(
                 "get_products: adapter.enrich_products failed (fail-open, continuing): %s",
                 _enrich_err,

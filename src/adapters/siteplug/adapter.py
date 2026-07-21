@@ -146,11 +146,6 @@ class SiteplugAdapter(AdServerAdapter):
                 max_retries=config.get("max_retries", 3),
                 affilizz_internal_url=config.get("affilizz_internal_url", ""),
                 affilizz_api_key=config.get("affilizz_api_key", ""),
-                # Brand-agent integration — forwarded from get_siteplug_config()
-                # so enrich_products() can resolve king_domains for SDC campaigns.
-                brand_agent_url=config.get("brand_agent_url", ""),
-                brand_agent_api_key=config.get("brand_agent_api_key", ""),
-                brand_agent_tenant_id=config.get("brand_agent_tenant_id", ""),
             )
 
         # Initialize HTTP client
@@ -435,56 +430,9 @@ class SiteplugAdapter(AdServerAdapter):
             brand_domain=brand_domain,
         )
 
-        # Fallback: if ext.affinity.king_domains was not set by get_products enrichment
-        # (e.g. buyer-agent called get_products without a principal so enrich_products
-        # was skipped), resolve king_domains now from the brand-agent using req.brand.domain.
-        # This makes create_media_buy self-healing for SDC campaigns.
-        if campaign_type == "SDC" and not _ext_king_domains and not related_domains:
-            _req_brand_domain: str | None = getattr(
-                getattr(req, "brand", None), "domain", None
-            ) or brand_domain or None
-            if _req_brand_domain and self.connection_config.brand_agent_url:
-                try:
-                    from src.adapters.siteplug.brand_agent_client import fetch_brand_related_domains
-
-                    _ba_domains = fetch_brand_related_domains(
-                        brand_agent_url=self.connection_config.brand_agent_url,
-                        brand_agent_api_key=self.connection_config.brand_agent_api_key,
-                        brand_agent_tenant_id=self.connection_config.brand_agent_tenant_id,
-                        domain=_req_brand_domain,
-                    )
-                    _all_domains = list(dict.fromkeys([_req_brand_domain] + _ba_domains))
-                    _fake_ext = {"affinity": {"king_domains": _all_domains}}
-                    _ext_king_domains, related_domains = self._merge_king_domains(
-                        pkg_ext=_fake_ext,
-                        impl_config=impl_config,
-                        brand_domain=brand_domain,
-                    )
-                    self.log(
-                        f"[siteplug] create_media_buy: resolved king_domains={_all_domains} "
-                        f"from brand-agent fallback for domain={_req_brand_domain}",
-                        dry_run_prefix=False,
-                    )
-                except Exception as _ba_err:
-                    logger.warning(
-                        "[siteplug] create_media_buy: brand-agent fallback failed: %s", _ba_err
-                    )
-            elif _req_brand_domain:
-                # No brand-agent configured — use brand domain itself as the sole king domain
-                _fake_ext = {"affinity": {"king_domains": [_req_brand_domain]}}
-                _ext_king_domains, related_domains = self._merge_king_domains(
-                    pkg_ext=_fake_ext,
-                    impl_config=impl_config,
-                    brand_domain=brand_domain,
-                )
-                self.log(
-                    f"[siteplug] create_media_buy: no brand-agent configured, "
-                    f"using brand domain '{_req_brand_domain}' as sole king domain",
-                    dry_run_prefix=False,
-                )
-
-        # Fail-closed for SDC: king_domains must be present so the Siteplug
-        # traffic matching engine can associate publisher traffic with the brand.
+        # Fail-closed for SDC: king_domains must be present (set by get_products
+        # enrichment) so the Siteplug traffic matching engine can associate
+        # publisher traffic with the correct brand.
         if campaign_type == "SDC" and not _ext_king_domains and not related_domains:
             raise AdCPValidationError(
                 "SDC campaign requires king_domains to be set. "

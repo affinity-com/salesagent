@@ -201,11 +201,6 @@ class AdapterConfigRepository:
             # Used by SiteplugCreativeManager to sync siteplug_text_ad_search creatives.
             "affilizz_internal_url": raw.get("affilizz_internal_url", ""),
             "affilizz_api_key": raw.get("affilizz_api_key", ""),
-            # Brand-agent integration — optional; used by enrich_products() to resolve
-            # king_domains for SDC campaigns via GET /api/brands/resolve?domain=...
-            "brand_agent_url": raw.get("brand_agent_url", ""),
-            "brand_agent_api_key": raw.get("brand_agent_api_key", ""),
-            "brand_agent_tenant_id": raw.get("brand_agent_tenant_id", ""),
         }
         if "timeout" in raw:
             result["timeout"] = raw["timeout"]
