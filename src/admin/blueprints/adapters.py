@@ -440,7 +440,23 @@ def test_siteplug_connection(tenant_id, **kwargs):
 
         # Probe the inventory endpoint with page=1, limit=1 — lightweight connectivity check
         result = asyncio.run(client.list_inventory(page=1, limit=1, status=1))
-        total = result.get("pagination", {}).get("total", 0) if isinstance(result, dict) else 0
+        # list_inventory may return a raw list (client unwraps envelope) or a dict.
+        # Extract total from pagination when available; fall back to len of list.
+        if isinstance(result, dict):
+            total = result.get("pagination", {}).get("total", len(result.get("data", [])))
+        elif isinstance(result, list):
+            # Client unwrapped the envelope — count synced DB rows for a more accurate total
+            from src.core.database.models import ProductInventoryMapping
+            from sqlalchemy import func as sa_func
+            with get_db_session() as count_session:
+                total = count_session.scalar(
+                    sa_func.count(ProductInventoryMapping.id).filter(
+                        ProductInventoryMapping.tenant_id == tenant_id,
+                        ProductInventoryMapping.inventory_type == "zone",
+                    )
+                ) or len(result)
+        else:
+            total = 0
 
         return jsonify(
             {
