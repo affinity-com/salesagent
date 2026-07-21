@@ -604,8 +604,6 @@ def sync_siteplug_inventory(tenant_id, **kwargs):
         from src.adapters.siteplug.client import SiteplugClient
         from src.adapters.siteplug.config_schema import SiteplugConnectionConfig
         from src.adapters.siteplug.managers.inventory import SiteplugInventoryManager
-        from src.core.database.models import Principal
-        from sqlalchemy import select as sa_select
 
         sp_config = SiteplugConnectionConfig(
             base_url=config.get("base_url", ""),
@@ -614,13 +612,11 @@ def sync_siteplug_inventory(tenant_id, **kwargs):
         client = SiteplugClient(sp_config)
 
         with get_db_session() as session:
-            principal = session.scalars(sa_select(Principal).filter_by(tenant_id=tenant_id)).first()
-
             manager = SiteplugInventoryManager(
                 client=client,
                 tenant_id=tenant_id,
             )
-            result = asyncio.run(manager.sync_inventory(db_session=session, principal=principal))
+            result = asyncio.run(manager.sync_inventory(db_session=session))
 
         return jsonify({"success": True, "result": result})
 
