@@ -447,10 +447,10 @@ def test_siteplug_connection(tenant_id, **kwargs):
         elif isinstance(result, list):
             # Client unwrapped the envelope — count synced DB rows for a more accurate total
             from src.core.database.models import ProductInventoryMapping
-            from sqlalchemy import func as sa_func
+            from sqlalchemy import func as sa_func, select as sa_select
             with get_db_session() as count_session:
                 total = count_session.scalar(
-                    sa_func.count(ProductInventoryMapping.id).filter(
+                    sa_select(sa_func.count(ProductInventoryMapping.id)).where(
                         ProductInventoryMapping.tenant_id == tenant_id,
                         ProductInventoryMapping.inventory_type == "zone",
                     )
