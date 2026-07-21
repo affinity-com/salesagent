@@ -198,3 +198,5 @@ def get_adapter(
         return MockAdServerAdapter(
             adapter_config, principal, dry_run, tenant_id=tenant_id, strategy_context=testing_context
         )
+
+
