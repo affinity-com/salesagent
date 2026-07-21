@@ -146,6 +146,11 @@ class SiteplugAdapter(AdServerAdapter):
                 max_retries=config.get("max_retries", 3),
                 affilizz_internal_url=config.get("affilizz_internal_url", ""),
                 affilizz_api_key=config.get("affilizz_api_key", ""),
+                # Brand-agent integration — forwarded from get_siteplug_config()
+                # so enrich_products() can resolve king_domains for SDC campaigns.
+                brand_agent_url=config.get("brand_agent_url", ""),
+                brand_agent_api_key=config.get("brand_agent_api_key", ""),
+                brand_agent_tenant_id=config.get("brand_agent_tenant_id", ""),
             )
 
         # Initialize HTTP client

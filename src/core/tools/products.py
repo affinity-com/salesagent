@@ -761,7 +761,12 @@ async def _get_products_impl(
     # for Siteplug SDC campaigns) that the buyer-agent should pass through to
     # create_media_buy unchanged.  Fail-open: the adapter is responsible for
     # catching its own exceptions (see AdServerAdapter.enrich_products docstring).
-    if principal and eligible_products:
+    #
+    # NOTE: We run enrichment even when principal is None (anonymous/buyer-agent
+    # discovery calls).  Brand-agent config is tenant-level, not principal-level,
+    # so king_domains resolution works regardless of whether the caller is
+    # authenticated.  get_adapter() accepts None principal for Siteplug.
+    if eligible_products:
         try:
             from src.core.helpers.adapter_helpers import get_adapter
 
