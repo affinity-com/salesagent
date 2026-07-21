@@ -587,11 +587,12 @@ class SiteplugAdapter(AdServerAdapter):
         # Each AdCP package maps to one Siteplug ad group within the campaign.
         async def _create_adgroups_for_packages() -> None:
             for pkg in packages:
-                # Determine bid amount from package.cpm (pricing field)
-                bid_amount: float = float(pkg.cpm) if pkg.cpm else 0.0
                 bid_type: str = "cpm"
 
-                # Check package_pricing_info for a more specific bid/type
+                # Check package_pricing_info for an explicit bid/type first.
+                # If an explicit rate is present it is forwarded directly;
+                # otherwise _derive_starting_bid() is called (Task 11 / D17).
+                explicit_rate: float | None = None
                 if package_pricing_info and pkg.package_id in package_pricing_info:
                     pricing = package_pricing_info[pkg.package_id]
                     pricing_model = pricing.get("pricing_model", "cpm").lower()
@@ -599,7 +600,17 @@ class SiteplugAdapter(AdServerAdapter):
                         bid_type = pricing_model
                     rate = pricing.get("rate") or pricing.get("bid_price")
                     if rate is not None:
-                        bid_amount = float(rate)
+                        explicit_rate = float(rate)
+
+                if explicit_rate is not None:
+                    bid_amount: float = explicit_rate
+                else:
+                    # Task 11 (D17): derive geo-tier × product-type starting bid.
+                    # Passes product_config so configurable thresholds are respected.
+                    _product_config = getattr(pkg, "product_config", None)
+                    bid_amount = self.campaign_manager._derive_starting_bid(
+                        request, pkg, campaign_type, product_config=_product_config
+                    )
 
                 # Build ad group name from package name; validate against regex
                 adgroup_name: str | None = pkg.name or None
