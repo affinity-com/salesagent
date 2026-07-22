@@ -402,17 +402,40 @@ class SiteplugAdapter(AdServerAdapter):
         impl_config: dict[str, Any] = getattr(first_package, "implementation_config", None) or {}
 
         platform_name: str = impl_config.get("platform_name", "")
-        brand_name: str = impl_config.get("brand_name", self.principal.name or "")
-        brand_domain: str = impl_config.get("brand_domain", "")
-        vertical: str = impl_config.get("vertical", "")
-        sub_category: str = impl_config.get("sub_category", "")
+        _raw_brand_name: str = impl_config.get("brand_name", self.principal.name or "")
+        # Staging AX API requires brand_name to contain only alphanumeric chars and underscores.
+        # Sanitize: replace spaces and any disallowed chars with underscores.
+        brand_name: str = re.sub(r"[^a-zA-Z0-9_]", "_", _raw_brand_name)
+        # brand_domain: prefer impl_config, fall back to request.brand.domain (set by buyer-agent)
+        brand_domain: str = impl_config.get("brand_domain", "") or (
+            getattr(getattr(request, "brand", None), "domain", None) or ""
+        )
+        # vertical / sub_category: required by staging AX API.
+        # vertical is a free-form string stored in ss_brand_master.vertical (not validated against a table).
+        # sub_category MUST match ss_sub_category_master.sub_category_name exactly.
+        # Valid pairs from ss_sub_category_master (local dev SQL + staging AX DB):
+        #   "Technology" / "Software" | "Technology" / "Hardware" | "Technology" / "Internet"
+        #   "Business"   / "Advertising" | "Business" / "Finance" | "Business" / "Legal"
+        #   "Finance"    / "Banking" | "Finance" / "Insurance" | "Finance" / "Investing"
+        #   "Arts & Entertainment" / "Gaming" | ... (see brand_stored_procedures.sql)
+        # NOTE: "Retail", "Sports", "E-Commerce", "Footwear" do NOT exist in ss_sub_category_master.
+        vertical: str = impl_config.get("vertical", "") or "Technology"
+        sub_category: str = impl_config.get("sub_category", "") or "Software"
         campaign_type: str = impl_config.get("campaign_type", "SDC")
         sol_id: int = int(impl_config.get("sol_id", 1))
         is_product: int = int(impl_config.get("is_product", 0))
-        deal_type: str | None = impl_config.get("deal_type")
-        budget_type: int | None = (
-            int(impl_config.get("budget_type")) if impl_config.get("budget_type") is not None else None
-        )
+        # deal_type and budget_type are required by the staging AX API for non-RTB platforms.
+        # Defaults: "CPC" / 1 — the standard onboarding defaults per constants.php.
+        # Allowed deal_types: CPC, CPA, VCPC. Allowed budget_types: 1, 2, 3, 4, 5.
+        deal_type: str = impl_config.get("deal_type") or "CPC"
+        budget_type: int = int(impl_config.get("budget_type") or 1)
+        # SM/BDAM/AM names: optional — only pass when explicitly set in impl_config.
+        # When omitted, the Siteplug campaign SP uses its hardcoded default IDs
+        # (SM_ID, BDAM_ID, ADMIN_ID from config('constants.direct_campaign')).
+        # Passing a name that doesn't exist in ss_sales_manager_master causes a 422.
+        account_manager_name: str = impl_config.get("account_manager_name", "") or ""
+        sales_manager_name: str = impl_config.get("sales_manager_name", "") or ""
+        bdam_name: str = impl_config.get("bdam_name", "") or ""
         # Task 02c Phase 2: king_domains resolved at get_products time and passed
         # back by the buyer-agent via package.ext.affinity.king_domains.
         #
@@ -569,6 +592,9 @@ class SiteplugAdapter(AdServerAdapter):
                 is_product=is_product,
                 deal_type=deal_type,
                 budget_type=budget_type,
+                account_manager_name=account_manager_name,
+                sales_manager_name=sales_manager_name,
+                bdam_name=bdam_name,
                 tenant_id=self.tenant_id,
                 idempotency_key=request.idempotency_key,
                 related_domains=related_domains,
@@ -1560,7 +1586,9 @@ class SiteplugAdapter(AdServerAdapter):
 
             for product in products:
                 _impl = getattr(product, "implementation_config", None) or {}
-                _camp_type: str = str(_impl.get("campaign_type", "")).upper()
+                # Default to "SDC" — matches create_media_buy's impl_config.get("campaign_type", "SDC")
+                # so products with no campaign_type set are treated as SDC in both places.
+                _camp_type: str = str(_impl.get("campaign_type", "SDC")).upper()
                 if _camp_type == "SDC":
                     # Merge brand-agent domains with static related_domains from impl_config
                     # using the shared helper so the deduplication logic stays in one place.

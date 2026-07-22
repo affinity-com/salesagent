@@ -79,6 +79,9 @@ class SiteplugCampaignManager:
         is_product: int = 0,
         deal_type: str | None = None,
         budget_type: int | None = None,
+        account_manager_name: str | None = None,
+        sales_manager_name: str | None = None,
+        bdam_name: str | None = None,
         tenant_id: str,
         idempotency_key: str | None = None,
         related_domains: list[str] | None = None,
@@ -150,11 +153,11 @@ class SiteplugCampaignManager:
 
         except SiteplugAPIError as exc:
             # Fall back to sequential if the onboard route is not yet live
-            # (ENTITY_NOT_FOUND = 404 means the route doesn't exist yet)
-            if exc.status_code == 404 or exc.error_code == "ENTITY_NOT_FOUND":
+            # (ENTITY_NOT_FOUND = 404 means the route doesn't exist yet),
+            # or if the brand already exists in staging (BRAND_ALREADY_EXISTS).
+            if exc.status_code == 404 or exc.error_code in ("ENTITY_NOT_FOUND", "BRAND_ALREADY_EXISTS"):
                 self._log(
-                    "[siteplug] /onboard not available (Phase 7 not live) — "
-                    "falling back to sequential provisioning."
+                    f"[siteplug] /onboard fallback to sequential: {exc.error_code} — {exc}"
                 )
             else:
                 raise
@@ -173,6 +176,9 @@ class SiteplugCampaignManager:
             is_product=is_product,
             deal_type=deal_type,
             budget_type=budget_type,
+            account_manager_name=account_manager_name,
+            sales_manager_name=sales_manager_name,
+            bdam_name=bdam_name,
             tenant_id=tenant_id,
             idempotency_key=idempotency_key,
             related_domains=related_domains,
@@ -237,30 +243,57 @@ class SiteplugCampaignManager:
         result = body["results"][0]
         result_status: str = result.get("status", "")
 
-        if result_status == "partial_failure":
+        if result_status in ("partial_failure", "failed"):
             # Find the first failed step's error_code
             steps = result.get("steps", {})
             for step_name in ("brand", "advertiser", "campaign"):
                 step = steps.get(step_name, {})
-                if step.get("status") not in ("success", None):
+                step_status = step.get("status", "")
+                if step_status not in ("success", "skipped", None, ""):
                     error_code = step.get("error_code", "PARTIAL_FAILURE")
+                    error_msg = step.get("error_message", step.get("message", ""))
+                    # BRAND_ERROR "Brand already exists" — check if campaign was still created.
+                    # When brand already exists, the onboard SP may still create the campaign
+                    # using the existing brand. If campaign_id is present in the steps, use it.
+                    if error_code == "BRAND_ERROR" and "already exists" in error_msg.lower():
+                        campaign_step = steps.get("campaign", {})
+                        campaign_id_from_onboard = campaign_step.get("campaign_id")
+                        if campaign_id_from_onboard:
+                            self._log(
+                                f"[siteplug] brand already exists but campaign created: "
+                                f"campaign_id={campaign_id_from_onboard} — using onboard result"
+                            )
+                            brand_id_from_onboard = steps.get("brand", {}).get("brand_id") or 0
+                            advertiser_id_from_onboard = steps.get("advertiser", {}).get("advertiser_id") or 0
+                            self._persist_entity_ids(
+                                media_buy_id=media_buy_id,
+                                package_id=package_id,
+                                platform_id=platform_id,
+                                agency_id=agency_id,
+                                brand_id=brand_id_from_onboard,
+                                advertiser_id=advertiser_id_from_onboard,
+                                campaign_id=int(campaign_id_from_onboard),
+                                tenant_id=tenant_id,
+                            )
+                            await self._mark_primary_campaign(
+                                brand_id=brand_id_from_onboard,
+                                new_campaign_id=int(campaign_id_from_onboard),
+                                new_campaign_type=campaign_type,
+                            )
+                            return int(campaign_id_from_onboard)
+                        # No campaign_id → fall back to sequential
+                        raise SiteplugAPIError(
+                            f"Brand already exists — falling back to sequential provisioning",
+                            error_code="BRAND_ALREADY_EXISTS",
+                        )
                     raise SiteplugAPIError(
                         f"Siteplug onboarding partial_failure at step '{step_name}': "
-                        f"{step.get('message', '')}",
+                        f"{error_msg} | full_step={step}",
                         error_code=error_code,
                     )
             raise SiteplugAPIError(
-                "Siteplug onboarding partial_failure (unknown step)",
+                f"Siteplug onboarding partial_failure (unknown step) | result={result}",
                 error_code="PARTIAL_FAILURE",
-            )
-
-        if result_status == "failed":
-            steps = result.get("steps", {})
-            brand_step = steps.get("brand", {})
-            error_code = brand_step.get("error_code", "ONBOARD_FAILED")
-            raise SiteplugAPIError(
-                f"Siteplug onboarding failed at brand step: {brand_step.get('message', '')}",
-                error_code=error_code,
             )
 
         steps = result["steps"]
@@ -321,6 +354,9 @@ class SiteplugCampaignManager:
         is_product: int,
         deal_type: str | None,
         budget_type: int | None,
+        account_manager_name: str | None = None,
+        sales_manager_name: str | None = None,
+        bdam_name: str | None = None,
         tenant_id: str,
         idempotency_key: str | None,
         related_domains: list[str] | None = None,
@@ -377,18 +413,14 @@ class SiteplugCampaignManager:
             media_buy_id, package_id, "siteplug_brand_id", tenant_id
         )
         if not brand_id:
-            brand_data = await self.client.create_brand(
-                {
-                    "brand_name": brand_name,
-                    "brand_domain": brand_domain,
-                    "vertical": vertical,
-                    "sub_category": sub_category,
-                    "is_product": is_product,  # Fix 2: removed platform_id; added is_product
-                },
+            brand_id = await self._resolve_or_create_brand(
+                brand_name=brand_name,
+                brand_domain=brand_domain,
+                vertical=vertical,
+                sub_category=sub_category,
+                is_product=is_product,
                 idempotency_key=idempotency_key,
             )
-            brand_id = int(brand_data.get("brand_id", 0))
-            self._log(f"[siteplug] brand created: brand_id={brand_id}")
             self._persist_entity_ids(
                 media_buy_id=media_buy_id,
                 package_id=package_id,
@@ -436,19 +468,35 @@ class SiteplugCampaignManager:
             media_buy_id, package_id, "siteplug_campaign_id", tenant_id
         )
         if not campaign_id:
-            # Fix 4: campaign_name, deal_type, budget_type always required for non-RTB
+            # deal_type and budget_type are always required for non-RTB platforms.
+            # Use media_buy_id suffix to guarantee uniqueness — avoids 409 on retry
+            # since each AdCP media buy maps to exactly one Siteplug campaign.
+            import uuid as _uuid
+            campaign_name = (
+                f"{platform_name} {brand_name} {campaign_type} "
+                f"{media_buy_id[-8:] if len(media_buy_id) >= 8 else _uuid.uuid4().hex[:8]}"
+            )
             campaign_payload: dict[str, Any] = {
                 "advertiser_id": advertiser_id,
                 "platform_id": platform_id,
                 "brand_id": brand_id,
                 "campaign_type": campaign_type,
                 "sol_id": sol_id,
-                "campaign_name": f"{platform_name} {brand_name} {campaign_type}",
+                "campaign_name": campaign_name,
+                "deal_type": deal_type or "CPC",
+                "budget_type": int(budget_type) if budget_type is not None else 1,
             }
-            if deal_type is not None:
-                campaign_payload["deal_type"] = deal_type
-            if budget_type is not None:
-                campaign_payload["budget_type"] = budget_type
+            # SM/BDAM/AM names: only include when explicitly set in impl_config.
+            # When omitted, the SP uses its hardcoded default IDs (SM_ID, BDAM_ID, ADMIN_ID
+            # from config('constants.direct_campaign')). Passing a name that doesn't exist
+            # in ss_sales_manager_master causes a 422 pre-flight error.
+            if account_manager_name:
+                campaign_payload["account_manager_name"] = account_manager_name
+            if sales_manager_name:
+                campaign_payload["sales_manager_name"] = sales_manager_name
+            if bdam_name:
+                campaign_payload["bdam_name"] = bdam_name
+            self._log(f"[siteplug] POST /campaigns payload: {campaign_payload}")
 
             campaign_data = await self.client.create_campaign(
                 campaign_payload,
@@ -456,6 +504,7 @@ class SiteplugCampaignManager:
             )
             campaign_id = int(campaign_data.get("campaign_id", 0))
             self._log(f"[siteplug] campaign created: campaign_id={campaign_id}")
+
             self._persist_entity_ids(
                 media_buy_id=media_buy_id,
                 package_id=package_id,
@@ -659,6 +708,76 @@ class SiteplugCampaignManager:
             )
 
     # =========================================================================
+    # Brand resolution helper
+    # =========================================================================
+
+    async def _resolve_or_create_brand(
+        self,
+        *,
+        brand_name: str,
+        brand_domain: str,
+        vertical: str,
+        sub_category: str,
+        is_product: int,
+        idempotency_key: str | None,
+    ) -> int:
+        """Create a brand, or resolve the existing one if it already exists.
+
+        Strategy:
+          1. POST /brands — if successful, return brand_id.
+          2. If the API returns "Brand already exists" (BRAND_ERROR), fall back
+             to GET /brands?search=<brand_name> and match by name.
+          3. If still not found, re-raise the original error.
+
+        Returns:
+            Siteplug brand_id (int).
+        """
+        try:
+            brand_data = await self.client.create_brand(
+                {
+                    "brand_name": brand_name,
+                    "brand_domain": brand_domain,
+                    "vertical": vertical,
+                    "sub_category": sub_category,
+                    "is_product": is_product,
+                },
+                idempotency_key=idempotency_key,
+            )
+            brand_id = int(brand_data.get("brand_id", 0))
+            self._log(f"[siteplug] brand created: brand_id={brand_id}")
+            return brand_id
+
+        except SiteplugAPIError as exc:
+            err_msg = str(exc).lower()
+            if "already exists" not in err_msg and exc.error_code not in (
+                "BRAND_ERROR",
+                "ENTITY_ALREADY_EXISTS",
+            ):
+                raise
+
+            # Brand already exists — resolve by name
+            self._log(
+                f"[siteplug] brand '{brand_name}' already exists — "
+                "resolving via GET /brands?search=..."
+            )
+            brands = await self.client.list_brands(search=brand_name)
+            items: list[dict[str, Any]] = (
+                brands if isinstance(brands, list)
+                else brands.get("data", []) if isinstance(brands, dict)
+                else []
+            )
+            for b in items:
+                if b.get("brand_name", "").lower() == brand_name.lower():
+                    brand_id = int(b["brand_id"])
+                    self._log(f"[siteplug] resolved existing brand_id={brand_id}")
+                    return brand_id
+
+            raise SiteplugAPIError(
+                f"Brand '{brand_name}' already exists but could not be resolved via search.",
+                error_code="BRAND_LOOKUP_ERROR",
+            )
+
+    # =========================================================================
     # Advertiser resolution helper (C3)
     # =========================================================================
 
@@ -698,13 +817,28 @@ class SiteplugCampaignManager:
                 else advertisers.get("data", []) if isinstance(advertisers, dict)
                 else []
             )
+            self._log(f"[siteplug] advertiser search returned {len(items)} items: {[a.get('advertiser_id') for a in items]}")
             for a in items:
+                self._log(
+                    f"[siteplug] advertiser item: id={a.get('advertiser_id')} "
+                    f"adv_name={a.get('adv_name')!r} platform_id={a.get('platform_id')} "
+                    f"brand_id={a.get('brand_id')}"
+                )
+                # Strict match: name + platform_id both present and match
                 name_match = a.get("adv_name", "").lower() == adv_name.lower()
-                platform_match = int(a.get("platform_id", 0)) == platform_id
+                plat_id_val = a.get("platform_id")
+                platform_match = plat_id_val is not None and int(plat_id_val) == platform_id
                 if name_match and platform_match:
                     advertiser_id = int(a["advertiser_id"])
-                    self._log(f"[siteplug] resolved existing advertiser_id={advertiser_id}")
+                    self._log(f"[siteplug] resolved existing advertiser_id={advertiser_id} (strict match)")
                     return advertiser_id
+
+            # Relaxed match: staging API may omit platform_id/brand_id in list response
+            # and use a different name format. If only 1 result returned, trust it.
+            if len(items) == 1:
+                advertiser_id = int(items[0]["advertiser_id"])
+                self._log(f"[siteplug] resolved existing advertiser_id={advertiser_id} (single result fallback)")
+                return advertiser_id
         except SiteplugAPIError:
             pass  # Search failure is non-fatal — proceed to create
 
@@ -724,28 +858,70 @@ class SiteplugCampaignManager:
             return advertiser_id
 
         except SiteplugAPIError as exc:
-            if exc.error_code != "ENTITY_ALREADY_EXISTS":
+            # Catch any "already exists" condition: 409 status, ENTITY_ALREADY_EXISTS code,
+            # or "email already in use" message (staging AX API variant).
+            is_conflict = (
+                exc.status_code == 409
+                or exc.error_code == "ENTITY_ALREADY_EXISTS"
+                or "already" in str(exc).lower()
+            )
+            if not is_conflict:
                 raise
 
-            # 409 — resolve again
             self._log(
-                f"[siteplug] advertiser '{adv_name}' 409 on create — "
-                "resolving via GET /advertisers?search= (race condition)..."
+                f"[siteplug] advertiser '{adv_name}' conflict on create ({exc.error_code}) — "
+                "resolving via multiple search strategies..."
             )
-            advertisers = await self.client.list_advertisers(search=adv_name)
-            items = (
-                advertisers if isinstance(advertisers, list)
-                else advertisers.get("data", []) if isinstance(advertisers, dict)
-                else []
-            )
-            for a in items:
-                if int(a.get("platform_id", 0)) == platform_id:
-                    advertiser_id = int(a["advertiser_id"])
-                    self._log(f"[siteplug] resolved existing advertiser_id={advertiser_id}")
-                    return advertiser_id
+
+            def _extract_items(resp: Any) -> list[dict[str, Any]]:
+                if isinstance(resp, list):
+                    return resp
+                if isinstance(resp, dict):
+                    return resp.get("data", [])
+                return []
+
+            # Strategy 1: search by brand_id filter
+            try:
+                resp = await self.client.list_advertisers(brand_id=brand_id)
+                for a in _extract_items(resp):
+                    if int(a.get("platform_id", 0)) == platform_id:
+                        advertiser_id = int(a["advertiser_id"])
+                        self._log(f"[siteplug] resolved existing advertiser_id={advertiser_id} (by brand_id filter)")
+                        return advertiser_id
+            except SiteplugAPIError:
+                pass
+
+            # Strategy 2: search by platform_id filter
+            try:
+                resp = await self.client.list_advertisers(platform_id=platform_id)
+                for a in _extract_items(resp):
+                    if int(a.get("brand_id", 0)) == brand_id:
+                        advertiser_id = int(a["advertiser_id"])
+                        self._log(f"[siteplug] resolved existing advertiser_id={advertiser_id} (by platform_id filter)")
+                        return advertiser_id
+            except SiteplugAPIError:
+                pass
+
+            # Strategy 3: search by name (em-dash variant)
+            try:
+                resp = await self.client.list_advertisers(search=adv_name)
+                items = _extract_items(resp)
+                for a in items:
+                    if int(a.get("platform_id", 0)) == platform_id:
+                        advertiser_id = int(a["advertiser_id"])
+                        self._log(f"[siteplug] resolved existing advertiser_id={advertiser_id} (by name search)")
+                        return advertiser_id
+                # Fallback: any item matching brand_id
+                for a in items:
+                    if int(a.get("brand_id", 0)) == brand_id:
+                        advertiser_id = int(a["advertiser_id"])
+                        self._log(f"[siteplug] resolved existing advertiser_id={advertiser_id} (by brand_id in name search)")
+                        return advertiser_id
+            except SiteplugAPIError:
+                pass
 
             raise SiteplugAPIError(
-                f"Advertiser '{adv_name}' returned 409 but could not be resolved via search.",
+                f"Advertiser '{adv_name}' conflict but could not be resolved via search.",
                 error_code="ADVERTISER_LOOKUP_ERROR",
             )
 

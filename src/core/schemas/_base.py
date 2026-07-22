@@ -99,6 +99,7 @@ from pydantic import (
     ConfigDict,
     Field,
     RootModel,
+    field_validator,
     model_serializer,
     model_validator,
 )
@@ -1542,6 +1543,27 @@ class MediaPackage(SalesAgentBaseModel):
     budget: float | None = None  # Budget allocation in the currency specified by the pricing option
     creative_ids: list[str] | None = None  # Creative IDs to assign to this package
     implementation_config: dict[str, Any] | None = None  # Adapter-specific config (e.g. platform_name for Siteplug)
+    ext: dict[str, Any] | None = None  # AdCP ext pass-through (e.g. ext.affinity.king_domains for Siteplug SDC)
+
+    @field_validator("ext", mode="before")
+    @classmethod
+    def _coerce_ext_to_dict(cls, v: Any) -> dict[str, Any] | None:
+        """Coerce ExtensionObject (adcp library Pydantic model) to plain dict.
+
+        The adcp library returns ext as an ExtensionObject instance, but
+        MediaPackage.ext is typed as dict[str, Any]. This validator converts
+        any Pydantic model to its dict representation so validation passes.
+        """
+        if v is None:
+            return None
+        if isinstance(v, dict):
+            return v
+        # Pydantic model (e.g. ExtensionObject from adcp library)
+        if hasattr(v, "model_dump"):
+            return v.model_dump()
+        if hasattr(v, "dict"):
+            return v.dict()
+        return v
 
 
 class PackagePerformance(SalesAgentBaseModel):

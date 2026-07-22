@@ -625,6 +625,47 @@ def seed_siteplug_extra_products(conn):
         """, f"siteplug auto_approve_format_ids updated with '{format_id}'")
 
 
+def seed_siteplug_sdc_impl_config(conn):
+    """Backfill implementation_config for legacy SDC display/video products.
+
+    The SDC products (siteplug_display_premium, siteplug_ros_display,
+    siteplug_video_preroll) were seeded before implementation_config was
+    required by the Siteplug adapter.  Without platform_name the adapter
+    raises a VALIDATION_ERROR at create_media_buy time.
+
+    Idempotent: only updates rows where implementation_config IS NULL so
+    ops-set values (e.g. a real platform_id from AX) are never overwritten.
+
+    platform_name "CJ" is the standard test network used throughout the
+    codebase (see tests/unit/adapters/siteplug/).
+    automation_mode "confirmation_required" mirrors the SSS products so
+    campaigns are created paused and require human approval before serving.
+    """
+    SDC_IMPL_CONFIG = (
+        '{"campaign_type": "SDC", "platform_name": "CJ Network", "sol_id": 1, '
+        '"deal_type": "CPC", "budget_type": 1, '
+        '"automation_mode": "confirmation_required"}'
+    )
+    SDC_PRODUCT_IDS = [
+        "siteplug_display_premium",
+        "siteplug_ros_display",
+        "siteplug_video_preroll",
+    ]
+    for product_id in SDC_PRODUCT_IDS:
+        n = count(conn, f"SELECT COUNT(*) FROM products WHERE tenant_id='siteplug' AND product_id='{product_id}'")
+        if n == 0:
+            print(f"  ✓ siteplug SDC product '{product_id}' not present — skipping")
+            continue
+        # Use jsonb merge (||) so any ops-set fields (e.g. real platform_id from AX) are preserved,
+        # while deal_type and budget_type are always backfilled.
+        run_sql(conn, f"""
+            UPDATE products
+            SET implementation_config = COALESCE(implementation_config, '{{}}'::jsonb) || '{SDC_IMPL_CONFIG}'::jsonb
+            WHERE tenant_id = 'siteplug'
+              AND product_id = '{product_id}'
+        """, f"siteplug SDC product '{product_id}' implementation_config merged (deal_type=CPC, budget_type=1)")
+
+
 def seed_tmp_provider(conn):
     n = count(conn, "SELECT COUNT(*) FROM tmp_providers WHERE tenant_id='siteplug'")
     if n > 0:
@@ -1162,6 +1203,10 @@ def main():
 
     print("Step 6: Seeding siteplug extra products (survey_ad, text_ad_search)...")
     seed_siteplug_extra_products(conn)
+    print()
+
+    print("Step 6b: Backfilling implementation_config for siteplug SDC display/video products...")
+    seed_siteplug_sdc_impl_config(conn)
     print()
 
     print("Step 7: Seeding tmp_providers for siteplug...")

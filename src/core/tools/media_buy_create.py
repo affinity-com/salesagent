@@ -865,6 +865,7 @@ def execute_approved_media_buy(media_buy_id: str, tenant_id: str) -> tuple[bool,
                         product_id=product_id,
                         budget=budget,
                         implementation_config=getattr(product, "implementation_config", None),  # Adapter-specific config
+                        ext=package_config.get("ext"),  # Restore ext (e.g. king_domains for Siteplug SDC)
                     )
                     packages.append(media_package)
 
@@ -2541,6 +2542,7 @@ async def _create_media_buy_impl(
                                     "impressions": getattr(
                                         req_pkg, "impressions", None
                                     ),  # Store impressions for display (legacy field)
+                                    "ext": getattr(req_pkg, "ext", None),  # Pass-through ext (e.g. king_domains for Siteplug SDC)
                                 }
                             )
                             break
@@ -3140,6 +3142,7 @@ async def _create_media_buy_impl(
                         _get_creative_ids(matching_package) if matching_package else None
                     ),  # Include creative_ids from uploaded creatives
                     implementation_config=getattr(pkg_product, "implementation_config", None),  # Adapter-specific config
+                    ext=getattr(matching_package, "ext", None),  # Pass through ext (e.g. king_domains for Siteplug SDC)
                 )
             )
 
@@ -3373,6 +3376,7 @@ async def _create_media_buy_impl(
                         "paused": paused,  # Store paused state (adcp 2.12.0)
                         "pricing_info": pricing_info_for_package,  # Store pricing info for UI display
                         "impressions": impressions,  # Store impressions for display
+                        "ext": getattr(request_pkg, "ext", None),  # Pass-through ext (e.g. king_domains for Siteplug SDC)
                     }
 
                     # Extract pricing fields for dual-write from adapter response
