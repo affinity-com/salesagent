@@ -154,8 +154,16 @@ class SiteplugCampaignManager:
         except SiteplugAPIError as exc:
             # Fall back to sequential if the onboard route is not yet live
             # (ENTITY_NOT_FOUND = 404 means the route doesn't exist yet),
-            # or if the brand already exists in staging (BRAND_ALREADY_EXISTS).
-            if exc.status_code == 404 or exc.error_code in ("ENTITY_NOT_FOUND", "BRAND_ALREADY_EXISTS"):
+            # if the brand already exists in staging (BRAND_ALREADY_EXISTS),
+            # or if the campaign step failed with CAMPAIGN_ERROR (staging SSP DB
+            # bug: triggered when brand/advertiser already exist and only the
+            # campaign creation is attempted — the sequential path has per-step
+            # idempotency guards and its own SP_ERROR recovery).
+            if exc.status_code == 404 or exc.error_code in (
+                "ENTITY_NOT_FOUND",
+                "BRAND_ALREADY_EXISTS",
+                "CAMPAIGN_ERROR",
+            ):
                 self._log(
                     f"[siteplug] /onboard fallback to sequential: {exc.error_code} — {exc}"
                 )
