@@ -178,13 +178,16 @@ class SiteplugClient:
         if status in _HTTP_ERROR_CODES or status >= 400:
             mapped_code = _HTTP_ERROR_CODES.get(status, "INTERNAL_ERROR")
 
-            # For 500 onboarding errors, prefer the API's own error code
+            # For 500 errors, prefer the API's own error code.
+            # The staging API returns the code in body["code"] (flat envelope),
+            # e.g. {"status":"error","code":"SP_ERROR","message":"..."}.
+            # Some endpoints nest it under body["error"]["code"].
             if status == 500 and isinstance(body, dict):
                 api_code = (
                     body.get("error", {}).get("code")
                     if isinstance(body.get("error"), dict)
                     else None
-                )
+                ) or body.get("code")
                 error_code = api_code or mapped_code
             else:
                 # For other errors, try to extract a more specific code from body
@@ -358,9 +361,9 @@ class SiteplugClient:
         )
 
     async def list_campaigns(self, **filters: Any) -> list[dict[str, Any]]:
-        """List campaigns. GET /campaigns/list (note: not /campaigns)."""
+        """List campaigns. GET /campaigns with optional filter params."""
         params = {k: v for k, v in filters.items() if v is not None}
-        return await self._request("GET", "/campaigns/list", params=params)
+        return await self._request("GET", "/campaigns", params=params)
 
     async def onboard(
         self, data: dict[str, Any], *, idempotency_key: str | None = None

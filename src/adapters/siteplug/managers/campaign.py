@@ -286,6 +286,54 @@ class SiteplugCampaignManager:
                             f"Brand already exists — falling back to sequential provisioning",
                             error_code="BRAND_ALREADY_EXISTS",
                         )
+                    # CAMPAIGN_ERROR — staging AX bug: SP4/SP5 may return a non-zero error
+                    # code even when the campaign record was committed to the DB. The brand
+                    # and advertiser steps succeeded, so we have their IDs. Recover by
+                    # fetching the most recently created campaign under the advertiser.
+                    if step_name == "campaign" and error_code == "CAMPAIGN_ERROR":
+                        brand_id_from_onboard = steps.get("brand", {}).get("brand_id") or 0
+                        advertiser_id_from_onboard = steps.get("advertiser", {}).get("advertiser_id") or 0
+                        self._log(
+                            f"[siteplug] onboard CAMPAIGN_ERROR — attempting recovery via "
+                            f"GET /campaigns?advertiser_id={advertiser_id_from_onboard}..."
+                        )
+                        try:
+                            campaigns = await self.client.list_campaigns(
+                                advertiser_id=advertiser_id_from_onboard
+                            )
+                            campaign_list = campaigns if isinstance(campaigns, list) else []
+                            if campaign_list:
+                                # Take the most recently created campaign (highest campaign_id)
+                                recovered = max(campaign_list, key=lambda c: int(c.get("campaign_id", 0)))
+                                recovered_id = int(recovered["campaign_id"])
+                                self._log(
+                                    f"[siteplug] CAMPAIGN_ERROR recovery: found campaign_id={recovered_id} "
+                                    f"(name={recovered.get('campaign_name')!r}) — campaign was created despite CAMPAIGN_ERROR"
+                                )
+                                self._persist_entity_ids(
+                                    media_buy_id=media_buy_id,
+                                    package_id=package_id,
+                                    platform_id=platform_id,
+                                    agency_id=agency_id,
+                                    brand_id=brand_id_from_onboard,
+                                    advertiser_id=advertiser_id_from_onboard,
+                                    campaign_id=recovered_id,
+                                    tenant_id=tenant_id,
+                                )
+                                await self._mark_primary_campaign(
+                                    brand_id=brand_id_from_onboard,
+                                    new_campaign_id=recovered_id,
+                                    new_campaign_type=campaign_type,
+                                )
+                                return recovered_id
+                            self._log(
+                                f"[siteplug] CAMPAIGN_ERROR recovery: no campaigns found for "
+                                f"advertiser {advertiser_id_from_onboard} — re-raising"
+                            )
+                        except SiteplugAPIError:
+                            self._log(
+                                f"[siteplug] CAMPAIGN_ERROR recovery: list_campaigns failed — re-raising"
+                            )
                     raise SiteplugAPIError(
                         f"Siteplug onboarding partial_failure at step '{step_name}': "
                         f"{error_msg} | full_step={step}",
@@ -498,12 +546,50 @@ class SiteplugCampaignManager:
                 campaign_payload["bdam_name"] = bdam_name
             self._log(f"[siteplug] POST /campaigns payload: {campaign_payload}")
 
-            campaign_data = await self.client.create_campaign(
-                campaign_payload,
-                idempotency_key=idempotency_key,
-            )
-            campaign_id = int(campaign_data.get("campaign_id", 0))
-            self._log(f"[siteplug] campaign created: campaign_id={campaign_id}")
+            try:
+                campaign_data = await self.client.create_campaign(
+                    campaign_payload,
+                    idempotency_key=idempotency_key,
+                )
+                campaign_id = int(campaign_data.get("campaign_id", 0))
+                self._log(f"[siteplug] campaign created: campaign_id={campaign_id}")
+            except SiteplugAPIError as exc:
+                # Staging AX bug: SP4/SP5 may return SP_ERROR (HTTP 500) even when
+                # the campaign record was committed to the DB. Recover by searching
+                # for the campaign by name under the advertiser.
+                if exc.error_code != "SP_ERROR":
+                    raise
+                self._log(
+                    f"[siteplug] POST /campaigns returned SP_ERROR — "
+                    f"attempting recovery via GET /campaigns?advertiser_id={advertiser_id}..."
+                )
+                try:
+                    campaigns = await self.client.list_campaigns(advertiser_id=advertiser_id)
+                    recovered_id: int | None = None
+                    for c in (campaigns if isinstance(campaigns, list) else []):
+                        if c.get("campaign_name", "") == campaign_name:
+                            recovered_id = int(c["campaign_id"])
+                            break
+                    if recovered_id:
+                        self._log(
+                            f"[siteplug] SP_ERROR recovery: found campaign_id={recovered_id} "
+                            f"by name '{campaign_name}' — campaign was created despite SP_ERROR"
+                        )
+                        campaign_id = recovered_id
+                    else:
+                        # Campaign not found — re-raise the original error
+                        self._log(
+                            f"[siteplug] SP_ERROR recovery: campaign '{campaign_name}' "
+                            f"not found in advertiser {advertiser_id} — re-raising"
+                        )
+                        raise
+                except SiteplugAPIError:
+                    raise
+                except Exception as search_exc:
+                    self._log(
+                        f"[siteplug] SP_ERROR recovery: search failed ({search_exc}) — re-raising original"
+                    )
+                    raise exc
 
             self._persist_entity_ids(
                 media_buy_id=media_buy_id,
