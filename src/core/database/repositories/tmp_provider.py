@@ -108,7 +108,11 @@ class TMPProviderRepository:
         """
         provider = TMPProvider(tenant_id=self._tenant_id)
         for key, value in kwargs.items():
-            if not hasattr(provider, key):
+            # Validate against the CLASS, not the instance: hasattr(provider, key)
+            # would invoke TMPProvider.auth_credentials' getter, which decrypts the
+            # stored value and can raise AdCPConfigurationError on corrupt/rotated
+            # ciphertext — an existence check must never trigger a decrypt.
+            if not hasattr(type(provider), key):
                 raise ValueError(f"TMPProvider has no attribute {key!r}")
             setattr(provider, key, value)
         self._session.add(provider)
@@ -127,7 +131,13 @@ class TMPProviderRepository:
         if provider is None:
             return None
         for key, value in kwargs.items():
-            if not hasattr(provider, key):
+            # Validate against the CLASS, not the instance (see create_from_fields):
+            # hasattr(provider, "auth_credentials") decrypts the OLD stored value
+            # via the property getter — exactly the case hit during credential
+            # rotation, where a corrupt/rotated ciphertext would abort the very
+            # update meant to replace it. hasattr(type(provider), key) checks for
+            # the descriptor without invoking it.
+            if not hasattr(type(provider), key):
                 raise ValueError(f"TMPProvider has no attribute {key!r}")
             setattr(provider, key, value)
         self._session.flush()

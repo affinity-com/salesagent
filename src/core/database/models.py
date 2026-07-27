@@ -1493,6 +1493,33 @@ class TMPProvider(Base):
             include_conditional: When True (default), include countries/uid_types/
                 properties only if they are non-None.  When False, always include
                 them (as None for legacy rows).
+
+        NOTE — deliberate divergences from the pinned discovery schema.
+        This dict is shared by the admin UI (list/edit views, which need
+        ``name`` to render) and the discovery wire
+        (``GET /tenant/{id}/tmp-providers/discovery``).
+        ``dist/schemas/3.1.0-beta.3/tmp/provider-registration.json`` is a closed
+        object (``additionalProperties: false``, 10 properties), and this wire
+        carries two things that schema does not describe:
+
+          1. ``name`` — not in the schema at all. Kept as a human-readable label
+             for router-side logging/debugging; splitting admin vs. wire
+             serialization would duplicate this method for one field.
+          2. ``countries`` / ``uid_types`` / ``properties`` emitted as ``null``
+             when ``include_conditional=False`` (the mode the discovery route
+             uses). The schema types all three as ``array`` with ``minItems: 1``,
+             so ``null`` is a *type* violation rather than an unknown key — and
+             for ``identity_match: true`` rows its if/then branch requires both
+             ``countries`` and ``uid_types`` non-empty. The router reads ``null``
+             as "no restriction" (see
+             ``test_null_countries_uid_types_for_legacy_rows``).
+
+        Neither divergence is sanctioned by the pin: a closed object grants no
+        tolerant-reader allowance, so a strictly-validating router rejects both.
+        They are accepted because today's only consumer is the TMP Router
+        deployed alongside this agent, which reads the fields it knows. Emitting
+        a schema-valid response means dropping ``name`` and omitting — not
+        nulling — absent conditional fields; left as a follow-up.
         """
         result: dict = {
             "provider_id": self.provider_id,

@@ -36,6 +36,7 @@ import httpx
 from src.core.database.database_session import get_db_session
 from src.core.database.repositories.tmp_provider import TMPProviderRepository
 from src.core.database.repositories.uow import TMPProviderUoW
+from src.core.security.url_validator import sanitize_for_log
 from src.services._provider_http import provider_client_kwargs, provider_url
 from src.services._scheduler_base import IntervalScheduler, _parse_interval_env
 
@@ -44,9 +45,8 @@ logger = logging.getLogger(__name__)
 # Configurable via env var — default 60 seconds.
 HEALTH_CHECK_INTERVAL_SECONDS: int = _parse_interval_env("TMP_HEALTH_CHECK_INTERVAL", 60)
 
-# Per-provider HTTP timeout.  Shorter than the old inline 5 s because
-# the scheduler can afford to mark a slow provider as unhealthy and
-# retry on the next cycle.
+# Per-provider HTTP timeout.  The scheduler can afford to mark a slow
+# provider as unhealthy and retry on the next cycle, so this stays short.
 HEALTH_CHECK_TIMEOUT_SECONDS = 5
 
 
@@ -71,7 +71,7 @@ async def _check_provider_health(endpoint: str) -> str:
             resp = await client.get(health_url)
         return "healthy" if resp.status_code == 200 else "unhealthy"
     except Exception:
-        logger.exception("[TMP health] Health probe failed for %s", endpoint)
+        logger.exception("[TMP health] Health probe failed for %s", sanitize_for_log(endpoint))
         return "error"
 
 

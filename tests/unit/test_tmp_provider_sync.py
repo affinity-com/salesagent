@@ -35,7 +35,7 @@ from tests.unit._tmp_helpers import _make_sync_uow, _make_tenant_config_uow
 class TestBuildPackagePayload:
     """_build_package_payload emits a spec-compliant AvailablePackage payload.
 
-    Authority: dist/schemas/3.1.0/tmp/available-package.json (AdCP 3.1.0-beta.3).
+    Authority: dist/schemas/3.1.0-beta.3/tmp/available-package.json (AdCP 3.1.0-beta.3).
     The schema has ``additionalProperties: false`` and requires exactly:
     ``package_id``, ``media_buy_id``, ``seller_agent``.
     Optional allowed fields: ``format_ids``, ``catalogs``.
@@ -56,7 +56,7 @@ class TestBuildPackagePayload:
     def test_seller_agent_is_structured_object(self):
         """seller_agent is a dict with agent_url, not a flat string.
 
-        Per dist/schemas/3.1.0/core/seller-agent-ref.json, seller_agent MUST be
+        Per dist/schemas/3.1.0-beta.3/core/seller-agent-ref.json, seller_agent MUST be
         an object with agent_url — not the legacy flat si_agent_endpoint string.
         """
         pkg = MagicMock()
@@ -110,7 +110,7 @@ class TestBuildPackagePayload:
 class TestSyncSkipsWhenNoSellerAgentUrl:
     """sync_packages_for_media_buy skips sync when _resolve_seller_agent_url returns None.
 
-    Per dist/schemas/3.1.0/core/seller-agent-ref.json, agent_url MUST use
+    Per dist/schemas/3.1.0-beta.3/core/seller-agent-ref.json, agent_url MUST use
     https://. When no valid https URL is available (no ADCP_AGENT_URL, no
     public virtual_host), the function must skip rather than emit a
     spec-invalid binding.
@@ -425,6 +425,39 @@ class TestResolveSellAgentUrl:
 
         assert result == "https://custom.agent.com/mcp"
 
+    def test_non_https_env_override_is_rejected(self):
+        """A non-https ADCP_AGENT_URL override is rejected, not emitted verbatim.
+
+        Per dist/schemas/3.1.0-beta.3/core/seller-agent-ref.json, agent_url MUST
+        use https://. An operator misconfiguring ADCP_AGENT_URL=http://... must
+        not produce a spec-invalid binding — the override is ignored and
+        resolution falls through to the tenant virtual_host path (which itself
+        also requires https, so with no valid tenant host this returns None).
+        """
+        tenant = MagicMock()
+        tenant.virtual_host = None
+        tenant.subdomain = None
+        mock_uow_cls = _make_tenant_config_uow(tenant)
+
+        with patch("src.services.tmp_provider_sync.TenantConfigUoW", mock_uow_cls):
+            with patch.dict("os.environ", {"ADCP_AGENT_URL": "http://insecure.agent.com/mcp"}):
+                result = _resolve_seller_agent_url("test-tenant")
+
+        assert result is None
+
+    def test_non_https_env_override_falls_through_to_https_virtual_host(self):
+        """A rejected non-https override still allows the virtual_host path to succeed."""
+        tenant = MagicMock()
+        tenant.virtual_host = "tenant.salesagent.example.com"
+        tenant.subdomain = None
+        mock_uow_cls = _make_tenant_config_uow(tenant)
+
+        with patch("src.services.tmp_provider_sync.TenantConfigUoW", mock_uow_cls):
+            with patch.dict("os.environ", {"ADCP_AGENT_URL": "http://insecure.agent.com/mcp"}):
+                result = _resolve_seller_agent_url("test-tenant")
+
+        assert result == "https://tenant.salesagent.example.com/mcp"
+
     def test_uses_tenant_virtual_host(self):
         """Uses tenant.virtual_host when ADCP_AGENT_URL is not set."""
         import os
@@ -481,7 +514,7 @@ class TestResolveSellAgentUrl:
     def test_returns_none_for_localhost_virtual_host(self):
         """A localhost virtual_host returns None — cannot produce a valid https URL.
 
-        Per dist/schemas/3.1.0/core/seller-agent-ref.json, agent_url MUST use
+        Per dist/schemas/3.1.0-beta.3/core/seller-agent-ref.json, agent_url MUST use
         https://. Local dev hosts cannot satisfy this requirement, so None is
         returned and the caller skips the sync.
         """

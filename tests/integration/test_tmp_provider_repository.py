@@ -135,3 +135,39 @@ class TestGetAllSyncableCrossTenant:
         assert "Cross T2 Draining" in names
         # Inactive must be excluded
         assert "Cross T1 Inactive" not in names
+
+
+class TestUpdateFieldsSurvivesCorruptCredential:
+    """update_fields() must not be blocked by a corrupt/rotated existing credential.
+
+    Regression test: ``update_fields`` used to validate incoming field names with
+    ``hasattr(provider, key)`` against the INSTANCE. For ``key="auth_credentials"``,
+    that invokes the property getter, which decrypts the *existing* stored value —
+    exactly the case hit during credential rotation. A corrupt ciphertext (e.g. the
+    encryption key was rotated) raised ``AdCPConfigurationError`` from the mere
+    existence check, aborting the very update meant to replace the bad value.
+    ``hasattr(type(provider), key)`` checks the descriptor exists without invoking it.
+    """
+
+    def test_rotating_a_corrupt_credential_succeeds(self, integration_db):
+        """A provider with an undecryptable stored credential can still be updated."""
+        with _RepoEnv() as env:
+            tenant = TenantFactory(tenant_id="tmp_repo_rotate")
+            provider = TMPProviderFactory(tenant=tenant, name="Rotate Provider", status="active")
+            session = env.get_session()
+
+            # Simulate a corrupt/rotated ciphertext: not valid Fernet output, so the
+            # auth_credentials getter's decrypt call raises ValueError -> AdCPConfigurationError.
+            provider._auth_credentials = "not-a-valid-fernet-token"
+            session.flush()
+            provider_id = provider.provider_id
+
+            repo = TMPProviderRepository(session, "tmp_repo_rotate")
+
+            # Rotating the credential must succeed even though the OLD value can't
+            # be decrypted — update_fields must not read the old value to validate
+            # the field name.
+            updated = repo.update_fields(provider_id, auth_credentials="new-plaintext-secret")
+
+            assert updated is not None
+            assert updated.auth_credentials == "new-plaintext-secret"

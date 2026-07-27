@@ -17,6 +17,7 @@ machine-to-machine discovery endpoint lives in ``src/routes/tmp_providers.py``.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
 
@@ -66,12 +67,16 @@ def _log_and_500(action: str, exc: Exception):
     string appears in the log message and the JSON error body so operators can
     identify which handler failed.
 
+    ``[TMP admin]`` prefix matches the sync/health/discovery modules' tags
+    (``[TMP sync]``, ``[TMP health]``, ``[TMP discovery]``) so an operator
+    grepping ``[TMP`` for this feature's logs sees the admin-side lines too.
+
     Usage::
 
         except Exception as e:
             return _log_and_500("deactivating TMP provider", e)
     """
-    logger.error("Error %s: %s", action, exc, exc_info=True)
+    logger.error("[TMP admin] Error %s: %s", action, exc, exc_info=True)
     return jsonify({"error": f"Error {action}"}), 500
 
 
@@ -81,6 +86,9 @@ def _log_flash_and_redirect(action: str, exc: Exception, redirect_response):
     Collapses the copy-pasted ``except Exception as e: logger.error(...); flash(...);
     return redirect(...)`` blocks in flash-based route handlers into one call site.
 
+    ``[TMP admin]`` prefix matches the sync/health/discovery modules' tags —
+    see ``_log_and_500`` above.
+
     Usage::
 
         except Exception as e:
@@ -89,7 +97,7 @@ def _log_flash_and_redirect(action: str, exc: Exception, redirect_response):
                 redirect(url_for("tenants.tenant_settings", tenant_id=tenant_id)),
             )
     """
-    logger.error("Error %s: %s", action, exc, exc_info=True)
+    logger.error("[TMP admin] Error %s: %s", action, exc, exc_info=True)
     flash(f"Error {action}", "error")
     return redirect_response
 
@@ -137,8 +145,13 @@ def _provider_not_found_redirect(tenant_id: str):
 # ---------------------------------------------------------------------------
 
 
-def _validate_provider_form(form: dict) -> tuple[dict, str | None]:
+def _validate_provider_form(form: Mapping[str, str]) -> tuple[dict, str | None]:
     """Parse and validate TMP provider form data.
+
+    ``form`` is typed as ``Mapping[str, str]`` — callers pass
+    ``request.form``, a Werkzeug ``ImmutableMultiDict``, not a plain ``dict``.
+    Only ``.get()`` is used here, so the narrower ``Mapping`` contract is
+    what's actually relied on.
 
     Returns:
         (data, error_message) — *error_message* is ``None`` on success.
@@ -183,7 +196,10 @@ def _validate_provider_form(form: dict) -> tuple[dict, str | None]:
     is_safe, ssrf_error = check_url_ssrf(endpoint)
     if not is_safe:
         logger.warning(
-            "[SECURITY] TMP provider rejected unsafe URL %s: %s",
+            # [TMP admin] tag included so an operator grepping `[TMP` for this
+            # feature's logs sees the SSRF rejections too, not just the
+            # _log_and_500 / _log_flash_and_redirect lines.
+            "[TMP admin][SECURITY] Provider rejected unsafe URL %s: %s",
             sanitize_for_log(endpoint),
             sanitize_for_log(ssrf_error),
         )

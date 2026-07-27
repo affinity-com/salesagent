@@ -163,7 +163,8 @@ async def tmp_providers_discovery(tenant_id: str, _: None = Depends(require_api_
         providers = uow.tmp_providers.list_syncable()
 
         # include_conditional=False: the TMP Router expects countries/uid_types
-        # to always be present (None means "accepts all" for legacy rows).
+        # to always be present in the response shape (see TMPProvider.to_dict
+        # docstring for the full contract, including the tolerated `name` field).
         provider_list = [p.to_dict(include_conditional=False) for p in providers]
 
     logger.debug(

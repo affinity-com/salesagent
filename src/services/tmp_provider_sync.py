@@ -36,15 +36,29 @@ import httpx
 
 from src.core.database.models import MediaPackage
 from src.core.database.repositories.uow import MediaBuyUoW, TenantConfigUoW, TMPProviderUoW
+from src.core.security.url_validator import sanitize_for_log
 from src.services._provider_http import bearer_headers, provider_client_kwargs, provider_url
 
 if TYPE_CHECKING:
     from src.core.resolved_identity import ResolvedIdentity
+    from src.core.schemas._base import CreateMediaBuyResult, UpdateMediaBuyError, UpdateMediaBuySuccess
 
 logger = logging.getLogger(__name__)
 
+# Log-sanitization rule across the TMP surfaces (this module,
+# tmp_health_scheduler, the admin blueprint, the discovery route): a value goes
+# through ``sanitize_for_log`` (CWE-117) when it enters the process from outside
+# — operator form input (provider ``endpoint``/``name``), env (``ADCP_AGENT_URL``),
+# or a request path (the discovery route's ``tenant_id``). Values that are only
+# ever DB-resolved inside the process are logged raw; here that is ``tenant_id``
+# and ``media_buy_id``, which reach this module from ResolvedIdentity and the
+# media_buys table, never from a caller-controlled string.
 
-def fire_tmp_sync(response: Any, identity: ResolvedIdentity | None) -> None:
+
+def fire_tmp_sync(
+    response: CreateMediaBuyResult | UpdateMediaBuySuccess | UpdateMediaBuyError | None,
+    identity: ResolvedIdentity | None,
+) -> None:
     """Spawn a daemon thread to sync TMP packages after a successful media buy operation.
 
     Transport-agnostic entry point shared by MCP, A2A, and REST transports.
@@ -86,13 +100,15 @@ def fire_tmp_sync(response: Any, identity: ResolvedIdentity | None) -> None:
 def _resolve_seller_agent_url(tenant_id: str) -> str | None:
     """Resolve the seller agent URL for the AvailablePackage.seller_agent field.
 
-    Per ``dist/schemas/3.1.0/core/seller-agent-ref.json``, ``agent_url`` MUST
-    use the ``https://`` scheme.  Returns ``None`` when no valid https URL can
-    be resolved so the caller can skip the sync rather than emit a
+    Per ``dist/schemas/3.1.0-beta.3/core/seller-agent-ref.json``, ``agent_url``
+    MUST use the ``https://`` scheme.  Returns ``None`` when no valid https URL
+    can be resolved so the caller can skip the sync rather than emit a
     spec-invalid binding.
 
     Resolution order:
       1. ADCP_AGENT_URL env var (explicit override for non-standard deployments)
+         — validated to use https:// like the virtual_host path; a non-https
+         override is rejected (logged, falls through) rather than emitted.
       2. Tenant virtual_host (the public domain, e.g. "tenant.salesagent.example.com")
          — local hosts (localhost / *.localhost / 127.0.0.1) are skipped because
          they cannot produce a valid https URL.
@@ -107,7 +123,15 @@ def _resolve_seller_agent_url(tenant_id: str) -> str | None:
     """
     override = os.environ.get("ADCP_AGENT_URL")
     if override:
-        return override.rstrip("/")
+        override = override.rstrip("/")
+        if override.startswith("https://"):
+            return override
+        logger.error(
+            "[TMP sync] ADCP_AGENT_URL=%s does not use https:// — ignoring override "
+            "(dist/schemas/3.1.0-beta.3/core/seller-agent-ref.json requires https for agent_url). "
+            "Falling back to tenant virtual_host resolution.",
+            sanitize_for_log(override),
+        )
 
     # Load tenant to resolve virtual_host.
     # Uses TenantConfigUoW for architecture compliance (no raw get_db_session).
@@ -158,13 +182,13 @@ def _build_package_payload(
 ) -> dict[str, Any]:
     """Build the POST /packages/sync payload from a MediaPackage DB row.
 
-    Conforms to ``dist/schemas/3.1.0/tmp/available-package.json``
+    Conforms to ``dist/schemas/3.1.0-beta.3/tmp/available-package.json``
     (AdCP 3.1.0-beta.3), which has ``additionalProperties: false`` and
     requires exactly: ``package_id``, ``media_buy_id``, ``seller_agent``.
     Optional fields allowed by the schema: ``format_ids``, ``catalogs``.
 
     ``seller_agent`` is a structured object per
-    ``dist/schemas/3.1.0/core/seller-agent-ref.json``:
+    ``dist/schemas/3.1.0-beta.3/core/seller-agent-ref.json``:
       ``{"agent_url": "<https://...>"}``
 
     ``agent_url`` MUST use the ``https://`` scheme per the spec.  Callers
@@ -200,9 +224,11 @@ def _post_packages_sync(endpoint: str, payloads: list[dict[str, Any]], auth_cred
     with httpx.Client(**provider_client_kwargs()) as client:
         resp = client.post(url, json=payloads, headers=headers)
         resp.raise_for_status()
-    logger.info(
+    # Sync fires on every media-buy create/update; keep at DEBUG (failures stay
+    # at WARNING in sync_packages_for_media_buy's fan-out loop below).
+    logger.debug(
         "[TMP sync] POST %s → %d (%d package(s), auth=%s)",
-        url,
+        sanitize_for_log(url),
         resp.status_code,
         len(payloads),
         "bearer" if auth_credentials else "none",
@@ -273,11 +299,13 @@ def sync_packages_for_media_buy(tenant_id: str, media_buy_id: str) -> None:
         )
         return
 
-    logger.info(
+    # Sync fires on every media-buy create/update — DEBUG matches the poll-path
+    # per-cycle summaries (tmp_health_scheduler); failures below stay at WARNING.
+    logger.debug(
         "[TMP sync] Built %d package payload(s) for media_buy=%s seller_agent=%s",
         len(payloads),
         media_buy_id,
-        seller_agent_url,
+        sanitize_for_log(seller_agent_url),
     )
 
     # --- Step 3: load active + draining TMP provider endpoints ---
@@ -319,8 +347,8 @@ def sync_packages_for_media_buy(tenant_id: str, media_buy_id: str) -> None:
             logger.warning(
                 "[TMP sync] Failed to sync %d package(s) to provider '%s' (%s) for tenant=%s media_buy=%s",
                 len(payloads),
-                provider_name,
-                provider_endpoint,
+                sanitize_for_log(provider_name),
+                sanitize_for_log(provider_endpoint),
                 tenant_id,
                 media_buy_id,
                 exc_info=True,

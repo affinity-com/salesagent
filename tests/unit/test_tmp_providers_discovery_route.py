@@ -241,10 +241,14 @@ class TestDiscoveryApiKeyAuth:
         """When TMP_DISCOVERY_API_KEYS is unset the endpoint returns 500 (fail-closed, operator must act).
 
         AdCPConfigurationError is the right error here: the operator has to configure
-        the env var; the buyer cannot recover this themselves.  The wire code is
-        SERVICE_UNAVAILABLE (CONFIGURATION_ERROR maps through exceptions.py) with
-        recovery="terminal" — the spec-correct value under the current pin (3.1.0-beta.3
-        classifies CONFIGURATION_ERROR as terminal).
+        the env var; the buyer cannot recover this themselves.  On the wire this maps
+        to code=SERVICE_UNAVAILABLE with recovery="terminal". Under the pinned
+        3.1.0-beta.3 ``enums/error-code.json``, SERVICE_UNAVAILABLE is classified
+        transient and CONFIGURATION_ERROR is classified terminal — so this
+        code/recovery pairing is self-inconsistent against the pinned enum. The
+        wire-code choice (SERVICE_UNAVAILABLE vs CONFIGURATION_ERROR) is a
+        maintainer-accepted follow-up, not fixed by this test; only the recovery
+        value asserted here is confirmed correct for this failure mode.
         """
         import os
 
@@ -253,8 +257,10 @@ class TestDiscoveryApiKeyAuth:
             response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 500
-        # CONFIGURATION_ERROR maps to SERVICE_UNAVAILABLE on wire; recovery=terminal
-        # is spec-correct under the current pin (3.1.0-beta.3).
+        # CONFIGURATION_ERROR maps to SERVICE_UNAVAILABLE on wire (agreed follow-up
+        # to revisit the code choice); recovery="terminal" matches the operator-must-act
+        # semantics of this failure even though it disagrees with the pinned enum's
+        # SERVICE_UNAVAILABLE=transient classification (see class docstring above).
         assert_envelope_shape(response.json(), "SERVICE_UNAVAILABLE", recovery="terminal")
 
     def test_returns_500_when_tmp_discovery_api_keys_is_empty_string(self, client):
@@ -266,8 +272,10 @@ class TestDiscoveryApiKeyAuth:
             response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 500
-        # CONFIGURATION_ERROR maps to SERVICE_UNAVAILABLE on wire; recovery=terminal
-        # is spec-correct under the current pin (3.1.0-beta.3).
+        # CONFIGURATION_ERROR maps to SERVICE_UNAVAILABLE on wire (agreed follow-up
+        # to revisit the code choice); recovery="terminal" matches the operator-must-act
+        # semantics of this failure — see test_returns_500_when_tmp_discovery_api_keys_not_set
+        # for the pinned-enum inconsistency this pairing carries.
         assert_envelope_shape(response.json(), "SERVICE_UNAVAILABLE", recovery="terminal")
 
     def test_open_when_tmp_discovery_api_keys_is_open(self, client):

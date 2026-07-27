@@ -14,7 +14,10 @@ from typing import Any
 
 # Default timeout for synchronous package-sync calls (seconds).
 # Kept short — TMP Provider is an internal service on the same network.
-_DEFAULT_SYNC_TIMEOUT_S = 5.0
+# Named with the *_SECONDS suffix (matching HEALTH_CHECK_TIMEOUT_SECONDS,
+# HEALTH_CHECK_INTERVAL_SECONDS, STATUS_CHECK_INTERVAL_SECONDS) so a grep for
+# *_SECONDS finds every duration constant this feature touches.
+_DEFAULT_SYNC_TIMEOUT_SECONDS = 5.0
 
 
 def provider_url(endpoint: str, path: str) -> str:
@@ -42,7 +45,7 @@ def bearer_headers(auth_credentials: str) -> dict[str, str]:
     return {}
 
 
-def provider_client_kwargs(timeout: float = _DEFAULT_SYNC_TIMEOUT_S) -> dict[str, Any]:
+def provider_client_kwargs(timeout: float = _DEFAULT_SYNC_TIMEOUT_SECONDS) -> dict[str, Any]:
     """Return shared ``httpx.Client`` / ``httpx.AsyncClient`` constructor kwargs.
 
     Centralises the two flags that every outbound TMP Provider call must set:
