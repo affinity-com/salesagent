@@ -117,16 +117,12 @@ async def require_api_key(request: Request) -> None:
         if not any(secrets.compare_digest(api_key_bytes, k.encode("utf-8", "surrogatepass")) for k in allowed):
             raise AdCPAuthRequiredError(
                 "Authentication required.",
-                details={
-                    "suggestion": "Provide a valid API key via x-adcp-auth, X-API-Key, or Authorization: Bearer <key>."
-                },
+                suggestion="Provide a valid API key via x-adcp-auth, X-API-Key, or Authorization: Bearer <key>.",
             )
     except (UnicodeEncodeError, TypeError):
         raise AdCPAuthRequiredError(
             "Authentication required.",
-            details={
-                "suggestion": "Provide a valid API key via x-adcp-auth, X-API-Key, or Authorization: Bearer <key>."
-            },
+            suggestion="Provide a valid API key via x-adcp-auth, X-API-Key, or Authorization: Bearer <key>.",
         )
 
 
@@ -156,7 +152,7 @@ async def tmp_providers_discovery(tenant_id: str, _: None = Depends(require_api_
         if uow.tenant_config.get_tenant() is None:
             raise AdCPAccountNotFoundError(
                 f"Tenant '{tenant_id}' not found.",
-                details={"suggestion": "Provide a valid tenant ID."},
+                suggestion="Provide a valid tenant ID.",
             )
 
         assert uow.tmp_providers is not None

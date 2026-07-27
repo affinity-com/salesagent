@@ -128,7 +128,7 @@ class TestDiscoveryTenantNotFound:
         assert response.status_code == 404
         envelope = response.json()
         assert_envelope_shape(envelope, "ACCOUNT_NOT_FOUND", recovery="terminal", message_substr="not found")
-        assert envelope["errors"][0]["details"]["suggestion"] == "Provide a valid tenant ID."
+        assert envelope["errors"][0]["suggestion"] == "Provide a valid tenant ID."
 
 
 class TestDiscoveryEmptyProviders:
@@ -313,7 +313,7 @@ class TestDiscoveryApiKeyAuth:
         # AUTH_TOKEN_INVALID from the vocabulary entirely, so the bump closed it.
         assert_envelope_shape(envelope, "AUTH_REQUIRED", recovery="correctable")
         assert (
-            envelope["errors"][0]["details"]["suggestion"]
+            envelope["errors"][0]["suggestion"]
             == "Provide a valid API key via x-adcp-auth, X-API-Key, or Authorization: Bearer <key>."
         )
 
@@ -338,7 +338,7 @@ class TestDiscoveryApiKeyAuth:
         # splitting them is an app-wide error-code change, not a TMP one.
         assert_envelope_shape(envelope, "AUTH_REQUIRED", recovery="correctable")
         assert (
-            envelope["errors"][0]["details"]["suggestion"]
+            envelope["errors"][0]["suggestion"]
             == "Provide a valid API key via x-adcp-auth, X-API-Key, or Authorization: Bearer <key>."
         )
 

@@ -211,10 +211,7 @@ class TestHealthSchedulerTickPersistsStatus:
         """After tick(), the provider's health_status column is updated in the DB."""
         import asyncio
 
-        from sqlalchemy import select
-
-        from src.core.database.database_session import get_db_session
-        from src.core.database.models import TMPProvider
+        from src.core.database.repositories.uow import TMPProviderUoW
         from src.services.tmp_health_scheduler import TMPHealthScheduler
 
         with _TMPEnv() as env:
@@ -227,6 +224,7 @@ class TestHealthSchedulerTickPersistsStatus:
             )
             env._commit_factory_data()
             provider_id = provider.provider_id
+            tenant_id = tenant.tenant_id
 
         # Stub the HTTP probe so no real network call is made
         with patch(
@@ -236,14 +234,17 @@ class TestHealthSchedulerTickPersistsStatus:
             scheduler = TMPHealthScheduler()
             asyncio.run(scheduler.tick())
 
-        # Verify the health_status was persisted
-        with get_db_session() as session:
-            stmt = select(TMPProvider).filter_by(provider_id=provider_id)
-            updated = session.scalars(stmt).first()
+        # Verify the health_status was persisted. Read back through the repository
+        # (not get_db_session in a test body) per CLAUDE.md Pattern #8 — this also
+        # grades that the scheduler's write is visible through the same repository
+        # method the admin UI reads.
+        with TMPProviderUoW(tenant_id) as uow:
+            assert uow.tmp_providers is not None
+            updated = uow.tmp_providers.get_by_id(provider_id)
 
-        assert updated is not None
-        assert updated.health_status == "healthy"
-        assert updated.last_health_checked_at is not None
+            assert updated is not None
+            assert updated.health_status == "healthy"
+            assert updated.last_health_checked_at is not None
 
 
 # ---------------------------------------------------------------------------

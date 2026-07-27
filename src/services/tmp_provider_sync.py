@@ -41,7 +41,7 @@ from src.services._provider_http import bearer_headers, provider_client_kwargs, 
 
 if TYPE_CHECKING:
     from src.core.resolved_identity import ResolvedIdentity
-    from src.core.schemas._base import CreateMediaBuyResult, UpdateMediaBuyError, UpdateMediaBuySuccess
+    from src.core.schemas._base import CreateMediaBuyResult, UpdateMediaBuyResult, UpdateMediaBuySubmitted
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 
 def fire_tmp_sync(
-    response: CreateMediaBuyResult | UpdateMediaBuySuccess | UpdateMediaBuyError | None,
+    response: CreateMediaBuyResult | UpdateMediaBuyResult | UpdateMediaBuySubmitted | None,
     identity: ResolvedIdentity | None,
 ) -> None:
     """Spawn a daemon thread to sync TMP packages after a successful media buy operation.
@@ -65,11 +65,18 @@ def fire_tmp_sync(
     REST callers may also use FastAPI BackgroundTasks — both paths converge on
     ``sync_packages_for_media_buy``.
 
-    ``response`` may be a ``CreateMediaBuyResult`` wrapper (create path) or a
-    direct ``UpdateMediaBuySuccess | UpdateMediaBuyError`` (update path).
-    ``CreateMediaBuyResult`` serializes flat but stores the domain response in
-    its ``.response`` field — ``media_buy_id`` lives there, not on the wrapper.
+    ``response`` is whatever the two ``_impl`` functions return:
+    ``CreateMediaBuyResult`` (create path) or
+    ``UpdateMediaBuyResult | UpdateMediaBuySubmitted`` (update path). The
+    ``TaskResultEnvelope`` shapes serialize flat but store the domain response in
+    their ``.response`` field — ``media_buy_id`` lives there, not on the wrapper.
     Uses ``getattr`` with an inner-response fallback to handle both shapes.
+
+    Keep this union in step with those two return annotations: it is what caught
+    the update path's type change when the pin moved to adcp 6.6.0 / spec 3.1.1
+    (``UpdateMediaBuySuccess | UpdateMediaBuyError`` became
+    ``UpdateMediaBuyResult | UpdateMediaBuySubmitted``), which ``response: Any``
+    would have swallowed.
 
     ``identity`` is a ``ResolvedIdentity`` — ``tenant_id`` is extracted here so
     callers don't need to repeat ``identity.tenant_id if identity else None`` at
