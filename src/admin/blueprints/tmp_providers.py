@@ -43,6 +43,7 @@ VALID_UID_TYPES = frozenset(
         "maid",
         "hashed_email",
         "publisher_first_party",
+        "world_id_nullifier",
         "other",
     ]
 )

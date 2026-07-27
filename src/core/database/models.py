@@ -1498,8 +1498,8 @@ class TMPProvider(Base):
         This dict is shared by the admin UI (list/edit views, which need
         ``name`` to render) and the discovery wire
         (``GET /tenant/{id}/tmp-providers/discovery``).
-        ``dist/schemas/3.1.0-beta.3/tmp/provider-registration.json`` is a closed
-        object (``additionalProperties: false``, 10 properties), and this wire
+        ``dist/schemas/3.1.1/trusted-match/provider-registration.json`` is a closed
+        object (``additionalProperties: false``, 11 properties), and this wire
         carries two things that schema does not describe:
 
           1. ``name`` — not in the schema at all. Kept as a human-readable label
@@ -1520,6 +1520,13 @@ class TMPProvider(Base):
         deployed alongside this agent, which reads the fields it knows. Emitting
         a schema-valid response means dropping ``name`` and omitting — not
         nulling — absent conditional fields; left as a follow-up.
+
+        Also not carried: ``tmpx_macros``, the 11th property, added by spec 3.1.1.
+        It declares the provider-namespaced ad-server macro names a provider's
+        TMPX response fills. It is optional in the schema, so omitting it is
+        conformant, and there is no column, admin field, or router consumer for
+        it yet — registering TMPX macros is its own feature, not part of TMP
+        provider registration + package sync.
         """
         result: dict = {
             "provider_id": self.provider_id,

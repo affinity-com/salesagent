@@ -801,7 +801,7 @@ class TestTMPProviderAuthFields:
 class TestValidUidTypesMatchesPinnedSchema:
     """VALID_UID_TYPES must equal the uid-type enum in the pinned AdCP SDK.
 
-    Authority: ``adcp.types.generated_poc.enums.uid_type.UidType`` (adcp==5.7.0,
+    Authority: ``adcp.types.generated_poc.enums.uid_type.UidType`` (adcp==6.6.0,
     pinned in pyproject.toml).  No ``pytest.skip`` fallback — if the import
     fails the guard must fail loudly so the drift is caught immediately.
     """
@@ -809,7 +809,7 @@ class TestValidUidTypesMatchesPinnedSchema:
     def test_valid_uid_types_matches_pinned_schema(self):
         """VALID_UID_TYPES frozenset equals UidType enum values in the pinned adcp SDK.
 
-        Authority: adcp.types.generated_poc.enums.uid_type.UidType (adcp==5.7.0).
+        Authority: adcp.types.generated_poc.enums.uid_type.UidType (adcp==6.6.0).
         Schema path in SDK: adcp/types/generated_poc/enums/uid_type.py.
         """
         from adcp.types.generated_poc.enums.uid_type import UidType  # type: ignore[import]
@@ -819,7 +819,7 @@ class TestValidUidTypesMatchesPinnedSchema:
         sdk_uid_types = frozenset(v.value for v in UidType)
 
         assert VALID_UID_TYPES == sdk_uid_types, (
-            f"VALID_UID_TYPES diverges from the pinned adcp SDK (adcp==5.7.0).\n"
+            f"VALID_UID_TYPES diverges from the pinned adcp SDK (adcp==6.6.0).\n"
             f"  In SDK but not in VALID_UID_TYPES: {sdk_uid_types - VALID_UID_TYPES}\n"
             f"  In VALID_UID_TYPES but not in SDK: {VALID_UID_TYPES - sdk_uid_types}\n"
             f"  Update VALID_UID_TYPES in src/admin/blueprints/tmp_providers.py to match."

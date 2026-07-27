@@ -100,7 +100,7 @@ def fire_tmp_sync(
 def _resolve_seller_agent_url(tenant_id: str) -> str | None:
     """Resolve the seller agent URL for the AvailablePackage.seller_agent field.
 
-    Per ``dist/schemas/3.1.0-beta.3/core/seller-agent-ref.json``, ``agent_url``
+    Per ``dist/schemas/3.1.1/core/seller-agent-ref.json``, ``agent_url``
     MUST use the ``https://`` scheme.  Returns ``None`` when no valid https URL
     can be resolved so the caller can skip the sync rather than emit a
     spec-invalid binding.
@@ -128,7 +128,7 @@ def _resolve_seller_agent_url(tenant_id: str) -> str | None:
             return override
         logger.error(
             "[TMP sync] ADCP_AGENT_URL=%s does not use https:// — ignoring override "
-            "(dist/schemas/3.1.0-beta.3/core/seller-agent-ref.json requires https for agent_url). "
+            "(dist/schemas/3.1.1/core/seller-agent-ref.json requires https for agent_url). "
             "Falling back to tenant virtual_host resolution.",
             sanitize_for_log(override),
         )
@@ -182,13 +182,13 @@ def _build_package_payload(
 ) -> dict[str, Any]:
     """Build the POST /packages/sync payload from a MediaPackage DB row.
 
-    Conforms to ``dist/schemas/3.1.0-beta.3/tmp/available-package.json``
-    (AdCP 3.1.0-beta.3), which has ``additionalProperties: false`` and
+    Conforms to ``dist/schemas/3.1.1/trusted-match/available-package.json``
+    (AdCP 3.1.1), which has ``additionalProperties: false`` and
     requires exactly: ``package_id``, ``media_buy_id``, ``seller_agent``.
     Optional fields allowed by the schema: ``format_ids``, ``catalogs``.
 
     ``seller_agent`` is a structured object per
-    ``dist/schemas/3.1.0-beta.3/core/seller-agent-ref.json``:
+    ``dist/schemas/3.1.1/core/seller-agent-ref.json``:
       ``{"agent_url": "<https://...>"}``
 
     ``agent_url`` MUST use the ``https://`` scheme per the spec.  Callers

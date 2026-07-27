@@ -13,7 +13,7 @@ Covers:
 - Response shape matches TMP Router contract
 - Providers ordered by priority ASC, name ASC
 - Handles legacy rows with null countries/uid_types
-- Fail-closed auth: unset/empty TMP_DISCOVERY_API_KEYS → 503
+- Fail-closed auth: unset/empty TMP_DISCOVERY_API_KEYS → 500 (CONFIGURATION_ERROR)
 - Explicit opt-out: TMP_DISCOVERY_API_KEYS=OPEN disables auth
 - uow.tenant_config is None → 500 (not an assert)
 - TMPProvider.to_dict() serializes both conditional paths correctly
@@ -242,13 +242,14 @@ class TestDiscoveryApiKeyAuth:
 
         AdCPConfigurationError is the right error here: the operator has to configure
         the env var; the buyer cannot recover this themselves.  On the wire this maps
-        to code=SERVICE_UNAVAILABLE with recovery="terminal". Under the pinned
-        3.1.0-beta.3 ``enums/error-code.json``, SERVICE_UNAVAILABLE is classified
-        transient and CONFIGURATION_ERROR is classified terminal — so this
-        code/recovery pairing is self-inconsistent against the pinned enum. The
-        wire-code choice (SERVICE_UNAVAILABLE vs CONFIGURATION_ERROR) is a
-        maintainer-accepted follow-up, not fixed by this test; only the recovery
-        value asserted here is confirmed correct for this failure mode.
+        to code=CONFIGURATION_ERROR with recovery="terminal", which is self-consistent
+        against the pinned ``enums/error-code.json``: 3.1.1 classifies
+        CONFIGURATION_ERROR as terminal (SERVICE_UNAVAILABLE is the transient code).
+
+        This pairing was previously SERVICE_UNAVAILABLE + terminal — flagged in review
+        as self-inconsistent and deferred as a follow-up. Moving to the adcp 6.6.0 /
+        spec 3.1.1 pin resolved it: the SDK now emits CONFIGURATION_ERROR for this
+        exception, so code and recovery agree with the enum and no follow-up remains.
         """
         import os
 
@@ -257,11 +258,10 @@ class TestDiscoveryApiKeyAuth:
             response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 500
-        # CONFIGURATION_ERROR maps to SERVICE_UNAVAILABLE on wire (agreed follow-up
-        # to revisit the code choice); recovery="terminal" matches the operator-must-act
-        # semantics of this failure even though it disagrees with the pinned enum's
-        # SERVICE_UNAVAILABLE=transient classification (see class docstring above).
-        assert_envelope_shape(response.json(), "SERVICE_UNAVAILABLE", recovery="terminal")
+        # AdCPConfigurationError maps to CONFIGURATION_ERROR + terminal under the
+        # adcp 6.6.0 / spec 3.1.1 pin — code and recovery agree with
+        # enums/error-code.json (see docstring for the pre-3.1.1 history).
+        assert_envelope_shape(response.json(), "CONFIGURATION_ERROR", recovery="terminal")
 
     def test_returns_500_when_tmp_discovery_api_keys_is_empty_string(self, client):
         """When TMP_DISCOVERY_API_KEYS is set to empty string the endpoint returns 500 (fail-closed).
@@ -272,11 +272,9 @@ class TestDiscoveryApiKeyAuth:
             response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 500
-        # CONFIGURATION_ERROR maps to SERVICE_UNAVAILABLE on wire (agreed follow-up
-        # to revisit the code choice); recovery="terminal" matches the operator-must-act
-        # semantics of this failure — see test_returns_500_when_tmp_discovery_api_keys_not_set
-        # for the pinned-enum inconsistency this pairing carries.
-        assert_envelope_shape(response.json(), "SERVICE_UNAVAILABLE", recovery="terminal")
+        # Same wire shape as the unset case: CONFIGURATION_ERROR + terminal under the
+        # 3.1.1 pin — see test_returns_500_when_tmp_discovery_api_keys_not_set.
+        assert_envelope_shape(response.json(), "CONFIGURATION_ERROR", recovery="terminal")
 
     def test_open_when_tmp_discovery_api_keys_is_open(self, client):
         """When TMP_DISCOVERY_API_KEYS=OPEN the endpoint is accessible without a key."""
@@ -307,7 +305,13 @@ class TestDiscoveryApiKeyAuth:
 
         assert response.status_code == 401
         envelope = response.json()
-        assert_envelope_shape(envelope, "AUTH_TOKEN_INVALID", recovery="terminal")
+        # AUTH_REQUIRED + correctable is the spec-grounded pairing under the
+        # adcp 6.6.0 / spec 3.1.1 pin: enums/error-code.json enumMetadata gives
+        # AUTH_REQUIRED {"recovery": "correctable"} ("provide credentials when
+        # missing"). The previous assertion pinned AUTH_TOKEN_INVALID + terminal
+        # and was deferred in review as an agreed follow-up; 3.1.1 removed
+        # AUTH_TOKEN_INVALID from the vocabulary entirely, so the bump closed it.
+        assert_envelope_shape(envelope, "AUTH_REQUIRED", recovery="correctable")
         assert (
             envelope["errors"][0]["details"]["suggestion"]
             == "Provide a valid API key via x-adcp-auth, X-API-Key, or Authorization: Bearer <key>."
@@ -323,7 +327,16 @@ class TestDiscoveryApiKeyAuth:
 
         assert response.status_code == 401
         envelope = response.json()
-        assert_envelope_shape(envelope, "AUTH_TOKEN_INVALID", recovery="terminal")
+        # Same pairing as the missing-key case — see
+        # test_returns_401_when_no_key_provided_and_keys_configured.
+        #
+        # Worth noting for the follow-up: 3.1.1 also added AUTH_MISSING
+        # (correctable) and AUTH_INVALID (terminal, "credentials were rejected,
+        # do NOT auto-retry"), which distinguish this case from the one above.
+        # Both 401 paths currently emit AUTH_REQUIRED because they share
+        # AdCPAuthenticationError with every other auth boundary in the app;
+        # splitting them is an app-wide error-code change, not a TMP one.
+        assert_envelope_shape(envelope, "AUTH_REQUIRED", recovery="correctable")
         assert (
             envelope["errors"][0]["details"]["suggestion"]
             == "Provide a valid API key via x-adcp-auth, X-API-Key, or Authorization: Bearer <key>."
