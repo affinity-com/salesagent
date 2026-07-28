@@ -174,7 +174,7 @@ class TestSyncUnchangedCount:
             unchanged_result = SyncCreativeResult(
                 creative_id="c1",
                 action=CreativeAction.unchanged,
-                status="approved",
+                internal_status="approved",
                 platform_id=None,
                 review_feedback=None,
                 assigned_to=None,
@@ -220,7 +220,7 @@ class TestSyncAiReviewReasonOnUpdate:
             update_result = SyncCreativeResult(
                 creative_id="c1",
                 action=CreativeAction.updated,
-                status="pending_review",
+                internal_status="pending_review",
                 platform_id=None,
                 review_feedback=None,
                 assigned_to=None,
@@ -276,7 +276,7 @@ class TestSyncProvenanceWarningOnUpdate:
             update_result = SyncCreativeResult(
                 creative_id="c1",
                 action=CreativeAction.updated,
-                status="approved",
+                internal_status="approved",
                 platform_id=None,
                 review_feedback=None,
                 assigned_to=None,
@@ -333,7 +333,7 @@ class TestSyncMixedMessageSuffix:
             update_result = SyncCreativeResult(
                 creative_id="c2",
                 action=CreativeAction.updated,
-                status="approved",
+                internal_status="approved",
                 platform_id=None,
                 review_feedback=None,
                 assigned_to=None,
@@ -662,11 +662,15 @@ class TestListingEdgeCases:
     """Lines 184-185, 271, 274 in listing.py."""
 
     def test_validation_error_in_list_creatives_request(self, identity):
-        """Lines 184-185: ValidationError from ListCreativesRequest raises AdCPValidationError."""
+        """ValidationError from ListCreativesRequest construction raises AdCPValidationError.
+
+        Request construction (and its ValidationError translation) now lives in
+        _build_list_creatives_request, so patch the name the builder resolves.
+        """
         from pydantic import ValidationError
 
         from src.core.exceptions import AdCPValidationError
-        from src.core.tools.creatives.listing import _list_creatives_impl
+        from src.core.tools.creatives.listing import _build_list_creatives_request
 
         ve = ValidationError.from_exception_data(
             title="ListCreativesRequest",
@@ -681,10 +685,10 @@ class TestListingEdgeCases:
         )
 
         with (
-            patch("src.core.schemas.ListCreativesRequest", side_effect=ve),
+            patch("src.core.tools.creatives.listing.ListCreativesRequest", side_effect=ve),
             pytest.raises(AdCPValidationError),
         ):
-            _list_creatives_impl(identity=identity)
+            _build_list_creatives_request()
 
 
 # ===========================================================================

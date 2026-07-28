@@ -9,10 +9,8 @@ from src.core.creative_agent_registry import (
     _KNOWN_ASSET_TYPES,
     CreativeAgent,
     CreativeAgentRegistry,
-    _get_mock_formats,
 )
 from src.core.exceptions import AdCPAdapterError, AdCPAuthenticationError, AdCPServiceUnavailableError
-
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -414,9 +412,9 @@ class TestKnownAssetTypes:
         )
 
     def test_known_asset_types_covers_full_sdk_union(self):
-        """_KNOWN_ASSET_TYPES must match all 16 asset_type Literals the SDK's
-        Format.assets discriminated union actually accepts (14 from
-        AssetContentType + zip + card), not just the 14-member response enum.
+        """_KNOWN_ASSET_TYPES must match all 17 asset_type Literals the SDK's
+        Format.assets discriminated union actually accepts (15 from
+        AssetContentType + zip + card), not just the response enum.
         """
         expected = {
             "image",
@@ -433,6 +431,7 @@ class TestKnownAssetTypes:
             "webhook",
             "brief",
             "catalog",
+            "published_post",
             "zip",
             "card",
         }
@@ -440,20 +439,6 @@ class TestKnownAssetTypes:
             f"_KNOWN_ASSET_TYPES drifted from the SDK's full asset_type union: "
             f"missing={expected - _KNOWN_ASSET_TYPES}, extra={_KNOWN_ASSET_TYPES - expected}"
         )
-
-    def test_text_ad_search_mock_format_present(self):
-        """text_ad_search mock format must be in _get_mock_formats() (Change 4)."""
-        mock_formats = _get_mock_formats()
-        format_ids = {fmt.format_id.id for fmt in mock_formats}
-        assert "text_ad_search" in format_ids, "text_ad_search mock format must be registered for testing mode"
-
-    def test_text_ad_search_format_has_assets(self):
-        """text_ad_search mock format must have assets defined."""
-        mock_formats = _get_mock_formats()
-        text_ad_search = next((fmt for fmt in mock_formats if fmt.format_id.id == "text_ad_search"), None)
-        assert text_ad_search is not None
-        assert text_ad_search.assets is not None
-        assert len(text_ad_search.assets) > 0, "text_ad_search must have at least one asset slot"
 
 
 class TestBuildCreativeUsesADCPClient:
@@ -577,12 +562,17 @@ class TestBuildCreativeUsesADCPClient:
         assert result.get("status") == "draft"
 
     @pytest.mark.asyncio
-    async def test_build_creative_translates_auth_error_to_terminal(self):
-        """build_creative must translate ADCPAuthenticationError to a terminal AdCPAuthenticationError.
+    async def test_build_creative_translates_auth_error_to_typed_auth_error(self):
+        """build_creative must translate ADCPAuthenticationError to AdCPAuthenticationError.
 
         Mirrors _fetch_formats_from_agent's translation via raise_mapped_adcp_error:
         an SDK auth failure must not fall through to a blanket except that would
-        classify it as retryable "transient" — rejected credentials are terminal.
+        classify it as a generic retryable "transient" adapter outage — the auth
+        type, and with it the AUTH_REQUIRED wire code, must survive.
+
+        Recovery is ``correctable``, per the pinned AdCP error-code enum
+        (``AUTH_REQUIRED.recovery == "correctable"``) — see
+        ``AdCPAuthenticationError``'s docstring (#1417).
         """
         from adcp.exceptions import ADCPAuthenticationError
 
@@ -604,8 +594,11 @@ class TestBuildCreativeUsesADCPClient:
                     message="Build a banner ad",
                 )
 
-        assert exc_info.value.recovery == "terminal", (
-            "Rejected credentials must be terminal — retrying a rejected auth token loops forever"
+        assert exc_info.value.error_code == "AUTH_REQUIRED", (
+            "SDK auth failure must keep the AUTH_REQUIRED wire code, not collapse to a generic adapter error"
+        )
+        assert exc_info.value.recovery == "correctable", (
+            "Recovery must follow the pinned AdCP error-code enum (AUTH_REQUIRED → correctable)"
         )
 
     @pytest.mark.asyncio

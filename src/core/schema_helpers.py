@@ -10,8 +10,8 @@ Philosophy:
 - Custom logic (validators, conversions) lives here, not in wrapper classes
 """
 
-import re
 from typing import Any
+from urllib.parse import urlparse
 
 # FIXME(#1388): GetProductsResponse, Product have local subclasses; import from src.core.schemas.
 from adcp import CreativeFilters, GetProductsResponse, Product
@@ -23,75 +23,124 @@ from adcp.types import (
     ContextObject,
     ProductFilters,
     PropertyListReference,
+    PushNotificationConfig,
     ReportingWebhook,
 )
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from src.core.exceptions import AdCPValidationError
 from src.core.schemas.product import GetProductsRequest
-from src.core.validation_helpers import format_validation_error
+from src.core.validation_helpers import adcp_validation_boundary
 
 
-def _normalize_brand_domain_string(brand_str: str) -> str:
-    """Normalize a plain brand string to a bare lowercase hostname.
+def _coerce_wire_object[ModelT: BaseModel](value: Any, model_cls: type[ModelT], context: str) -> ModelT | None:
+    """Shared dict → typed-model coercion with the boundary BUILT IN.
 
-    ``brand-ref.json`` requires ``domain`` to be a bare lowercase hostname (no
-    scheme, path, query, or fragment). Buyer-supplied shorthand strings
-    ("https://example.com/path?q=1", "Example.COM") are common, so this strips
-    scheme/path/query/fragment and lowercases the result before it reaches
-    ``BrandReference``.
+    Single home for the ``to_*`` helpers' isinstance ladder. The internal
+    ``adcp_validation_boundary`` means a malformed wire dict rejects as a
+    typed ``AdCPValidationError`` (message + field + top-level suggestion)
+    from EVERY call site — callers cannot forget the boundary
+    (#1417; mirrors ``coerce_creative_filters``).
+
+    Returns ``None`` for non-dict unexpected types, preserving the helpers'
+    long-standing fallback behavior.
     """
-    domain = re.sub(r"^https?://", "", brand_str, flags=re.IGNORECASE)
-    domain = domain.split("/")[0].split("?")[0].split("#")[0]
-    return domain.lower().strip()
+    if value is None or isinstance(value, model_cls):
+        return value
+    if isinstance(value, dict):
+        with adcp_validation_boundary(context=context):
+            # model_validate handles plain models and RootModels alike
+            # (AccountReference is a RootModel — field-unpacking would break it).
+            return model_cls.model_validate(value)
+    return None  # Fallback for unexpected types
 
 
 def to_context_object(context: dict[str, Any] | ContextObject | None) -> ContextObject | None:
-    """Convert dict context to ContextObject for adcp 2.12.0+ compatibility.
-
-    Args:
-        context: Context as dict or ContextObject or None
-
-    Returns:
-        ContextObject or None
-    """
-    if context is None:
-        return None
-    if isinstance(context, ContextObject):
-        return context
-    if isinstance(context, dict):
-        return ContextObject(**context)
-    return None  # Fallback for unexpected types
+    """Convert dict context to ContextObject for adcp 2.12.0+ compatibility."""
+    return _coerce_wire_object(context, ContextObject, "context value")
 
 
 def to_reporting_webhook(webhook: dict[str, Any] | ReportingWebhook | None) -> ReportingWebhook | None:
-    """Convert dict to ReportingWebhook for adcp type compatibility.
+    """Convert dict to ReportingWebhook for adcp type compatibility."""
+    return _coerce_wire_object(webhook, ReportingWebhook, "reporting_webhook value")
 
-    Args:
-        webhook: Webhook config as dict or ReportingWebhook or None
 
-    Returns:
-        ReportingWebhook or None
+def to_push_notification_config(
+    config: dict[str, Any] | PushNotificationConfig | None,
+) -> PushNotificationConfig | None:
+    """Convert dict to PushNotificationConfig for adcp type compatibility."""
+    return _coerce_wire_object(config, PushNotificationConfig, "push_notification_config value")
+
+
+def is_url_shorthand(value: str) -> bool:
+    """Return True when a string looks like a URL (scheme or protocol-relative)."""
+    return "://" in value or value.startswith("//")
+
+
+def brand_shorthand_to_domain(value: str) -> str:
+    """Normalize AdCP v3 brand string shorthand to a domain hostname.
+
+    Storyboard runners may send ``https://test.example``; ``BrandReference.domain``
+    expects a hostname (no scheme/path) per the adcp library pattern.
+
+    Returns empty string when a URL-shaped value cannot be parsed into a hostname
+    (malformed IPv6, etc.) so legacy ``brand_manifest`` middleware can silently
+    strip the field. Callers on the explicit ``brand`` path must use
+    ``to_brand_reference`` / ``_coerce_domain_or_raise`` instead — those raise
+    ``AdCPValidationError(field="brand")`` rather than dropping the brand.
     """
-    if webhook is None:
-        return None
-    if isinstance(webhook, ReportingWebhook):
-        return webhook
-    if isinstance(webhook, dict):
-        return ReportingWebhook(**webhook)
-    return None  # Fallback for unexpected types
+    value = value.strip()
+    if not value:
+        return value
+    if is_url_shorthand(value):
+        try:
+            parsed = urlparse(value if "://" in value else f"https:{value}")
+        except ValueError:
+            return ""
+        if parsed.hostname:
+            return parsed.hostname.lower()
+        return ""
+    return value.lower()
+
+
+def _coerce_domain_or_raise(raw: str) -> str:
+    """Normalize brand shorthand and validate against BrandReference.domain pattern.
+
+    Used for explicit ``brand`` on tool boundaries — malformed input must surface
+    as ``VALIDATION_ERROR / field="brand"``, not be coerced to missing brand
+    (which would mis-route ``require_brand`` policy to an authorization error).
+
+    Raises:
+        AdCPValidationError: when the value cannot be normalized to a valid hostname
+            (empty parse, path/underscore/IDN/pattern mismatch). Always tagged
+            ``field="brand"`` so wire envelopes name the request field.
+    """
+    domain = brand_shorthand_to_domain(raw)
+    if not domain:
+        raise AdCPValidationError(
+            f"Invalid brand: could not derive domain from brand shorthand {raw!r}",
+            field="brand",
+        )
+    try:
+        BrandReference(domain=domain)
+    except ValidationError as e:
+        raise AdCPValidationError(
+            f"Invalid brand: domain {domain!r} is not a valid hostname",
+            field="brand",
+        ) from e
+    return domain
 
 
 def to_brand_reference(brand: dict[str, Any] | BrandReference | str | None) -> BrandReference | None:
     """Convert dict/string brand to BrandReference for adcp 3.6.0 compatibility.
 
     The single converter for all str/dict/model → BrandReference paths in the
-    codebase (creative build, get_products, create_media_buy) — routing every
-    caller through here means a scheme-bearing or uppercase string ("https://
-    Example.COM/path") is normalized the same way everywhere, instead of
-    raising an unhandled ``ValidationError`` on paths that construct
-    ``BrandReference`` directly with the raw string. ``brand-ref.json``
-    requires ``domain`` to be a bare lowercase hostname.
+    codebase (creative build, get_products, create_media_buy). String and dict
+    ``domain`` values share one normalize-then-validate funnel so ``"ACME.COM"``
+    / ``{"domain":"ACME.COM"}`` / URL-in-domain are equivalent, instead of a
+    direct ``BrandReference`` construction raising an unhandled
+    ``ValidationError`` on one path and normalizing on another.
+    ``brand-ref.json`` requires ``domain`` to be a bare lowercase hostname.
 
     Args:
         brand: Brand as dict, string domain shorthand, BrandReference, or None
@@ -100,64 +149,48 @@ def to_brand_reference(brand: dict[str, Any] | BrandReference | str | None) -> B
         BrandReference or None
 
     Raises:
-        AdCPValidationError: when ``brand`` is a dict/string that fails
-            BrandReference validation (e.g. malformed domain) — a typed,
-            correctable error rather than a raw ``ValidationError`` crash.
+        AdCPValidationError: when an explicit brand cannot be coerced to a valid
+            ``BrandReference`` (tagged ``field="brand"``) — a typed, correctable
+            error rather than a raw ``ValidationError`` crash.
     """
     if brand is None:
         return None
     if isinstance(brand, BrandReference):
         return brand
-    try:
+    # Raise-capable coercion routes through the internal boundary (like
+    # ``coerce_creative_filters``/``_coerce_wire_object``) so a malformed brand
+    # rejects as a typed AdCPValidationError with field + top-level suggestion
+    # from every call site — no hand-rolled ValidationError translation (#1417).
+    with adcp_validation_boundary(context="brand", field="brand"):
         if isinstance(brand, str):
-            return BrandReference(domain=_normalize_brand_domain_string(brand))
+            return BrandReference(domain=_coerce_domain_or_raise(brand))
         if isinstance(brand, dict):
-            return BrandReference.model_validate(brand)
-    except ValidationError as e:
+            domain_raw = brand.get("domain")
+            if not isinstance(domain_raw, str):
+                raise AdCPValidationError(
+                    "Invalid brand: domain is required",
+                    field="brand",
+                )
+            allowed = BrandReference.model_fields.keys()
+            ref_data = {key: value for key, value in brand.items() if key in allowed}
+            ref_data["domain"] = _coerce_domain_or_raise(domain_raw)
+            return BrandReference(**ref_data)
         raise AdCPValidationError(
-            format_validation_error(e, context="brand"),
-            suggestion="brand.domain must be a bare lowercase hostname, e.g. 'acme.com'.",
-        ) from e
-    return None  # Fallback for unexpected types
+            f"Invalid brand: expected dict, string, or BrandReference, got {type(brand).__name__}",
+            field="brand",
+        )
 
 
 def to_account_reference(account: dict[str, Any] | AccountReference | None) -> AccountReference | None:
-    """Convert dict to AccountReference for adcp compatibility.
-
-    Args:
-        account: Account reference as dict, AccountReference, or None
-
-    Returns:
-        AccountReference or None
-    """
-    if account is None:
-        return None
-    if isinstance(account, AccountReference):
-        return account
-    if isinstance(account, dict):
-        # AccountReference is a RootModel, so validate the whole value instead of field-unpacking.
-        return AccountReference.model_validate(account)
-    return None  # Fallback for unexpected types
+    """Convert dict to AccountReference for adcp compatibility."""
+    return _coerce_wire_object(account, AccountReference, "account value")
 
 
 def to_property_list_reference(
     property_list: dict[str, Any] | PropertyListReference | None,
 ) -> PropertyListReference | None:
-    """Convert dict to PropertyListReference for adcp compatibility.
-
-    Args:
-        property_list: Property list reference as dict or PropertyListReference or None
-
-    Returns:
-        PropertyListReference or None
-    """
-    if property_list is None:
-        return None
-    if isinstance(property_list, PropertyListReference):
-        return property_list
-    if isinstance(property_list, dict):
-        return PropertyListReference(**property_list)
-    return None  # Fallback for unexpected types
+    """Convert dict to PropertyListReference for adcp compatibility."""
+    return _coerce_wire_object(property_list, PropertyListReference, "property_list value")
 
 
 def coerce_creative_filters(filters: dict[str, Any] | CreativeFilters | None) -> CreativeFilters | None:
@@ -186,13 +219,8 @@ def coerce_creative_filters(filters: dict[str, Any] | CreativeFilters | None) ->
     """
     if filters is None or isinstance(filters, CreativeFilters):
         return filters
-    try:
+    with adcp_validation_boundary(context="list_creatives filters"):
         return CreativeFilters.model_validate(filters)
-    except ValidationError as e:
-        raise AdCPValidationError(
-            format_validation_error(e, context="list_creatives filters"),
-            suggestion="Fix the filters object — e.g. concept_ids must contain at least 1 concept id.",
-        ) from e
 
 
 def create_get_products_request(
@@ -240,9 +268,13 @@ def create_get_products_request(
 
 # Re-export commonly used generated types for convenience
 __all__ = [
+    "is_url_shorthand",
+    "brand_shorthand_to_domain",
     "to_account_reference",
     "to_brand_reference",
     "to_context_object",
+    "to_property_list_reference",
+    "to_push_notification_config",
     "to_reporting_webhook",
     "coerce_creative_filters",
     "create_get_products_request",

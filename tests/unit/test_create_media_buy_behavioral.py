@@ -5,7 +5,7 @@ wrappers must use model_dump(mode='json') so that Pydantic v2 AnyUrl fields and
 enum instances are converted to plain Python strings before reaching _impl and
 SQLAlchemy String columns.
 
-Also covers brand propagation (Change 5): _brand_str_to_ref() must convert
+Also covers brand propagation (Change 5): to_brand_reference() must convert
 plain brand strings to AdCP BrandRef-shaped dicts (bare hostname, no scheme/path).
 
 Also covers media_buy_brand propagation (Bug 4 fix): _create_media_buy_impl must
@@ -19,15 +19,17 @@ Obligation IDs:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.core.helpers.creative_helpers import _brand_str_to_ref
+from src.core.schema_helpers import to_brand_reference
 from src.core.schemas import CreateMediaBuyRequest
 from tests.factories import PrincipalFactory
 from tests.helpers.create_media_buy_capture import capture_a2a_forwarded_pnc, capture_mcp_forwarded_pnc
-from tests.unit._media_buy_mock_helpers import future as _future, mock_pricing_option
+from tests.unit._media_buy_mock_helpers import future as _future
+from tests.unit._media_buy_mock_helpers import mock_pricing_option
 
 # ---------------------------------------------------------------------------
 # Shared helpers for TestMediaBuyBrandPropagation
@@ -226,7 +228,7 @@ class TestA2AWrapperPncJsonSerialization:
 
 
 class TestBrandStrToRef:
-    """_brand_str_to_ref converts plain brand strings to typed BrandReference (Change 5).
+    """to_brand_reference converts plain brand strings to typed BrandReference (Change 5).
 
     AdCP 3.1 BrandReference.domain requires a bare hostname (no scheme, no path).
     The helper must strip URL scheme and path components so adapters can read
@@ -239,55 +241,55 @@ class TestBrandStrToRef:
 
     def test_plain_domain_unchanged(self):
         """A bare domain string is returned as-is in the domain field."""
-        result = _brand_str_to_ref("example.com")
+        result = to_brand_reference("example.com")
         assert result.domain == "example.com"
 
     def test_https_scheme_stripped(self):
         """https:// scheme is stripped, leaving only the hostname."""
-        result = _brand_str_to_ref("https://example.com")
+        result = to_brand_reference("https://example.com")
         assert result.domain == "example.com"
 
     def test_http_scheme_stripped(self):
         """http:// scheme is stripped, leaving only the hostname."""
-        result = _brand_str_to_ref("http://example.com")
+        result = to_brand_reference("http://example.com")
         assert result.domain == "example.com"
 
     def test_path_stripped(self):
         """URL path is stripped — only the hostname is kept."""
-        result = _brand_str_to_ref("https://example.com/path/to/page")
+        result = to_brand_reference("https://example.com/path/to/page")
         assert result.domain == "example.com"
 
     def test_query_string_stripped(self):
         """Query string is stripped — only the hostname is kept."""
-        result = _brand_str_to_ref("https://example.com/path?q=1&foo=bar")
+        result = to_brand_reference("https://example.com/path?q=1&foo=bar")
         assert result.domain == "example.com"
 
     def test_fragment_stripped(self):
         """URL fragment is stripped — only the hostname is kept."""
-        result = _brand_str_to_ref("https://example.com/page#section")
+        result = to_brand_reference("https://example.com/page#section")
         assert result.domain == "example.com"
 
     def test_full_url_all_components_stripped(self):
         """Full URL with scheme, path, query, and fragment → bare hostname."""
-        result = _brand_str_to_ref("https://example.com/path?q=1#anchor")
+        result = to_brand_reference("https://example.com/path?q=1#anchor")
         assert result.domain == "example.com"
 
     def test_result_is_brand_reference(self):
         """Result is always a typed BrandReference, not a loose dict."""
         from adcp.types import BrandReference
 
-        result = _brand_str_to_ref("https://example.com")
+        result = to_brand_reference("https://example.com")
         assert isinstance(result, BrandReference)
         assert result.domain == "example.com"
 
     def test_domain_is_lowercase(self):
         """Domain is lowercased for consistent comparison."""
-        result = _brand_str_to_ref("https://Example.COM/Path")
+        result = to_brand_reference("https://Example.COM/Path")
         assert result.domain == "example.com"
 
     def test_subdomain_preserved(self):
         """Subdomains are preserved in the domain field."""
-        result = _brand_str_to_ref("https://ads.example.com/campaign")
+        result = to_brand_reference("https://ads.example.com/campaign")
         assert result.domain == "ads.example.com"
 
 
@@ -357,6 +359,7 @@ class TestToBrandReferenceNormalization:
             ext=None,
             account=None,
             idempotency_key="test-idempotency-key-0001",
+            paused=None,
         )
         assert req.brand is not None
         assert req.brand.domain == "example.com"

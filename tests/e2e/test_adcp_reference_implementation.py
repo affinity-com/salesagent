@@ -9,18 +9,15 @@ import uuid
 from time import sleep
 
 import pytest
-from fastmcp.client import Client
-from fastmcp.client.transports import StreamableHttpTransport
 
 from tests.e2e._webhook_capture import WebhookCaptureHandler, run_webhook_capture_server
 from tests.e2e.adcp_request_builder import (
-    build_adcp_media_buy_request,
     build_creative,
+    build_default_campaign_request,
     build_sync_creatives_request,
-    create_media_buy_via_client,
-    get_test_date_range,
     parse_tool_result,
 )
+from tests.e2e.utils import make_mcp_client
 
 
 class WebhookReceiver(WebhookCaptureHandler):
@@ -42,20 +39,14 @@ class TestAdCPReferenceImplementation:
 
     @pytest.mark.asyncio
     async def test_complete_campaign_lifecycle_with_webhooks(
-        self, docker_services_e2e, live_server, test_auth_token, webhook_server
+        self, docker_services_e2e, live_server, test_auth_token, webhook_server, auto_approval_adapter
     ):
         """Discovery → create → creatives → delivery → update → verify, over sync + webhook responses."""
         print("\n" + "=" * 80)
         print("REFERENCE E2E TEST: Complete Campaign Lifecycle")
         print("=" * 80)
 
-        headers = {
-            "x-adcp-auth": test_auth_token,
-            "x-adcp-tenant": "ci-test",
-        }
-        transport = StreamableHttpTransport(url=f"{live_server['mcp']}/mcp/", headers=headers)
-
-        async with Client(transport=transport) as client:
+        async with make_mcp_client(live_server, token=test_auth_token) as client:
             print("\n📦 PHASE 1: Product Discovery")
 
             products_result = await client.call_tool(
@@ -93,15 +84,9 @@ class TestAdCPReferenceImplementation:
 
             print("\n🎯 PHASE 2: Create Media Buy (with webhook for async updates)")
 
-            start_time, end_time = get_test_date_range(days_from_now=1, duration_days=30)
-
-            media_buy_request = build_adcp_media_buy_request(
-                product_ids=[product_id],
-                total_budget=5000.0,
-                start_time=start_time,
-                end_time=end_time,
-                brand={"domain": "testbrand.com"},
-                pricing_option_id=pricing_option_id,
+            media_buy_request = build_default_campaign_request(
+                product_id,
+                pricing_option_id,
                 targeting_overlay={
                     "geo_countries": ["US", "CA"],
                 },
@@ -256,23 +241,31 @@ class TestAdCPReferenceImplementation:
             "fires; update_media_buy needs the same treatment. Remove this marker once it does."
         ),
     )
-    async def test_update_media_buy_push_webhook_delivery(self, docker_services_e2e, live_server, test_auth_token):
+    async def test_update_media_buy_push_webhook_delivery(
+        self, docker_services_e2e, live_server, test_auth_token, auto_approval_adapter
+    ):
         """update_media_buy must deliver a task-status push webhook to the configured URL.
 
         Uses the shared helper's default (reachable) callback host — not the lifecycle's
         loopback-pinned fixture — so the webhook lands once the server links the mapping
         before firing. Discovers all ids from prior responses.
         """
-        headers = {"x-adcp-auth": test_auth_token, "x-adcp-tenant": "ci-test"}
-        transport = StreamableHttpTransport(url=f"{live_server['mcp']}/mcp/", headers=headers)
-
         with run_webhook_capture_server(WebhookReceiver, WebhookReceiver.received_webhooks) as webhook:
-            async with Client(transport=transport) as client:
-                # create is the only op that persists the PushNotificationConfig row delivery needs.
-                media_buy_id, _ = await create_media_buy_via_client(
-                    client,
-                    push_notification_url=webhook["url"],
+            async with make_mcp_client(live_server, token=test_auth_token) as client:
+                products_data = parse_tool_result(
+                    await client.call_tool(
+                        "get_products", {"brand": {"domain": "testbrand.com"}, "brief": "display advertising"}
+                    )
                 )
+                product = products_data["products"][0]
+                pricing_option_id = product["pricing_options"][0]["pricing_option_id"]
+
+                # create is the only op that persists the PushNotificationConfig row delivery needs.
+                create_request = build_default_campaign_request(product["product_id"], pricing_option_id)
+                create_request["push_notification_config"] = {"url": webhook["url"]}
+                create_data = parse_tool_result(await client.call_tool("create_media_buy", create_request))
+                media_buy_id = create_data.get("media_buy_id")
+                assert media_buy_id, f"create_media_buy must return media_buy_id; got: {create_data}"
 
                 # create_media_buy delivers its completion webhook and may re-deliver it, so drain to
                 # quiescence: wait for the first, then keep clearing until a quiet window passes with

@@ -8,12 +8,9 @@ All helpers enforce the NEW AdCP V2.3 format with proper schema validation.
 import uuid
 import warnings
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from tests.factories.creative_asset import build_assets, image_spec
-
-if TYPE_CHECKING:
-    from fastmcp.client import Client
 
 
 def generate_buyer_ref(prefix: str = "test") -> str:
@@ -305,57 +302,71 @@ def get_test_date_range(days_from_now: int = 1, duration_days: int = 30) -> tupl
     return (start.isoformat(), end.isoformat())
 
 
-async def create_media_buy_via_client(
-    client: "Client",
-    brand: dict[str, Any] | None = None,
-    brief: str = "display advertising",
+def build_a2a_message_send(
+    *,
+    text: str | None = None,
+    skill: str | None = None,
+    parameters: dict[str, Any] | None = None,
+    context_id: str | None = None,
+    push_notification_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build an A2A JSON-RPC ``message/send`` envelope (GH #1423 consolidation).
+
+    Single home for the envelope previously copy-pasted across the a2a e2e
+    files. Exactly one of ``text`` (natural-language part) or ``skill``
+    (explicit-skill data part, with ``parameters``) must be given. ``context_id``
+    defaults to a fresh uuid; ``push_notification_config`` (webhook tests) is
+    placed under ``params.configuration.pushNotificationConfig``.
+    """
+    if (text is None) == (skill is None):
+        raise ValueError("build_a2a_message_send: provide exactly one of text= or skill=")
+    part: dict[str, Any]
+    if text is not None:
+        part = {"kind": "text", "text": text}
+    else:
+        part = {"kind": "data", "data": {"skill": skill, "parameters": parameters or {}}}
+    params: dict[str, Any] = {
+        "message": {
+            "messageId": str(uuid.uuid4()),
+            "contextId": context_id or str(uuid.uuid4()),
+            "role": "user",  # Required by A2A spec
+            "parts": [part],
+        }
+    }
+    if push_notification_config is not None:
+        params["configuration"] = {"pushNotificationConfig": push_notification_config}
+    return {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "message/send",
+        "params": params,
+    }
+
+
+def build_default_campaign_request(
+    product_id: str,
+    pricing_option_id: str,
+    *,
     total_budget: float = 5000.0,
-    push_notification_url: str | None = None,
     days_from_now: int = 1,
     duration_days: int = 30,
-) -> tuple[str, str]:
-    """Discover the first product and create a media buy, returning (media_buy_id, pricing_option_id).
+    brand_domain: str = "testbrand.com",
+    **overrides: Any,
+) -> dict[str, Any]:
+    """Build the default e2e campaign request (GH #1423 consolidation).
 
-    Encapsulates the repeated get_products → build_adcp_media_buy_request → create_media_buy
-    sequence used across multiple E2E tests so each test does not duplicate the same block.
-
-    Args:
-        client: An active FastMCP Client already connected to the server.
-        brand: Brand reference dict (default: ``{"domain": "testbrand.com"}``).
-        brief: Product discovery brief string.
-        total_budget: Total budget for the created media buy.
-        push_notification_url: If provided, sets ``push_notification_config.url`` on the request.
-        days_from_now: Campaign start offset in days from now.
-        duration_days: Campaign duration in days.
-
-    Returns:
-        ``(media_buy_id, pricing_option_id)`` — both discovered dynamically from server responses.
+    Single home for the "$5000 testbrand.com buy starting tomorrow for 30 days"
+    block previously copy-pasted across the lifecycle/reference/creative e2e
+    suites. Anything test-specific (targeting_overlay, webhook_url, context, ...)
+    passes through ``**overrides`` to :func:`build_adcp_media_buy_request`.
     """
-    if brand is None:
-        brand = {"domain": "testbrand.com"}
-
-    products_data = parse_tool_result(await client.call_tool("get_products", {"brand": brand, "brief": brief}))
-    assert products_data.get("products"), f"get_products returned no products; got: {products_data}"
-    product = products_data["products"][0]
-    assert product.get("pricing_options"), (
-        f"Product {product.get('product_id')} must expose pricing_options; got: {product}"
-    )
-    pricing_option_id = product["pricing_options"][0]["pricing_option_id"]
-
     start_time, end_time = get_test_date_range(days_from_now=days_from_now, duration_days=duration_days)
-    create_request = build_adcp_media_buy_request(
-        product_ids=[product["product_id"]],
+    return build_adcp_media_buy_request(
+        product_ids=[product_id],
         total_budget=total_budget,
         start_time=start_time,
         end_time=end_time,
-        brand=brand,
+        brand={"domain": brand_domain},
         pricing_option_id=pricing_option_id,
+        **overrides,
     )
-    if push_notification_url is not None:
-        create_request["push_notification_config"] = {"url": push_notification_url}
-
-    create_data = parse_tool_result(await client.call_tool("create_media_buy", create_request))
-    media_buy_id = create_data.get("media_buy_id")
-    assert media_buy_id, f"create_media_buy must return media_buy_id; got: {create_data}"
-
-    return media_buy_id, pricing_option_id
