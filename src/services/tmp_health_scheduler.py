@@ -19,10 +19,11 @@ Design principles (matching tmp_provider_sync.py):
   cannot cancel the remaining probes.
 
 Singleton pattern (same as delivery_webhook_scheduler and media_buy_status_scheduler):
-Each scheduler module owns its own ``_scheduler`` global, ``get_*()``,
-``start_*()``, and ``stop_*()`` functions.  This is intentional: it keeps each
-scheduler independently testable (tests can construct a fresh instance without
-touching the global) and avoids coupling the base class to module-level state.
+the module-level ``get_*()`` / ``start_*()`` / ``stop_*()`` trio is bound from
+``_scheduler_base.make_singleton()`` rather than hand-rolled, so all three
+scheduler modules share one implementation.  Each module still owns its own
+cached instance, and tests can construct a fresh ``TMPHealthScheduler()``
+directly without touching it.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ from src.core.database.repositories.tmp_provider import TMPProviderRepository
 from src.core.database.repositories.uow import TMPProviderUoW
 from src.core.security.url_validator import sanitize_for_log
 from src.services._provider_http import provider_client_kwargs, provider_url
-from src.services._scheduler_base import IntervalScheduler, _parse_interval_env
+from src.services._scheduler_base import IntervalScheduler, _parse_interval_env, make_singleton
 
 logger = logging.getLogger(__name__)
 
@@ -135,27 +136,13 @@ class TMPHealthScheduler(IntervalScheduler):
 
 
 # ---------------------------------------------------------------------------
-# Global singleton (same pattern as delivery_webhook_scheduler)
+# Global singleton — derived from the shared factory, not hand-rolled.
+# main.py's _run_scheduler_fn reaches start_/stop_ by getattr off
+# _SCHEDULER_REGISTRY, so these exist only to be found by name.
 # ---------------------------------------------------------------------------
 
-_scheduler: TMPHealthScheduler | None = None
-
-
-def get_tmp_health_scheduler() -> TMPHealthScheduler:
-    """Get or create the global TMP health scheduler instance."""
-    global _scheduler
-    if _scheduler is None:
-        _scheduler = TMPHealthScheduler()
-    return _scheduler
-
-
-async def start_tmp_health_scheduler() -> None:
-    """Start the global TMP health scheduler."""
-    scheduler = get_tmp_health_scheduler()
-    await scheduler.start()
-
-
-async def stop_tmp_health_scheduler() -> None:
-    """Stop the global TMP health scheduler."""
-    scheduler = get_tmp_health_scheduler()
-    await scheduler.stop()
+(
+    get_tmp_health_scheduler,
+    start_tmp_health_scheduler,
+    stop_tmp_health_scheduler,
+) = make_singleton(TMPHealthScheduler)

@@ -24,32 +24,9 @@ from flask import Blueprint, flash, jsonify, redirect, render_template, request,
 from src.admin.utils import require_tenant_access
 from src.admin.utils.audit_decorator import log_admin_action
 from src.core.database.repositories.uow import TMPProviderUoW
-from src.core.security.url_validator import check_url_ssrf, sanitize_for_log
+from src.core.schemas.tmp_provider import TMPProviderFields, TMPProviderRegistration, TMPProviderValidationError
 
 logger = logging.getLogger(__name__)
-
-# Valid uid_type values per AdCP spec (uid-type enum).
-# Authority: adcp.types.generated_poc.enums.uid_type.UidType (pinned SDK, adcp==6.6.0).
-# Pinned by TestValidUidTypesMatchesPinnedSchema in test_tmp_providers_blueprint.py —
-# that guard asserts this frozenset equals the SDK enum so a version bump can't drift silently.
-VALID_UID_TYPES = frozenset(
-    [
-        "uid2",
-        "rampid",
-        "rampid_derived",
-        "id5",
-        "euid",
-        "pairid",
-        "maid",
-        "hashed_email",
-        "publisher_first_party",
-        "world_id_nullifier",
-        "other",
-    ]
-)
-
-# Valid status values for TMP providers.
-VALID_STATUSES = frozenset(["active", "inactive", "draining"])
 
 # Create Blueprint
 tmp_providers_bp = Blueprint("tmp_providers", __name__)
@@ -146,18 +123,18 @@ def _provider_not_found_redirect(tenant_id: str):
 # ---------------------------------------------------------------------------
 
 
-def _parse_int_field(form: Mapping[str, str], field: str, default: str, label: str) -> tuple[int, str | None]:
-    """Parse *field* as an int, returning ``(value, error_message)``.
+def _parse_int_field(form: Mapping[str, str], field: str, default: str, label: str) -> int:
+    """Parse *field* as an int, raising ``TMPProviderValidationError`` on bad input.
 
     Collapses the two identical ``try: int(form.get(...)) except (ValueError,
-    TypeError)`` blocks (timeout_ms, priority) into one call site.  On failure
-    the returned value is ``0`` and callers must propagate *error_message*
-    rather than use it.
+    TypeError)`` blocks (timeout_ms, priority) into one call site.  Raises the
+    same domain error the registration model raises, so the caller has one
+    rejection path rather than two.
     """
     try:
-        return int(form.get(field, default)), None
-    except (ValueError, TypeError):
-        return 0, f"{label} must be a numeric value"
+        return int(form.get(field, default))
+    except (ValueError, TypeError) as exc:
+        raise TMPProviderValidationError(f"{label} must be a numeric value") from exc
 
 
 def _split_csv(raw: str, *, upper: bool = False) -> list[str] | None:
@@ -173,124 +150,42 @@ def _split_csv(raw: str, *, upper: bool = False) -> list[str] | None:
     return items or None
 
 
-def _validate_endpoint_url(endpoint: str) -> str | None:
-    """Return an error message when *endpoint* fails the SSRF check, else ``None``."""
-    is_safe, ssrf_error = check_url_ssrf(endpoint)
-    if is_safe:
-        return None
-    logger.warning(
-        # [TMP admin] tag included so an operator grepping `[TMP` for this
-        # feature's logs sees the SSRF rejections too, not just the
-        # _log_and_500 / _log_flash_and_redirect lines.
-        "[TMP admin][SECURITY] Provider rejected unsafe URL %s: %s",
-        sanitize_for_log(endpoint),
-        sanitize_for_log(ssrf_error),
-    )
-    return f"Endpoint URL is not allowed: {ssrf_error}"
+def _validate_provider_form(form: Mapping[str, str]) -> TMPProviderRegistration:
+    """Parse TMP provider form data into a validated :class:`TMPProviderRegistration`.
 
-
-def _validate_match_capabilities(
-    *,
-    context_match: bool,
-    identity_match: bool,
-    countries: list[str] | None,
-    uid_types: list[str] | None,
-) -> str | None:
-    """Validate the declared match capabilities, returning an error message or ``None``.
-
-    A provider must support at least one match mode, and per AdCP spec
-    ``countries`` and ``uid_types`` MUST be non-empty when ``identity_match``
-    is true (uid_types additionally constrained to the uid-type enum).
-    """
-    if not context_match and not identity_match:
-        return "Provider must support at least one of context_match or identity_match"
-
-    if not identity_match:
-        return None
-
-    if not countries:
-        return "Countries are required when identity_match is enabled (ISO 3166-1 alpha-2 codes)"
-    if not uid_types:
-        return "UID types are required when identity_match is enabled (e.g. uid2, publisher_first_party)"
-
-    invalid_types = [u for u in uid_types if u not in VALID_UID_TYPES]
-    if invalid_types:
-        return f"Invalid uid_type(s): {', '.join(invalid_types)}. Valid values: {', '.join(sorted(VALID_UID_TYPES))}"
-    return None
-
-
-def _validate_provider_form(form: Mapping[str, str]) -> tuple[dict, str | None]:
-    """Parse and validate TMP provider form data.
+    This function owns **form shape only** — CSV splitting, checkbox ``"on"``,
+    int parsing, whitespace stripping.  Registration *validity* (the uid-type
+    and status enums, the at-least-one-match-mode rule, the
+    ``identity_match ⇒ countries + uid_types`` rule, the SSRF check) belongs to
+    ``TMPProviderRegistration`` in ``src/core/schemas/tmp_provider.py`` so that
+    a future programmatic write surface enforces the same rules without
+    reimplementing them (#1197 review).
 
     ``form`` is typed as ``Mapping[str, str]`` — callers pass
     ``request.form``, a Werkzeug ``ImmutableMultiDict``, not a plain ``dict``.
     Only ``.get()`` is used here, so the narrower ``Mapping`` contract is
     what's actually relied on.
 
-    Returns:
-        (data, error_message) — *error_message* is ``None`` on success.
-        *data* contains the parsed/normalised fields ready for DB write.
+    Raises:
+        TMPProviderValidationError: on any form-shape or registration-validity
+            rejection; ``str(exc)`` is the operator-facing message to flash.
     """
-    name = form.get("name", "").strip()
-    endpoint = form.get("endpoint", "").strip()
-    context_match = form.get("context_match") == "on"
-    identity_match = form.get("identity_match") == "on"
-    status = form.get("status", "active").strip()
-
-    timeout_ms, error = _parse_int_field(form, "timeout_ms", "50", "Timeout (ms)")
-    if error:
-        return {}, error
-
-    priority, error = _parse_int_field(form, "priority", "0", "Priority")
-    if error:
-        return {}, error
-
-    # Validate status against allowed values
-    if status not in VALID_STATUSES:
-        return {}, (f"Invalid status '{status}'. Valid values: {', '.join(sorted(VALID_STATUSES))}")
-
-    # Parse comma-separated lists
-    countries = _split_csv(form.get("countries", "").strip(), upper=True)
-    uid_types = _split_csv(form.get("uid_types", "").strip())
-    properties_list = _split_csv(form.get("properties", "").strip())
-
-    if not name:
-        return {}, "Provider name is required"
-
-    if not endpoint:
-        return {}, "Endpoint URL is required"
-
-    error = _validate_endpoint_url(endpoint)
-    if error:
-        return {}, error
-
-    error = _validate_match_capabilities(
-        context_match=context_match,
-        identity_match=identity_match,
-        countries=countries,
-        uid_types=uid_types,
+    return TMPProviderRegistration.parse(
+        TMPProviderFields(
+            name=form.get("name", "").strip(),
+            endpoint=form.get("endpoint", "").strip(),
+            context_match=form.get("context_match") == "on",
+            identity_match=form.get("identity_match") == "on",
+            countries=_split_csv(form.get("countries", "").strip(), upper=True),
+            uid_types=_split_csv(form.get("uid_types", "").strip()),
+            properties=_split_csv(form.get("properties", "").strip()),
+            timeout_ms=_parse_int_field(form, "timeout_ms", "50", "Timeout (ms)"),
+            priority=_parse_int_field(form, "priority", "0", "Priority"),
+            status=form.get("status", "active").strip(),
+            auth_type=form.get("auth_type", "").strip() or None,
+            auth_credentials=form.get("auth_credentials", "").strip() or None,
+        )
     )
-    if error:
-        return {}, error
-
-    auth_type = form.get("auth_type", "").strip() or None
-    auth_credentials = form.get("auth_credentials", "").strip() or None
-
-    data = {
-        "name": name,
-        "endpoint": endpoint,
-        "context_match": context_match,
-        "identity_match": identity_match,
-        "countries": countries,
-        "uid_types": uid_types,
-        "properties": properties_list,
-        "timeout_ms": timeout_ms,
-        "priority": priority,
-        "status": status,
-        "auth_type": auth_type,
-        "auth_credentials": auth_credentials,
-    }
-    return data, None
 
 
 @tmp_providers_bp.route("/")
@@ -362,16 +257,20 @@ def add_tmp_provider(tenant_id):
             if not tenant:
                 return _tenant_not_found_redirect()
 
-            data, error = _validate_provider_form(request.form)
-            if error:
-                flash(error, "error")
+            # Caught here, not by the handler's generic `except Exception` below:
+            # a validation rejection must flash its own operator-facing message,
+            # not the generic "Error adding TMP provider".
+            try:
+                registration = _validate_provider_form(request.form)
+            except TMPProviderValidationError as exc:
+                flash(str(exc), "error")
                 return redirect(url_for("tmp_providers.add_tmp_provider", tenant_id=tenant_id))
 
             # create_from_fields is symmetric with update_fields used in the edit path:
-            # both accept the same validated-form dict without inline ORM construction.
-            uow.tmp_providers.create_from_fields(**data)
+            # both take the same TMPProviderFields record without inline ORM construction.
+            uow.tmp_providers.create_from_fields(**registration.to_fields())
 
-            flash(f"TMP provider '{data['name']}' added successfully", "success")
+            flash(f"TMP provider '{registration.name}' added successfully", "success")
             return redirect(url_for("tmp_providers.list_tmp_providers", tenant_id=tenant_id))
 
     except Exception as e:
@@ -427,34 +326,26 @@ def edit_tmp_provider(tenant_id, provider_id):
             if not provider:
                 return _provider_not_found_redirect(tenant_id)
 
-            data, error = _validate_provider_form(request.form)
-            if error:
-                flash(error, "error")
+            # See the add handler: caught before the generic `except Exception`
+            # so the specific rejection message reaches the operator.
+            try:
+                registration = _validate_provider_form(request.form)
+            except TMPProviderValidationError as exc:
+                flash(str(exc), "error")
                 return redirect(
                     url_for("tmp_providers.edit_tmp_provider", tenant_id=tenant_id, provider_id=provider_id)
                 )
 
-            # Build kwargs — only include auth_credentials when a new non-empty
-            # value was submitted (preserves existing encrypted value otherwise).
-            update_kwargs: dict = {
-                "name": data["name"],
-                "endpoint": data["endpoint"],
-                "context_match": data["context_match"],
-                "identity_match": data["identity_match"],
-                "countries": data["countries"],
-                "uid_types": data["uid_types"],
-                "properties": data["properties"],
-                "timeout_ms": data["timeout_ms"],
-                "priority": data["priority"],
-                "status": data["status"],
-                "auth_type": data["auth_type"],
-            }
-            if data["auth_credentials"]:
-                update_kwargs["auth_credentials"] = data["auth_credentials"]
+            # auth_credentials is written only when a new non-empty value was
+            # submitted — otherwise the stored (encrypted) value is preserved.
+            # to_update_fields() owns that rule so the edit handler no longer
+            # hand-copies eleven field names to express it.
+            uow.tmp_providers.update_fields(
+                provider_id,
+                **registration.to_update_fields(include_credentials=bool(registration.auth_credentials)),
+            )
 
-            uow.tmp_providers.update_fields(provider_id, **update_kwargs)
-
-            flash(f"TMP provider '{data['name']}' updated successfully", "success")
+            flash(f"TMP provider '{registration.name}' updated successfully", "success")
             return redirect(url_for("tmp_providers.list_tmp_providers", tenant_id=tenant_id))
 
     except Exception as e:

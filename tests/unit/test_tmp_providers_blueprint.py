@@ -14,39 +14,15 @@ Note: Discovery endpoint tests are in test_tmp_providers_discovery_route.py
 """
 
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from src.core.database.models import TMPProvider
-from tests.unit._tmp_helpers import _make_blueprint_uow, make_super_admin_client
+from tests.unit._tmp_helpers import _make_blueprint_uow, _make_mock_provider, make_super_admin_client
 
 
 def _make_tmp_provider_client():
     """Create a Flask test client authenticated as super admin for TMP provider endpoints."""
     return make_super_admin_client()
-
-
-def _make_mock_provider(
-    provider_id="test-uuid-1234", name="Test Provider", endpoint="https://provider.example.com/tmp", status="active"
-):
-    """Create a mock TMPProvider object aligned with provider-registration.json schema.
-
-    Returns a MagicMock (not a real TMPProvider) — used for tests that only need
-    attribute access on the provider object (deactivate, delete, health, edit POST).
-    Tests that exercise to_dict() use a real TMPProvider via _tmp_helpers._make_provider.
-    """
-    provider = MagicMock()
-    provider.provider_id = provider_id
-    provider.name = name
-    provider.endpoint = endpoint
-    provider.context_match = True
-    provider.identity_match = True
-    provider.countries = ["US", "GB"]
-    provider.uid_types = ["uid2", "id5"]
-    provider.properties = None
-    provider.timeout_ms = 50
-    provider.priority = 0
-    provider.status = status
-    return provider
 
 
 class TestTMPProviderAddSSRF:
@@ -791,36 +767,3 @@ class TestTMPProviderAuthFields:
 # canonical home for model contract tests — uses _tmp_helpers._make_provider).
 # Keeping a second copy here would require parallel edits on every to_dict()
 # change and one copy would inevitably drift (CLAUDE.md DRY invariant).
-
-
-# ---------------------------------------------------------------------------
-# VALID_UID_TYPES guard — pins the frozenset to the pinned AdCP schema enum
-# ---------------------------------------------------------------------------
-
-
-class TestValidUidTypesMatchesPinnedSchema:
-    """VALID_UID_TYPES must equal the uid-type enum in the pinned AdCP SDK.
-
-    Authority: ``adcp.types.generated_poc.enums.uid_type.UidType`` (adcp==6.6.0,
-    pinned in pyproject.toml).  No ``pytest.skip`` fallback — if the import
-    fails the guard must fail loudly so the drift is caught immediately.
-    """
-
-    def test_valid_uid_types_matches_pinned_schema(self):
-        """VALID_UID_TYPES frozenset equals UidType enum values in the pinned adcp SDK.
-
-        Authority: adcp.types.generated_poc.enums.uid_type.UidType (adcp==6.6.0).
-        Schema path in SDK: adcp/types/generated_poc/enums/uid_type.py.
-        """
-        from adcp.types.generated_poc.enums.uid_type import UidType  # type: ignore[import]
-
-        from src.admin.blueprints.tmp_providers import VALID_UID_TYPES
-
-        sdk_uid_types = frozenset(v.value for v in UidType)
-
-        assert VALID_UID_TYPES == sdk_uid_types, (
-            f"VALID_UID_TYPES diverges from the pinned adcp SDK (adcp==6.6.0).\n"
-            f"  In SDK but not in VALID_UID_TYPES: {sdk_uid_types - VALID_UID_TYPES}\n"
-            f"  In VALID_UID_TYPES but not in SDK: {VALID_UID_TYPES - sdk_uid_types}\n"
-            f"  Update VALID_UID_TYPES in src/admin/blueprints/tmp_providers.py to match."
-        )

@@ -261,7 +261,11 @@ class TestDiscoveryApiKeyAuth:
         # AdCPConfigurationError maps to CONFIGURATION_ERROR + terminal under the
         # adcp 6.6.0 / spec 3.1.1 pin — code and recovery agree with
         # enums/error-code.json (see docstring for the pre-3.1.1 history).
-        assert_envelope_shape(response.json(), "CONFIGURATION_ERROR", recovery="terminal")
+        envelope = response.json()
+        assert_envelope_shape(envelope, "CONFIGURATION_ERROR", recovery="terminal")
+        # Every raise on this route carries an actionable suggestion; the operator
+        # is the actor here, so the hint names the env var they must set.
+        assert "TMP_DISCOVERY_API_KEYS" in envelope["errors"][0]["suggestion"]
 
     def test_returns_500_when_tmp_discovery_api_keys_is_empty_string(self, client):
         """When TMP_DISCOVERY_API_KEYS is set to empty string the endpoint returns 500 (fail-closed).
@@ -432,8 +436,25 @@ class TestDiscoveryApiKeyAuth:
 # ---------------------------------------------------------------------------
 
 
-class TestDiscoveryTenantConfigUnavailable:
-    """GET /tenant/{tenant_id}/tmp-providers/discovery returns 500 when tenant_config repo is None."""
+class TestDiscoveryRepositoryUnavailable:
+    """Both UoW repository guards emit the typed 503 envelope — never a bare ``assert``.
+
+    ``assert uow.<repo> is not None`` is stripped by ``python -O``, and when it
+    does fire it raises ``AssertionError`` → an un-enveloped 500 rather than the
+    typed AdCP envelope this endpoint's contract promises.  These two tests are
+    siblings on purpose: the ``tenant_config`` guard had a test, the parallel
+    ``tmp_providers`` guard eight lines down did not (#1197 review).
+    """
+
+    @staticmethod
+    def _uow_cls_with(*, tenant_config, tmp_providers) -> MagicMock:
+        mock_uow = MagicMock()
+        mock_uow.tenant_config = tenant_config
+        mock_uow.tmp_providers = tmp_providers
+        mock_uow_cls = MagicMock()
+        mock_uow_cls.return_value.__enter__ = MagicMock(return_value=mock_uow)
+        mock_uow_cls.return_value.__exit__ = MagicMock(return_value=False)
+        return mock_uow_cls
 
     def test_returns_503_when_tenant_config_is_none(self, client):
         """If TMPProviderUoW yields uow.tenant_config=None the endpoint returns 503 (service unavailable).
@@ -441,12 +462,7 @@ class TestDiscoveryTenantConfigUnavailable:
         AdCPServiceUnavailableError (503, transient) is the right error here: the
         repository layer is temporarily unavailable; the buyer should retry.
         """
-        mock_uow = MagicMock()
-        mock_uow.tenant_config = None  # simulate broken UoW
-        mock_uow.tmp_providers = MagicMock()  # unused but present for safety
-        mock_uow_cls = MagicMock()
-        mock_uow_cls.return_value.__enter__ = MagicMock(return_value=mock_uow)
-        mock_uow_cls.return_value.__exit__ = MagicMock(return_value=False)
+        mock_uow_cls = self._uow_cls_with(tenant_config=None, tmp_providers=MagicMock())
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_uow_cls):
             with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
@@ -454,7 +470,40 @@ class TestDiscoveryTenantConfigUnavailable:
 
         assert response.status_code == 503
         # AdCPServiceUnavailableError: recovery=transient (buyer should retry)
-        assert_envelope_shape(response.json(), "SERVICE_UNAVAILABLE", recovery="transient")
+        envelope = response.json()
+        assert_envelope_shape(
+            envelope,
+            "SERVICE_UNAVAILABLE",
+            recovery="transient",
+            message_substr="Tenant config repository unavailable",
+        )
+        assert "Retry shortly" in envelope["errors"][0]["suggestion"]
+
+    def test_returns_503_when_tmp_providers_is_none(self, client):
+        """If TMPProviderUoW yields uow.tmp_providers=None the endpoint returns the same typed 503.
+
+        Mutation this pins: reverting the guard to ``assert uow.tmp_providers is
+        not None`` produces an ``AssertionError`` → status 500 with no AdCP
+        envelope, failing both the status and the envelope assertion below.
+        The tenant_config repo is present so this test isolates the second guard.
+        """
+        tenant_config = MagicMock()
+        tenant_config.get_tenant.return_value = _make_tenant()
+        mock_uow_cls = self._uow_cls_with(tenant_config=tenant_config, tmp_providers=None)
+
+        with patch("src.routes.tmp_providers.TMPProviderUoW", mock_uow_cls):
+            with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
+                response = client.get("/tenant/si-host/tmp-providers/discovery")
+
+        assert response.status_code == 503
+        envelope = response.json()
+        assert_envelope_shape(
+            envelope,
+            "SERVICE_UNAVAILABLE",
+            recovery="transient",
+            message_substr="TMP provider repository unavailable",
+        )
+        assert "Retry shortly" in envelope["errors"][0]["suggestion"]
 
 
 # ---------------------------------------------------------------------------

@@ -36,7 +36,7 @@ from tests.factories.targeting import (
     PropertyListReferenceFactory,
     TargetingFactory,
 )
-from tests.factories.tmp_provider import TMPProviderFactory
+from tests.factories.tmp_provider import TMPProviderFactory, delete_tmp_providers, replace_tmp_providers
 from tests.factories.user import TenantAuthConfigFactory, UserFactory
 from tests.factories.webhook import PushNotificationConfigFactory
 
@@ -96,5 +96,7 @@ __all__ = [
     "TenantAuthConfigFactory",
     "TenantFactory",
     "TMPProviderFactory",
+    "delete_tmp_providers",
+    "replace_tmp_providers",
     "UserFactory",
 ]

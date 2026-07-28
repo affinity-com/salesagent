@@ -2,9 +2,11 @@
 
 All three interval schedulers (MediaBuyStatusScheduler, DeliveryWebhookScheduler,
 TMPHealthScheduler) share an identical scaffold:
-  - __init__ / start / stop / _run_scheduler / singleton accessor / module-level start_*/stop_*
+  - __init__ / start / stop / _run_scheduler  → :class:`IntervalScheduler`
+  - singleton accessor + module-level start_*/stop_*  → :func:`make_singleton`
 
-This base extracts that scaffold so each concrete scheduler only overrides ``tick()``.
+This base extracts *both* halves, so each concrete scheduler only overrides
+``tick()`` and binds the three module-level functions from the factory.
 
 Usage::
 
@@ -12,13 +14,7 @@ Usage::
         async def tick(self) -> None:
             await do_work()
 
-    _scheduler: MyScheduler | None = None
-
-    def get_my_scheduler() -> MyScheduler:
-        global _scheduler
-        if _scheduler is None:
-            _scheduler = MyScheduler()
-        return _scheduler
+    get_my_scheduler, start_my_scheduler, stop_my_scheduler = make_singleton(MyScheduler)
 """
 
 from __future__ import annotations
@@ -27,6 +23,7 @@ import abc
 import asyncio
 import logging
 import os
+from collections.abc import Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -137,3 +134,47 @@ class IntervalScheduler(abc.ABC):
     @abc.abstractmethod
     async def tick(self) -> None:
         """Override in subclasses to perform one unit of work."""
+
+
+def make_singleton[SchedulerT: IntervalScheduler](
+    cls: Callable[[], SchedulerT],
+) -> tuple[Callable[[], SchedulerT], Callable[[], Awaitable[None]], Callable[[], Awaitable[None]]]:
+    """Build the ``(get_x, start_x, stop_x)`` module-level singleton trio for *cls*.
+
+    *cls* is typed ``Callable[[], SchedulerT]`` rather than ``type[SchedulerT]``
+    because the requirement is a **zero-argument** constructor: each concrete
+    scheduler's ``__init__`` supplies its own interval and name to the base.
+    ``type[SchedulerT]`` would advertise the base's two-argument ``__init__``
+    and make the ``cls()`` call below a type error.
+
+    Every scheduler module used to hand-roll a byte-identical ``_scheduler``
+    global plus ``get_``/``start_``/``stop_`` wrappers.  ``main.py`` reaches the
+    start/stop pair by ``getattr`` off ``_SCHEDULER_REGISTRY``, so those
+    functions exist only to be found by name — nothing about them is
+    scheduler-specific.  Bind them from here instead::
+
+        get_my_scheduler, start_my_scheduler, stop_my_scheduler = make_singleton(MyScheduler)
+
+    The instance is created lazily on first ``get_`` call and cached in this
+    factory's closure (one cell per call, so each scheduler module keeps its own
+    independent singleton).  Tests can still construct ``MyScheduler()`` directly
+    without touching the cached instance.
+    """
+    instance: SchedulerT | None = None
+
+    def get_scheduler() -> SchedulerT:
+        """Get or create the global scheduler instance."""
+        nonlocal instance
+        if instance is None:
+            instance = cls()
+        return instance
+
+    async def start_scheduler() -> None:
+        """Start the global scheduler (called at application startup)."""
+        await get_scheduler().start()
+
+    async def stop_scheduler() -> None:
+        """Stop the global scheduler (called at application shutdown)."""
+        await get_scheduler().stop()
+
+    return get_scheduler, start_scheduler, stop_scheduler

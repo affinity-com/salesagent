@@ -19,7 +19,7 @@ from src.core.database.database_session import get_db_session
 from src.core.database.models import Creative, CreativeAssignment, MediaBuy
 from src.core.database.repositories import MediaBuyRepository
 from src.core.utils import utc_flight_end, utc_flight_start
-from src.services._scheduler_base import IntervalScheduler, _parse_interval_env
+from src.services._scheduler_base import IntervalScheduler, _parse_interval_env, make_singleton
 
 logger = logging.getLogger(__name__)
 
@@ -155,25 +155,14 @@ class MediaBuyStatusScheduler(IntervalScheduler):
         return True
 
 
-# Global singleton instance
-_scheduler: MediaBuyStatusScheduler | None = None
+# ---------------------------------------------------------------------------
+# Global singleton — derived from the shared factory, not hand-rolled.
+# main.py's _run_scheduler_fn reaches start_/stop_ by getattr off
+# _SCHEDULER_REGISTRY, so these exist only to be found by name.
+# ---------------------------------------------------------------------------
 
-
-def get_media_buy_status_scheduler() -> MediaBuyStatusScheduler:
-    """Get or create the global media buy status scheduler instance."""
-    global _scheduler
-    if _scheduler is None:
-        _scheduler = MediaBuyStatusScheduler()
-    return _scheduler
-
-
-async def start_media_buy_status_scheduler() -> None:
-    """Start the global media buy status scheduler."""
-    scheduler = get_media_buy_status_scheduler()
-    await scheduler.start()
-
-
-async def stop_media_buy_status_scheduler() -> None:
-    """Stop the global media buy status scheduler."""
-    scheduler = get_media_buy_status_scheduler()
-    await scheduler.stop()
+(
+    get_media_buy_status_scheduler,
+    start_media_buy_status_scheduler,
+    stop_media_buy_status_scheduler,
+) = make_singleton(MediaBuyStatusScheduler)

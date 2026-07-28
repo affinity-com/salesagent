@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, TypedDict
 
 import httpx
 
@@ -61,9 +61,11 @@ def fire_tmp_sync(
 ) -> None:
     """Spawn a daemon thread to sync TMP packages after a successful media buy operation.
 
-    Transport-agnostic entry point shared by MCP, A2A, and REST transports.
-    REST callers may also use FastAPI BackgroundTasks — both paths converge on
-    ``sync_packages_for_media_buy``.
+    Transport-agnostic entry point shared by MCP, A2A, and REST transports —
+    the sole trigger for ``sync_packages_for_media_buy``.  There is deliberately
+    no route-layer trigger: adding one (e.g. FastAPI ``BackgroundTasks`` in
+    ``api_v1.py``) would double-fire the sync on REST, since REST already reaches
+    this function through the ``_raw`` wrapper.
 
     ``response`` is whatever the two ``_impl`` functions return:
     ``CreateMediaBuyResult`` (create path) or
@@ -182,11 +184,31 @@ def _is_local_host(host: str) -> bool:
     return hostname == "localhost" or hostname.endswith(".localhost") or hostname == "127.0.0.1"
 
 
+class SellerAgentRef(TypedDict):
+    """``seller_agent`` object per ``dist/schemas/3.1.1/core/seller-agent-ref.json``."""
+
+    agent_url: str
+
+
+class AvailablePackagePayload(TypedDict):
+    """One ``POST /packages/sync`` body element.
+
+    Names the exact three keys ``dist/schemas/3.1.1/trusted-match/available-package.json``
+    requires — the schema sets ``additionalProperties: false``, so this is a
+    closed shape, not a partial one.  ``dict[str, Any]`` left the key set
+    documented only in prose (#1197 review).
+    """
+
+    package_id: str
+    media_buy_id: str
+    seller_agent: SellerAgentRef
+
+
 def _build_package_payload(
     media_buy_id: str,
     pkg_row: MediaPackage,
     seller_agent_url: str,
-) -> dict[str, Any]:
+) -> AvailablePackagePayload:
     """Build the POST /packages/sync payload from a MediaPackage DB row.
 
     Conforms to ``dist/schemas/3.1.1/trusted-match/available-package.json``
@@ -202,15 +224,15 @@ def _build_package_payload(
     must ensure ``seller_agent_url`` is a valid https URL before calling
     this function (see ``_resolve_seller_agent_url``).
     """
-    return {
-        "package_id": pkg_row.package_id,
-        "media_buy_id": media_buy_id,
+    return AvailablePackagePayload(
+        package_id=pkg_row.package_id,
+        media_buy_id=media_buy_id,
         # seller_agent is required by the schema; agent_url MUST be https.
-        "seller_agent": {"agent_url": seller_agent_url},
-    }
+        seller_agent=SellerAgentRef(agent_url=seller_agent_url),
+    )
 
 
-def _post_packages_sync(endpoint: str, payloads: list[dict[str, Any]], auth_credentials: str = "") -> None:
+def _post_packages_sync(endpoint: str, payloads: list[AvailablePackagePayload], auth_credentials: str = "") -> None:
     """POST /packages/sync to a single TMP Provider endpoint.
 
     Sends the full list as a JSON array.  The TMP Provider's handler accepts

@@ -23,7 +23,7 @@ from src.core.database.repositories import MediaBuyRepository
 from src.core.schemas import GetMediaBuyDeliveryRequest, GetMediaBuyDeliveryResponse
 from src.core.tools.media_buy_delivery import _get_media_buy_delivery_impl
 from src.core.utils import utc_flight_start
-from src.services._scheduler_base import IntervalScheduler, _parse_interval_env
+from src.services._scheduler_base import IntervalScheduler, _parse_interval_env, make_singleton
 from src.services.protocol_webhook_service import get_protocol_webhook_service
 
 logger = logging.getLogger(__name__)
@@ -307,25 +307,14 @@ class DeliveryWebhookScheduler(IntervalScheduler):
             raise
 
 
-# Global scheduler instance
-_scheduler: DeliveryWebhookScheduler | None = None
+# ---------------------------------------------------------------------------
+# Global singleton — derived from the shared factory, not hand-rolled.
+# main.py's _run_scheduler_fn reaches start_/stop_ by getattr off
+# _SCHEDULER_REGISTRY, so these exist only to be found by name.
+# ---------------------------------------------------------------------------
 
-
-def get_delivery_webhook_scheduler() -> DeliveryWebhookScheduler:
-    """Get or create global scheduler instance."""
-    global _scheduler
-    if _scheduler is None:
-        _scheduler = DeliveryWebhookScheduler()
-    return _scheduler
-
-
-async def start_delivery_webhook_scheduler():
-    """Start the delivery webhook scheduler (called at application startup)."""
-    scheduler = get_delivery_webhook_scheduler()
-    await scheduler.start()
-
-
-async def stop_delivery_webhook_scheduler():
-    """Stop the delivery webhook scheduler (called at application shutdown)."""
-    scheduler = get_delivery_webhook_scheduler()
-    await scheduler.stop()
+(
+    get_delivery_webhook_scheduler,
+    start_delivery_webhook_scheduler,
+    stop_delivery_webhook_scheduler,
+) = make_singleton(DeliveryWebhookScheduler)

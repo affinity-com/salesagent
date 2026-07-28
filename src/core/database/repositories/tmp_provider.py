@@ -9,11 +9,13 @@ beads: salesagent-m44
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Unpack
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.core.database.models import TMPProvider
+from src.core.schemas.tmp_provider import TMPProviderFields
 
 # Statuses that receive package sync updates and health probes.
 # Draining providers still serve in-flight requests and need current data.
@@ -96,33 +98,39 @@ class TMPProviderRepository:
     # Write methods (flush, never commit)
     # ------------------------------------------------------------------
 
-    def create_from_fields(self, **kwargs: object) -> TMPProvider:
-        """Build and persist a new TMPProvider from validated field values.
+    def create_from_fields(self, **kwargs: Unpack[TMPProviderFields]) -> TMPProvider:
+        """Build and persist a new TMPProvider from a validated field record.
 
-        Symmetric with :meth:`update_fields` — callers pass the same dict of
-        field names and values that ``_validate_provider_form`` produces,
-        without constructing the ORM model inline.
+        Symmetric with :meth:`update_fields` — both take the
+        :class:`TMPProviderFields` record that ``TMPProviderRegistration``
+        produces, without constructing the ORM model inline.
 
-        The ``tenant_id`` is injected automatically from the repository scope.
-        Raises ``ValueError`` if an unknown attribute is supplied.
+        The ``TMPProviderFields`` annotation is the field-name contract: a typo
+        (``timout_ms``) is a type error at the call site, so no runtime
+        ``hasattr`` guard is needed here.  ``tenant_id`` is injected
+        automatically from the repository scope.
         """
         provider = TMPProvider(tenant_id=self._tenant_id)
         for key, value in kwargs.items():
-            # Validate against the CLASS, not the instance: hasattr(provider, key)
-            # would invoke TMPProvider.auth_credentials' getter, which decrypts the
-            # stored value and can raise AdCPConfigurationError on corrupt/rotated
-            # ciphertext — an existence check must never trigger a decrypt.
-            if not hasattr(type(provider), key):
-                raise ValueError(f"TMPProvider has no attribute {key!r}")
             setattr(provider, key, value)
         self._session.add(provider)
         self._session.flush()
         return provider
 
-    def update_fields(self, provider_id: str, **kwargs: object) -> TMPProvider | None:
+    def update_fields(self, provider_id: str, **kwargs: Unpack[TMPProviderFields]) -> TMPProvider | None:
         """Update mutable fields on a provider. Returns None if not found.
 
-        Raises ValueError if any immutable field or unknown attribute is in kwargs.
+        Field names are pinned statically by :class:`TMPProviderFields`; the only
+        runtime check left is the immutable-field guard, which encodes a rule the
+        type cannot (``tenant_id`` / ``provider_id`` / ``created_at`` are valid
+        TMPProvider attributes but must never be updated).
+
+        Note the write below never *reads* an existing attribute — in particular
+        it must not touch ``provider.auth_credentials``, whose getter decrypts
+        the stored value and raises ``AdCPConfigurationError`` on corrupt or
+        rotated ciphertext.  That is exactly the credential-rotation case: the
+        update meant to replace a bad ciphertext must not be aborted by reading
+        it (pinned by ``TestUpdateFieldsSurvivesCorruptCredential``).
         """
         bad = self._IMMUTABLE_FIELDS & set(kwargs)
         if bad:
@@ -131,14 +139,6 @@ class TMPProviderRepository:
         if provider is None:
             return None
         for key, value in kwargs.items():
-            # Validate against the CLASS, not the instance (see create_from_fields):
-            # hasattr(provider, "auth_credentials") decrypts the OLD stored value
-            # via the property getter — exactly the case hit during credential
-            # rotation, where a corrupt/rotated ciphertext would abort the very
-            # update meant to replace it. hasattr(type(provider), key) checks for
-            # the descriptor without invoking it.
-            if not hasattr(type(provider), key):
-                raise ValueError(f"TMPProvider has no attribute {key!r}")
             setattr(provider, key, value)
         self._session.flush()
         return provider

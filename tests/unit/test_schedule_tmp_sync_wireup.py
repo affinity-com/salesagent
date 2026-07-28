@@ -1,15 +1,27 @@
-"""Unit tests for fire_tmp_sync transport-agnostic wireup.
+"""Unit tests for fire_tmp_sync's no-fire behavior and internal extraction logic.
 
-Verifies that ``fire_tmp_sync`` (in tmp_provider_sync) is called from all
-transport wrappers — ``create_media_buy`` / ``update_media_buy`` (MCP) and
-``create_media_buy_raw`` / ``update_media_buy_raw`` (A2A + REST) — so that
-TMP package sync fires on every transport, not only on the REST path.
+Scope boundary — read this before adding a test here:
 
-The guard ``if not media_buy_id or not tenant_id`` inside ``fire_tmp_sync``
-is a silent no-op on either falsy value — these tests pin the call shape so
-that guard cannot silently regress.
+**The positive "sync fired" case is NOT graded in this file.** That behavior is
+graded end-to-end by ``TestFireTmpSyncDispatched`` and
+``TestFireTmpSyncDispatchedOnUpdate`` in
+``tests/integration/test_tmp_provider_integration.py``, which dispatch through
+the real per-transport pipeline and assert on the outbound ``POST
+/packages/sync`` body.  This file used to carry four "a thread was constructed"
+positives; they asserted an in-process object no transport observes and merely
+restated the dispatched tests more weakly, so they were dropped (#1197 review).
 
-``fire_tmp_sync`` now accepts a ``ResolvedIdentity`` (not a bare ``tenant_id``
+What remains, and why each is distinct:
+
+- ``test_no_thread_when_*_raises`` — the *no-fire* contract: a failed create or
+  update must not sync. A dispatched test cannot express this as sharply
+  (a failed dispatch has no media_buy_id to assert absence against).
+- ``TestFireTmpSyncInternals`` — the ``media_buy_id`` extraction (direct vs
+  inner ``.response``) and the ``if not media_buy_id or not tenant_id`` guard,
+  which is a *silent* no-op on either falsy value. These are pure-function
+  behaviors of ``fire_tmp_sync`` with no transport involved.
+
+``fire_tmp_sync`` accepts a ``ResolvedIdentity`` (not a bare ``tenant_id``
 string) — the tenant_id extraction is centralised inside the function.  The
 internals tests below pass a mock identity to exercise that extraction path.
 
@@ -37,52 +49,13 @@ def _make_response(media_buy_id: str = "mb-abc") -> MagicMock:
 
 
 class TestFireTmpSyncOnCreate:
-    """create_media_buy_raw spawns a TMP sync thread after a successful create.
+    """create_media_buy_raw must NOT sync when the create failed.
 
-    We verify the thread is spawned (via threading.Thread) rather than patching
-    fire_tmp_sync directly, because fire_tmp_sync is imported inside the function
-    body and patching the deferred import site is fragile.  threading.Thread is
-    the observable side-effect that proves the sync was triggered.
+    ``threading.Thread`` is observed rather than ``fire_tmp_sync`` itself
+    because ``fire_tmp_sync`` is imported inside the function body, so the
+    deferred import site is fragile to patch.  The positive counterpart lives in
+    ``tests/integration/test_tmp_provider_integration.py`` (see module docstring).
     """
-
-    def test_thread_spawned_on_successful_create(self):
-        """A daemon thread targeting sync_packages_for_media_buy is started on success."""
-        import asyncio
-
-        from src.core.tools.media_buy_create import create_media_buy_raw
-
-        identity = _make_identity(tenant_id="tenant-1")
-        create_response = _make_response(media_buy_id="mb-create-1")
-
-        mock_req = MagicMock()
-        mock_req.account = None
-
-        with (
-            patch(
-                "src.core.tools.media_buy_create._create_media_buy_impl",
-                return_value=create_response,
-            ),
-            patch(
-                "src.core.tools.media_buy_create._build_create_media_buy_request",
-                return_value=mock_req,
-            ),
-            patch(
-                "src.core.transport_helpers.enrich_identity_with_account",
-                return_value=identity,
-            ),
-            patch("src.services.tmp_provider_sync.threading.Thread") as mock_thread_cls,
-        ):
-            mock_thread = MagicMock()
-            mock_thread_cls.return_value = mock_thread
-            asyncio.run(create_media_buy_raw(identity=identity))
-
-        mock_thread_cls.assert_called_once_with(
-            target=ANY,
-            args=("tenant-1", "mb-create-1"),
-            daemon=True,
-            name=ANY,
-        )
-        mock_thread.start.assert_called_once_with()
 
     def test_no_thread_when_create_raises(self):
         """No thread is spawned when _create_media_buy_impl raises."""
@@ -119,40 +92,10 @@ class TestFireTmpSyncOnCreate:
 
 
 class TestFireTmpSyncOnUpdate:
-    """update_media_buy_raw spawns a TMP sync thread after a successful update.
+    """update_media_buy_raw must NOT sync when the update failed.
 
     Same rationale as TestFireTmpSyncOnCreate — we observe threading.Thread.
     """
-
-    def test_thread_spawned_on_successful_update(self):
-        """A daemon thread targeting sync_packages_for_media_buy is started on success."""
-        from src.core.tools.media_buy_update import update_media_buy_raw
-
-        identity = _make_identity(tenant_id="tenant-2")
-        update_response = _make_response(media_buy_id="mb-update-1")
-
-        with (
-            patch(
-                "src.core.tools.media_buy_update._update_media_buy_impl",
-                return_value=update_response,
-            ),
-            patch(
-                "src.core.tools.media_buy_update._build_update_request",
-                return_value=MagicMock(),
-            ),
-            patch("src.services.tmp_provider_sync.threading.Thread") as mock_thread_cls,
-        ):
-            mock_thread = MagicMock()
-            mock_thread_cls.return_value = mock_thread
-            update_media_buy_raw(media_buy_id="mb-update-1", identity=identity)
-
-        mock_thread_cls.assert_called_once_with(
-            target=ANY,
-            args=("tenant-2", "mb-update-1"),
-            daemon=True,
-            name=ANY,
-        )
-        mock_thread.start.assert_called_once_with()
 
     def test_no_thread_when_update_raises(self):
         """No thread is spawned when _update_media_buy_impl raises."""
@@ -300,121 +243,5 @@ class TestFireTmpSyncInternals:
             args=("tenant-99", "mb-xyz"),
             daemon=True,
             name="tmp-sync-mb-xyz",
-        )
-        mock_thread.start.assert_called_once_with()
-
-
-class TestFireTmpSyncOnMcpCreate:
-    """create_media_buy (MCP wrapper) spawns a TMP sync thread after a successful create.
-
-    The MCP wrapper calls _create_media_buy_impl directly (not via _raw), so it
-    needs its own fire_tmp_sync call.  This class pins that the MCP path is wired.
-    """
-
-    def test_thread_spawned_on_successful_mcp_create(self):
-        """A daemon thread is started when the MCP create wrapper succeeds."""
-        import asyncio
-
-        from src.core.tools.media_buy_create import create_media_buy
-
-        identity = _make_identity(tenant_id="tenant-mcp-1")
-        create_response = _make_response(media_buy_id="mb-mcp-create-1")
-
-        mock_req = MagicMock()
-        mock_req.account = None
-
-        async def _fake_get_state(key):
-            if key == "identity":
-                return identity
-            return None
-
-        mock_ctx = MagicMock()
-        mock_ctx.get_state = _fake_get_state
-
-        with (
-            patch(
-                "src.core.tools.media_buy_create._create_media_buy_impl",
-                return_value=create_response,
-            ),
-            patch(
-                "src.core.tools.media_buy_create._build_create_media_buy_request",
-                return_value=mock_req,
-            ),
-            patch(
-                "src.core.transport_helpers.enrich_identity_with_account",
-                return_value=identity,
-            ),
-            patch(
-                "src.core.tools.media_buy_create.ToolResult",
-                side_effect=lambda content, structured_content: MagicMock(),
-            ),
-            patch("src.services.tmp_provider_sync.threading.Thread") as mock_thread_cls,
-        ):
-            mock_thread = MagicMock()
-            mock_thread_cls.return_value = mock_thread
-            asyncio.run(create_media_buy(ctx=mock_ctx))
-
-        mock_thread_cls.assert_called_once_with(
-            target=ANY,
-            args=("tenant-mcp-1", "mb-mcp-create-1"),
-            daemon=True,
-            name=ANY,
-        )
-        mock_thread.start.assert_called_once_with()
-
-
-class TestFireTmpSyncOnMcpUpdate:
-    """update_media_buy (MCP wrapper) spawns a TMP sync thread after a successful update.
-
-    The MCP wrapper calls _update_media_buy_impl directly (not via _raw), so it
-    needs its own fire_tmp_sync call.  This class pins that the MCP path is wired.
-    """
-
-    def test_thread_spawned_on_successful_mcp_update(self):
-        """A daemon thread is started when the MCP update wrapper succeeds."""
-        import asyncio
-
-        from fastmcp.server.context import Context
-
-        from src.core.tools.media_buy_update import update_media_buy
-
-        identity = _make_identity(tenant_id="tenant-mcp-2")
-        update_response = _make_response(media_buy_id="mb-mcp-update-1")
-
-        async def _fake_get_state(key):
-            if key == "identity":
-                return identity
-            return None
-
-        # spec=Context makes isinstance(mock_ctx, Context) return True so the
-        # wrapper's `if isinstance(ctx, Context)` branch is taken and identity
-        # is read from get_state rather than falling back to None.
-        mock_ctx = MagicMock(spec=Context)
-        mock_ctx.get_state = _fake_get_state
-
-        with (
-            patch(
-                "src.core.tools.media_buy_update._update_media_buy_impl",
-                return_value=update_response,
-            ),
-            patch(
-                "src.core.tools.media_buy_update._build_update_request",
-                return_value=MagicMock(),
-            ),
-            patch(
-                "src.core.tools.media_buy_update.ToolResult",
-                side_effect=lambda content, structured_content: MagicMock(),
-            ),
-            patch("src.services.tmp_provider_sync.threading.Thread") as mock_thread_cls,
-        ):
-            mock_thread = MagicMock()
-            mock_thread_cls.return_value = mock_thread
-            asyncio.run(update_media_buy(ctx=mock_ctx))
-
-        mock_thread_cls.assert_called_once_with(
-            target=ANY,
-            args=("tenant-mcp-2", "mb-mcp-update-1"),
-            daemon=True,
-            name=ANY,
         )
         mock_thread.start.assert_called_once_with()

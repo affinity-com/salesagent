@@ -3,19 +3,30 @@
 Extracted from test_tmp_providers_discovery_route.py to avoid duplicating the
 UoW mock factories across the four TMP test files (CLAUDE.md DRY invariant).
 
+Every UoW factory here is built on the one ``_mock_cm(inner)`` primitive rather
+than re-typing the ``.__enter__`` / ``.__exit__`` pair per factory.
+
 Usage::
 
     from tests.unit._tmp_helpers import (
         _make_blueprint_uow,
+        _make_db_context,
+        _make_mock_provider,
+        _make_provider,
         _make_sync_uow,
         _make_tenant_config_uow,
+        _make_tmp_repo_uow,
         _make_tmp_uow,
-        _make_provider,
+        _mock_cm,
         make_super_admin_client,
     )
 
     # FastAPI discovery route tests:
     mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
+
+    # Health scheduler tests (drive the repository mock directly):
+    mock_uow_cls = _make_tmp_repo_uow(mock_repo)
+    provider = _make_mock_provider(provider_id="uuid-a", tenant_id="tenant-1")
 
     # Flask admin blueprint tests:
     mock_uow_cls, mock_uow = _make_blueprint_uow()
@@ -42,6 +53,87 @@ from src.core.database.models import TMPProvider
 # Sentinel distinguishing "caller didn't pass tenant" (auto-build one) from
 # "caller explicitly passed tenant=None" (simulate unknown tenant / 404 path).
 _UNSET = object()
+
+
+def _mock_cm(inner: MagicMock) -> MagicMock:
+    """Wrap *inner* in a mock class whose instances are context managers yielding it.
+
+    The one primitive every UoW factory below is built on::
+
+        mock_uow_cls = _mock_cm(mock_uow)
+        with patch("...TMPProviderUoW", mock_uow_cls):
+            ...          # production's `with TMPProviderUoW(t) as uow:` yields mock_uow
+
+    Before this existed, the identical ``.__enter__`` / ``.__exit__`` assignment
+    pair was re-typed in every factory here and hand-rolled again in
+    ``test_tmp_health_scheduler.py`` (CLAUDE.md DRY invariant, #1197 review).
+    """
+    mock_cls = MagicMock()
+    mock_cls.return_value.__enter__ = MagicMock(return_value=inner)
+    mock_cls.return_value.__exit__ = MagicMock(return_value=False)
+    return mock_cls
+
+
+def _make_mock_provider(**overrides) -> MagicMock:
+    """Return a ``MagicMock`` provider carrying the full TMPProvider field superset.
+
+    The single mock-provider factory for every TMP test file.  Both
+    ``test_tmp_health_scheduler.py`` (which reads ``provider_id`` / ``tenant_id``
+    / ``endpoint``) and ``test_tmp_providers_blueprint.py`` (which reads the CRUD
+    fields) previously defined their own colliding ``_make_mock_provider`` with
+    divergent field sets; the superset here serves both.
+
+    Use this when the test only needs attribute access.  Use :func:`_make_provider`
+    when the test exercises ``to_dict()`` — that needs the real ORM model so the
+    production serializer, not a mock reimplementation, is what runs.
+    """
+    fields: dict = {
+        "provider_id": "test-uuid-1234",
+        "tenant_id": "default",
+        "name": "Test Provider",
+        "endpoint": "https://provider.example.com/tmp",
+        "context_match": True,
+        "identity_match": True,
+        "countries": ["US", "GB"],
+        "uid_types": ["uid2", "id5"],
+        "properties": None,
+        "timeout_ms": 50,
+        "priority": 0,
+        "status": "active",
+    }
+    unknown = set(overrides) - set(fields)
+    if unknown:
+        raise TypeError(f"_make_mock_provider got unexpected field(s): {sorted(unknown)}")
+    fields.update(overrides)
+
+    provider = MagicMock()
+    for key, value in fields.items():
+        setattr(provider, key, value)
+    return provider
+
+
+def _make_tmp_repo_uow(mock_repo: MagicMock) -> MagicMock:
+    """Return a mock ``TMPProviderUoW`` class exposing ``tmp_providers=mock_repo``.
+
+    Used by the health scheduler tests, which drive the repository mock directly
+    (``update_health_status`` assertions) rather than seeding provider lists.
+    """
+    mock_uow = MagicMock()
+    mock_uow.tmp_providers = mock_repo
+    return _mock_cm(mock_uow)
+
+
+def _make_db_context(session: MagicMock) -> MagicMock:
+    """Return a ``MagicMock`` that behaves like ``get_db_session()``'s context manager.
+
+    ``get_db_session()`` is called (not constructed like a UoW class), so this
+    yields the context manager itself rather than a class — the one place the
+    ``_mock_cm`` class-shape doesn't fit.
+    """
+    ctx = MagicMock()
+    ctx.__enter__ = MagicMock(return_value=session)
+    ctx.__exit__ = MagicMock(return_value=False)
+    return ctx
 
 
 def make_super_admin_client():
@@ -133,10 +225,7 @@ def _make_blueprint_uow(
     if providers is not None:
         mock_uow.tmp_providers.list_all.return_value = providers
 
-    mock_uow_cls = MagicMock()
-    mock_uow_cls.return_value.__enter__ = MagicMock(return_value=mock_uow)
-    mock_uow_cls.return_value.__exit__ = MagicMock(return_value=False)
-    return mock_uow_cls, mock_uow
+    return _mock_cm(mock_uow), mock_uow
 
 
 def _make_tenant_config_uow(tenant: MagicMock | None = None) -> MagicMock:
@@ -157,10 +246,7 @@ def _make_tenant_config_uow(tenant: MagicMock | None = None) -> MagicMock:
     mock_uow = MagicMock()
     mock_uow.tenant_config = MagicMock()
     mock_uow.tenant_config.get_tenant.return_value = tenant
-    mock_uow_cls = MagicMock()
-    mock_uow_cls.return_value.__enter__ = MagicMock(return_value=mock_uow)
-    mock_uow_cls.return_value.__exit__ = MagicMock(return_value=False)
-    return mock_uow_cls
+    return _mock_cm(mock_uow)
 
 
 def _make_sync_uow(
@@ -190,16 +276,12 @@ def _make_sync_uow(
     mock_mb_uow = MagicMock()
     mock_mb_uow.media_buys = MagicMock()
     mock_mb_uow.media_buys.get_packages.return_value = packages if packages is not None else []
-    mock_mb_cls = MagicMock()
-    mock_mb_cls.return_value.__enter__ = MagicMock(return_value=mock_mb_uow)
-    mock_mb_cls.return_value.__exit__ = MagicMock(return_value=False)
+    mock_mb_cls = _mock_cm(mock_mb_uow)
 
     mock_tp_uow = MagicMock()
     mock_tp_uow.tmp_providers = MagicMock()
     mock_tp_uow.tmp_providers.list_syncable.return_value = providers if providers is not None else []
-    mock_tp_cls = MagicMock()
-    mock_tp_cls.return_value.__enter__ = MagicMock(return_value=mock_tp_uow)
-    mock_tp_cls.return_value.__exit__ = MagicMock(return_value=False)
+    mock_tp_cls = _mock_cm(mock_tp_uow)
 
     return mock_mb_cls, mock_mb_uow, mock_tp_cls, mock_tp_uow
 
@@ -226,7 +308,4 @@ def _make_tmp_uow(providers: list[TMPProvider], tenant: MagicMock | None = _UNSE
     mock_uow.tmp_providers.list_syncable.return_value = providers
     mock_uow.tenant_config = MagicMock()
     mock_uow.tenant_config.get_tenant.return_value = MagicMock() if tenant is _UNSET else tenant
-    mock_uow_cls = MagicMock()
-    mock_uow_cls.return_value.__enter__ = MagicMock(return_value=mock_uow)
-    mock_uow_cls.return_value.__exit__ = MagicMock(return_value=False)
-    return mock_uow_cls
+    return _mock_cm(mock_uow)

@@ -97,9 +97,11 @@ async def require_api_key(request: Request) -> None:
     allowed = [k.strip() for k in raw.split(",") if k.strip()]
     if not allowed:
         raise AdCPConfigurationError(
-            "TMP_DISCOVERY_API_KEYS is not configured. "
-            "Set it to a comma-separated list of API keys, "
-            "or to 'OPEN' to disable authentication."
+            "TMP_DISCOVERY_API_KEYS is not configured.",
+            suggestion=(
+                "Ask the sales agent operator to set TMP_DISCOVERY_API_KEYS to a "
+                "comma-separated list of API keys, or to 'OPEN' to disable authentication."
+            ),
         )
 
     api_key = (
@@ -147,15 +149,27 @@ async def tmp_providers_discovery(tenant_id: str, _: None = Depends(require_api_
     # to_dict() after the `with` block closes hits a detached session and
     # raises DetachedInstanceError.
     with TMPProviderUoW(tenant_id) as uow:
+        # Both repository guards raise the same typed error, never `assert`:
+        # `python -O` strips asserts, and an AssertionError escapes as an
+        # un-enveloped 500 instead of the typed AdCP envelope this endpoint's
+        # contract promises.  Every raise on this route carries `suggestion=`
+        # so the buyer-facing envelope always has a next step (#1197 review).
         if uow.tenant_config is None:
-            raise AdCPServiceUnavailableError("Tenant config repository unavailable.")
+            raise AdCPServiceUnavailableError(
+                "Tenant config repository unavailable.",
+                suggestion="Retry shortly; the sales agent could not open a tenant configuration session.",
+            )
         if uow.tenant_config.get_tenant() is None:
             raise AdCPAccountNotFoundError(
                 f"Tenant '{tenant_id}' not found.",
                 suggestion="Provide a valid tenant ID.",
             )
+        if uow.tmp_providers is None:
+            raise AdCPServiceUnavailableError(
+                "TMP provider repository unavailable.",
+                suggestion="Retry shortly; the sales agent could not open a TMP provider session.",
+            )
 
-        assert uow.tmp_providers is not None
         providers = uow.tmp_providers.list_syncable()
 
         # include_conditional=False: the TMP Router expects countries/uid_types

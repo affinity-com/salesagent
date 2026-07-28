@@ -16,12 +16,16 @@ End-to-end scenarios exercised against a real PostgreSQL database:
    TMPHealthScheduler.tick() probes providers (HTTP stubbed) and persists the
    resulting health_status to the DB.
 
-4. TestFireTmpSyncDispatched (parametrized over MCP/A2A/REST)
-   Dispatches create_media_buy through the REAL per-transport pipeline
-   (dispatch → wrapper → _impl → fire_tmp_sync), not a hand-built MagicMock
-   response, so a regression in the wiring on any transport fails this test.
-   Only httpx.Client.post is stubbed; thread spawn, URL construction, auth
-   header, and body shape run against real production code.
+4. TestFireTmpSyncDispatched / TestFireTmpSyncDispatchedOnUpdate
+   (both parametrized over MCP/A2A/REST)
+   Dispatch create_media_buy and update_media_buy through the REAL
+   per-transport pipeline (dispatch → wrapper → _impl → fire_tmp_sync), not a
+   hand-built MagicMock response, so a regression in the wiring on any
+   transport fails these tests. Only httpx.Client.post is stubbed; thread
+   spawn, URL construction, auth header, and body shape run against real
+   production code. The E2E_REST transport is graded in
+   tests/e2e/test_tmp_provider_sync_e2e.py, where the sync runs server-side
+   and in-process patching cannot reach it.
 
 beads: salesagent-tmp-sync
 """
@@ -30,6 +34,7 @@ from __future__ import annotations
 
 import os
 import threading
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -257,6 +262,65 @@ def _future(days: int) -> str:
     return (datetime.now(UTC) + timedelta(days=days)).isoformat()
 
 
+# Transports that run the real wrapper chain in-process.  IMPL is excluded
+# deliberately: it bypasses the wrappers, which is where fire_tmp_sync lives.
+# E2E_REST is graded separately in tests/e2e/test_tmp_provider_sync_e2e.py —
+# in-process patching cannot reach the server process.
+_DISPATCHED_TRANSPORTS = [Transport.MCP, Transport.A2A, Transport.REST]
+
+_SELLER_AGENT_URL = "https://salesagent.example.com/mcp"
+_PROVIDER_ENDPOINT = "https://fire.example.com/tmp"
+
+
+@contextmanager
+def _captured_tmp_sync():
+    """Stub outbound sync HTTP and join every ``fire_tmp_sync`` thread on exit.
+
+    ``fire_tmp_sync`` is fire-and-forget, so the daemon thread it spawns races
+    the assertions.  The join must happen INSIDE the patch context: the thread
+    body reads ``ADCP_AGENT_URL`` and calls ``httpx.Client()``, so joining after
+    the patches are torn down sends a real outbound connection instead of
+    hitting the mock (observed as a real DNS/connect failure on REST).
+
+    Yields the mock client so callers can assert on ``.post``.  Shared by the
+    create and update siblings — the capture mechanics are identical and only
+    the dispatched call differs (CLAUDE.md DRY invariant).
+    """
+    mock_client = _make_mock_http_client(200)
+    spawned_threads: list[threading.Thread] = []
+    original_start = threading.Thread.start
+
+    def _track_start(self_thread: threading.Thread) -> None:
+        spawned_threads.append(self_thread)
+        original_start(self_thread)
+
+    with (
+        patch("src.services.tmp_provider_sync.httpx.Client", return_value=mock_client),
+        patch.dict(os.environ, {"ADCP_AGENT_URL": _SELLER_AGENT_URL}),
+        patch.object(threading.Thread, "start", _track_start),
+    ):
+        try:
+            yield mock_client
+        finally:
+            for t in spawned_threads:
+                t.join(timeout=10)
+
+
+def _assert_synced_once(mock_client: MagicMock, *, media_buy_id: str, transport: Transport) -> None:
+    """Assert exactly one ``POST /packages/sync`` carrying *media_buy_id*."""
+    assert mock_client.post.call_count == 1, (
+        f"Expected fire_tmp_sync to POST once via {transport.value}, got {mock_client.post.call_count} calls"
+    )
+    call = mock_client.post.call_args_list[0]
+    assert call.args[0] == f"{_PROVIDER_ENDPOINT}/packages/sync"
+
+    body = call.kwargs.get("json", call.args[1] if len(call.args) > 1 else None)
+    assert isinstance(body, list)
+    assert len(body) == 1
+    assert body[0]["media_buy_id"] == media_buy_id
+    assert body[0]["seller_agent"]["agent_url"] == _SELLER_AGENT_URL
+
+
 class TestFireTmpSyncDispatched:
     """create_media_buy on each real transport reaches fire_tmp_sync and POSTs.
 
@@ -270,7 +334,7 @@ class TestFireTmpSyncDispatched:
     asserted on the outbound wire body.
     """
 
-    @pytest.mark.parametrize("transport", [Transport.MCP, Transport.A2A, Transport.REST], ids=lambda t: t.value)
+    @pytest.mark.parametrize("transport", _DISPATCHED_TRANSPORTS, ids=lambda t: t.value)
     def test_fire_tmp_sync_dispatched_posts_to_providers(self, integration_db, transport):
         """create_media_buy via *transport* fires a real POST to the TMP provider."""
         with MediaBuyCreateEnv() as env:
@@ -278,27 +342,12 @@ class TestFireTmpSyncDispatched:
             TMPProviderFactory(
                 tenant=tenant,
                 name="Fire Provider",
-                endpoint="https://fire.example.com/tmp",
+                endpoint=_PROVIDER_ENDPOINT,
                 status="active",
             )
             env._commit_factory_data()
 
-            mock_client = _make_mock_http_client(200)
-
-            # Collect the spawned thread so we can join it before asserting —
-            # fire_tmp_sync() is fire-and-forget from the caller's perspective.
-            spawned_threads: list[threading.Thread] = []
-            original_start = threading.Thread.start
-
-            def _track_start(self_thread: threading.Thread) -> None:
-                spawned_threads.append(self_thread)
-                original_start(self_thread)
-
-            with (
-                patch("src.services.tmp_provider_sync.httpx.Client", return_value=mock_client),
-                patch.dict(os.environ, {"ADCP_AGENT_URL": "https://salesagent.example.com/mcp"}),
-                patch.object(threading.Thread, "start", _track_start),
-            ):
+            with _captured_tmp_sync() as mock_client:
                 result = env.call_via(
                     transport,
                     brand={"domain": "tmp-fire-dispatch.example.com"},
@@ -313,27 +362,65 @@ class TestFireTmpSyncDispatched:
                     end_time=_future(30),
                 )
 
-                # Join the daemon thread INSIDE the patch context — the thread body
-                # runs concurrently with t.start() returning, so joining after the
-                # `with` block exits risks the thread executing httpx.Client() (and
-                # os.environ.get("ADCP_AGENT_URL")) after the patches are torn down,
-                # sending a real outbound connection instead of hitting the mock
-                # (observed as a real DNS/connect failure on the REST transport).
-                for t in spawned_threads:
-                    t.join(timeout=10)
-
         assert result.is_success, f"create_media_buy failed on {transport.value}: {result.error}"
         media_buy_id = result.payload.response.media_buy_id
         assert media_buy_id
+        _assert_synced_once(mock_client, media_buy_id=media_buy_id, transport=transport)
 
-        assert mock_client.post.call_count == 1, (
-            f"Expected fire_tmp_sync to POST once via {transport.value}, got {mock_client.post.call_count} calls"
-        )
-        call = mock_client.post.call_args_list[0]
-        assert call.args[0] == "https://fire.example.com/tmp/packages/sync"
 
-        body = call.kwargs.get("json", call.args[1] if len(call.args) > 1 else None)
-        assert isinstance(body, list)
-        assert len(body) == 1
-        assert body[0]["media_buy_id"] == media_buy_id
-        assert body[0]["seller_agent"]["agent_url"] == "https://salesagent.example.com/mcp"
+class TestFireTmpSyncDispatchedOnUpdate:
+    """update_media_buy on each real transport reaches fire_tmp_sync and POSTs.
+
+    The update sibling of :class:`TestFireTmpSyncDispatched`.  Until this
+    existed, the update half of the sync was graded only by unit tests that
+    patched ``threading.Thread`` and asserted the thread was *constructed* — an
+    in-process object no transport observes.  Deleting the ``fire_tmp_sync``
+    call from an update wrapper failed nothing (#1197 review).
+
+    Dispatch goes through ``MediaBuyDualEnv``, which is the update harness with
+    real per-transport wrapper dispatch (A2A via the real ``on_message_send``,
+    MCP via the real FastMCP ``Client``, REST via the route).  Note this is NOT
+    ``MediaBuyUpdateEnv``: that is the *unit* env whose ``call_via`` routes every
+    transport through ``call_impl``, skipping the wrappers where
+    ``fire_tmp_sync`` lives.  Adding a second real-dispatch update path to it
+    would duplicate what ``MediaBuyDualEnv`` already owns.
+    """
+
+    @pytest.mark.parametrize("transport", _DISPATCHED_TRANSPORTS, ids=lambda t: t.value)
+    def test_fire_tmp_sync_dispatched_posts_on_update(self, integration_db, transport):
+        """update_media_buy via *transport* fires a real POST to the TMP provider."""
+        from src.core.schemas import UpdateMediaBuyRequest
+        from tests.harness.media_buy_dual import MediaBuyDualEnv
+
+        media_buy_id = f"mb_tmp_update_{transport.value}"
+
+        with MediaBuyDualEnv() as env:
+            tenant, principal, _product, _pricing_option = env.setup_media_buy_data()
+            media_buy = MediaBuyFactory(
+                tenant=tenant,
+                principal=principal,
+                media_buy_id=media_buy_id,
+                status="active",
+            )
+            # The sync only POSTs when the media buy has packages — without one
+            # sync_packages_for_media_buy short-circuits and the test would pass
+            # vacuously whether or not the wrapper fired.
+            MediaPackageFactory(
+                media_buy=media_buy,
+                package_config={"product_id": "prod-001", "name": "Update Package", "is_active": True},
+            )
+            TMPProviderFactory(
+                tenant=tenant,
+                name="Fire Provider",
+                endpoint=_PROVIDER_ENDPOINT,
+                status="active",
+            )
+            env._commit_factory_data()
+
+            with _captured_tmp_sync() as mock_client:
+                env.call_via(
+                    transport,
+                    req=UpdateMediaBuyRequest(media_buy_id=media_buy_id, budget=15000.0),
+                )
+
+        _assert_synced_once(mock_client, media_buy_id=media_buy_id, transport=transport)
