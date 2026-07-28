@@ -849,9 +849,8 @@ class TestBrandPersistence:
 
             assert result.creatives[0].action == "created"
 
-            with get_db_session() as session:
-                db = session.scalars(select(DBCreative).filter_by(creative_id="c_brand_create")).first()
-                assert db.data.get("brand") == {"domain": "acme.com"}
+            db = env.get_one(DBCreative, creative_id="c_brand_create")
+            assert db.data.get("brand") == {"domain": "acme.com"}
 
     def test_brand_not_overwritten_on_update(self, integration_db):
         """UPDATE: once brand is set, a second sync without media_buy_brand does not overwrite it.
@@ -881,10 +880,9 @@ class TestBrandPersistence:
 
             assert result.creatives[0].action == "updated"
 
-            with get_db_session() as session:
-                db = session.scalars(select(DBCreative).filter_by(creative_id="c_brand_no_overwrite")).first()
-                # Original brand preserved — no media_buy_brand on update means no overwrite
-                assert db.data.get("brand") == {"domain": "original.com"}
+            db = env.get_one(DBCreative, creative_id="c_brand_no_overwrite")
+            # Original brand preserved — no media_buy_brand on update means no overwrite
+            assert db.data.get("brand") == {"domain": "original.com"}
 
     def test_media_buy_brand_overwrites_previously_stored_brand(self, integration_db):
         """UPDATE: a new media_buy_brand overwrites the previously stored brand.
@@ -927,10 +925,9 @@ class TestBrandPersistence:
 
             assert result.creatives[0].action == "updated"
 
-            with get_db_session() as session:
-                db = session.scalars(select(DBCreative).filter_by(creative_id="c_brand_priority")).first()
-                # New media_buy_brand must overwrite the previously stored brand
-                assert db.data.get("brand") == {"domain": "mediabuy.com"}
+            db = env.get_one(DBCreative, creative_id="c_brand_priority")
+            # New media_buy_brand must overwrite the previously stored brand
+            assert db.data.get("brand") == {"domain": "mediabuy.com"}
 
     def test_update_media_buy_brand_propagated(self, integration_db):
         """UPDATE: media_buy_brand kwarg propagated and stored in data["brand"]."""
@@ -963,6 +960,5 @@ class TestBrandPersistence:
 
             assert result.creatives[0].action == "updated"
 
-            with get_db_session() as session:
-                db = session.scalars(select(DBCreative).filter_by(creative_id="c_brand_mb_update")).first()
-                assert db.data.get("brand") == {"domain": "mediabuy.com"}
+            db = env.get_one(DBCreative, creative_id="c_brand_mb_update")
+            assert db.data.get("brand") == {"domain": "mediabuy.com"}

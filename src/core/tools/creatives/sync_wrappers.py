@@ -4,7 +4,7 @@ from typing import Annotated, Any
 
 from adcp import PushNotificationConfig
 from adcp.types import AccountReference as LibraryAccountReference
-from adcp.types import BrandReference, ContextObject, CreativeAsset, ValidationMode
+from adcp.types import ContextObject, CreativeAsset, ValidationMode
 from fastmcp.server.context import Context
 from fastmcp.tools.tool import ToolResult
 from pydantic import Field
@@ -28,7 +28,6 @@ async def sync_creatives(
     push_notification_config: PushNotificationConfig | None = None,
     context: ContextObject | None = None,  # Application level context per adcp spec
     account: LibraryAccountReference | None = None,
-    media_buy_brand: BrandReference | None = None,
     ctx: Context | ToolContext | None = None,
 ):
     """Sync creative assets to centralized library (AdCP v2.5 spec compliant endpoint).
@@ -46,7 +45,6 @@ async def sync_creatives(
         push_notification_config: Push notification config for async notifications (AdCP spec, optional)
         context: Application level context per adcp spec
         account: Account reference for multi-account tenants
-        media_buy_brand: Brand reference propagated from the media buy (internal orchestration)
         ctx: FastMCP context (automatically provided)
 
     Returns:
@@ -71,7 +69,6 @@ async def sync_creatives(
         validation_mode=validation_mode_str,
         push_notification_config=push_notification_config,
         context=context,
-        media_buy_brand=media_buy_brand,
         identity=identity,
     )
     return ToolResult(content=str(response), structured_content=response)
@@ -89,7 +86,6 @@ def sync_creatives_raw(
     push_notification_config: PushNotificationConfig | None = None,
     context: ContextObject | None = None,
     account: LibraryAccountReference | None = None,
-    media_buy_brand: BrandReference | None = None,
     ctx: Context | ToolContext | None = None,
     identity: ResolvedIdentity | None = None,
 ):
@@ -107,7 +103,6 @@ def sync_creatives_raw(
         push_notification_config: Push notification config for status updates
         context: Application level context per adcp spec
         account: Account reference for multi-account tenants
-        media_buy_brand: Brand reference propagated from the media buy (internal orchestration)
         ctx: FastMCP context (automatically provided)
         identity: ResolvedIdentity (transport-agnostic, preferred over ctx)
 
@@ -133,6 +128,5 @@ def sync_creatives_raw(
         validation_mode=validation_mode,
         push_notification_config=push_notification_config,
         context=context,
-        media_buy_brand=media_buy_brand,
         identity=identity,
     )

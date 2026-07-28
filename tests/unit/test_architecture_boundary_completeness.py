@@ -47,6 +47,22 @@ KNOWN_VIOLATIONS: set[str] = set()
 # Parameters resolved at the boundary, not forwarded from the caller
 BOUNDARY_RESOLVED_PARAMS = {"identity"}
 
+# Parameters supplied ONLY by internal orchestration, never by a transport caller.
+#
+# Distinct from KNOWN_VIOLATIONS: these are not drops awaiting a fix — forwarding
+# them WOULD be the bug. A wire wrapper's signature is the buyer-facing contract
+# (FastMCP derives the advertised MCP tool schema from it), so exposing a param
+# the pinned AdCP request schema does not define would advertise a non-spec input.
+#
+# ``media_buy_brand``: threaded from _create_media_buy_impl through
+# process_and_upload_package_creatives into _sync_creatives_impl so adapters can
+# read brand.domain from stored creative data. ``SyncCreativesRequest`` has no
+# ``brand`` field in the pinned spec, and no transport caller sets it.
+#
+# This set only expresses "not buyer-facing" — the guard still enforces that every
+# buyer-facing _impl param reaches _impl from every wrapper.
+INTERNAL_ONLY_PARAMS = {"media_buy_brand"}
+
 
 def _module_to_filepath(module_path: str) -> Path:
     """Convert dotted module path to filesystem path."""
@@ -156,7 +172,7 @@ def _check_wrapper_completeness(
     violations = []
     for kwargs, n_positional in call_arg_sets:
         for i, param in enumerate(impl_params):
-            if param in BOUNDARY_RESOLVED_PARAMS:
+            if param in BOUNDARY_RESOLVED_PARAMS or param in INTERNAL_ONLY_PARAMS:
                 continue
             key = f"{module_path}::{impl_name}::{wrapper_kind}::{param}"
             if param not in kwargs and i >= n_positional:
