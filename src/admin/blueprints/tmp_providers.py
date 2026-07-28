@@ -29,7 +29,7 @@ from src.core.security.url_validator import check_url_ssrf, sanitize_for_log
 logger = logging.getLogger(__name__)
 
 # Valid uid_type values per AdCP spec (uid-type enum).
-# Authority: adcp.types.generated_poc.enums.uid_type.UidType (pinned SDK, adcp==5.7.0).
+# Authority: adcp.types.generated_poc.enums.uid_type.UidType (pinned SDK, adcp==6.6.0).
 # Pinned by TestValidUidTypesMatchesPinnedSchema in test_tmp_providers_blueprint.py —
 # that guard asserts this frozenset equals the SDK enum so a version bump can't drift silently.
 VALID_UID_TYPES = frozenset(
@@ -146,6 +146,79 @@ def _provider_not_found_redirect(tenant_id: str):
 # ---------------------------------------------------------------------------
 
 
+def _parse_int_field(form: Mapping[str, str], field: str, default: str, label: str) -> tuple[int, str | None]:
+    """Parse *field* as an int, returning ``(value, error_message)``.
+
+    Collapses the two identical ``try: int(form.get(...)) except (ValueError,
+    TypeError)`` blocks (timeout_ms, priority) into one call site.  On failure
+    the returned value is ``0`` and callers must propagate *error_message*
+    rather than use it.
+    """
+    try:
+        return int(form.get(field, default)), None
+    except (ValueError, TypeError):
+        return 0, f"{label} must be a numeric value"
+
+
+def _split_csv(raw: str, *, upper: bool = False) -> list[str] | None:
+    """Split a comma-separated form field into a list, or ``None`` when empty.
+
+    ``None`` (not ``[]``) is the "accepts all" sentinel used by the DB columns
+    and the discovery contract, so an empty field must not become an empty
+    list.  *upper* uppercases each entry (ISO 3166-1 alpha-2 country codes).
+    """
+    items = [item.strip() for item in raw.split(",") if item.strip()]
+    if upper:
+        items = [item.upper() for item in items]
+    return items or None
+
+
+def _validate_endpoint_url(endpoint: str) -> str | None:
+    """Return an error message when *endpoint* fails the SSRF check, else ``None``."""
+    is_safe, ssrf_error = check_url_ssrf(endpoint)
+    if is_safe:
+        return None
+    logger.warning(
+        # [TMP admin] tag included so an operator grepping `[TMP` for this
+        # feature's logs sees the SSRF rejections too, not just the
+        # _log_and_500 / _log_flash_and_redirect lines.
+        "[TMP admin][SECURITY] Provider rejected unsafe URL %s: %s",
+        sanitize_for_log(endpoint),
+        sanitize_for_log(ssrf_error),
+    )
+    return f"Endpoint URL is not allowed: {ssrf_error}"
+
+
+def _validate_match_capabilities(
+    *,
+    context_match: bool,
+    identity_match: bool,
+    countries: list[str] | None,
+    uid_types: list[str] | None,
+) -> str | None:
+    """Validate the declared match capabilities, returning an error message or ``None``.
+
+    A provider must support at least one match mode, and per AdCP spec
+    ``countries`` and ``uid_types`` MUST be non-empty when ``identity_match``
+    is true (uid_types additionally constrained to the uid-type enum).
+    """
+    if not context_match and not identity_match:
+        return "Provider must support at least one of context_match or identity_match"
+
+    if not identity_match:
+        return None
+
+    if not countries:
+        return "Countries are required when identity_match is enabled (ISO 3166-1 alpha-2 codes)"
+    if not uid_types:
+        return "UID types are required when identity_match is enabled (e.g. uid2, publisher_first_party)"
+
+    invalid_types = [u for u in uid_types if u not in VALID_UID_TYPES]
+    if invalid_types:
+        return f"Invalid uid_type(s): {', '.join(invalid_types)}. Valid values: {', '.join(sorted(VALID_UID_TYPES))}"
+    return None
+
+
 def _validate_provider_form(form: Mapping[str, str]) -> tuple[dict, str | None]:
     """Parse and validate TMP provider form data.
 
@@ -162,31 +235,24 @@ def _validate_provider_form(form: Mapping[str, str]) -> tuple[dict, str | None]:
     endpoint = form.get("endpoint", "").strip()
     context_match = form.get("context_match") == "on"
     identity_match = form.get("identity_match") == "on"
-    countries_raw = form.get("countries", "").strip()
-    uid_types_raw = form.get("uid_types", "").strip()
-    properties_raw = form.get("properties", "").strip()
     status = form.get("status", "active").strip()
 
-    # Validate timeout_ms is numeric
-    try:
-        timeout_ms = int(form.get("timeout_ms", "50"))
-    except (ValueError, TypeError):
-        return {}, "Timeout (ms) must be a numeric value"
+    timeout_ms, error = _parse_int_field(form, "timeout_ms", "50", "Timeout (ms)")
+    if error:
+        return {}, error
 
-    # Validate priority is numeric
-    try:
-        priority = int(form.get("priority", "0"))
-    except (ValueError, TypeError):
-        return {}, "Priority must be a numeric value"
+    priority, error = _parse_int_field(form, "priority", "0", "Priority")
+    if error:
+        return {}, error
 
     # Validate status against allowed values
     if status not in VALID_STATUSES:
         return {}, (f"Invalid status '{status}'. Valid values: {', '.join(sorted(VALID_STATUSES))}")
 
     # Parse comma-separated lists
-    countries = [c.strip().upper() for c in countries_raw.split(",") if c.strip()] or None
-    uid_types = [u.strip() for u in uid_types_raw.split(",") if u.strip()] or None
-    properties_list = [p.strip() for p in properties_raw.split(",") if p.strip()] or None
+    countries = _split_csv(form.get("countries", "").strip(), upper=True)
+    uid_types = _split_csv(form.get("uid_types", "").strip())
+    properties_list = _split_csv(form.get("properties", "").strip())
 
     if not name:
         return {}, "Provider name is required"
@@ -194,34 +260,18 @@ def _validate_provider_form(form: Mapping[str, str]) -> tuple[dict, str | None]:
     if not endpoint:
         return {}, "Endpoint URL is required"
 
-    is_safe, ssrf_error = check_url_ssrf(endpoint)
-    if not is_safe:
-        logger.warning(
-            # [TMP admin] tag included so an operator grepping `[TMP` for this
-            # feature's logs sees the SSRF rejections too, not just the
-            # _log_and_500 / _log_flash_and_redirect lines.
-            "[TMP admin][SECURITY] Provider rejected unsafe URL %s: %s",
-            sanitize_for_log(endpoint),
-            sanitize_for_log(ssrf_error),
-        )
-        return {}, f"Endpoint URL is not allowed: {ssrf_error}"
+    error = _validate_endpoint_url(endpoint)
+    if error:
+        return {}, error
 
-    # At least one of context_match or identity_match must be true
-    if not context_match and not identity_match:
-        return {}, "Provider must support at least one of context_match or identity_match"
-
-    # Per AdCP spec: countries and uid_types MUST be non-empty when identity_match is true
-    if identity_match:
-        if not countries:
-            return {}, "Countries are required when identity_match is enabled (ISO 3166-1 alpha-2 codes)"
-        if not uid_types:
-            return {}, "UID types are required when identity_match is enabled (e.g. uid2, publisher_first_party)"
-        # Validate uid_type values against the AdCP enum
-        invalid_types = [u for u in uid_types if u not in VALID_UID_TYPES]
-        if invalid_types:
-            return {}, (
-                f"Invalid uid_type(s): {', '.join(invalid_types)}. Valid values: {', '.join(sorted(VALID_UID_TYPES))}"
-            )
+    error = _validate_match_capabilities(
+        context_match=context_match,
+        identity_match=identity_match,
+        countries=countries,
+        uid_types=uid_types,
+    )
+    if error:
+        return {}, error
 
     auth_type = form.get("auth_type", "").strip() or None
     auth_credentials = form.get("auth_credentials", "").strip() or None
