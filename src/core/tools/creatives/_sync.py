@@ -391,18 +391,12 @@ def _sync_creatives_impl(
 
         # CreativeUoW auto-commits on clean exit — no explicit commit needed
 
-    # Process assignments (spec-compliant: creative_id → package_ids mapping)
-    # Only attempt assignments for creatives that were successfully synced;
-    # failed creatives are not in the DB so their assignments would violate
-    # the FK constraint on creative_assignments(creative_id, tenant_id, principal_id).
-    failed_creative_ids = {r.creative_id for r in results if r.action == "failed"}
-    if failed_creative_ids and assignments:
-        # Filter out assignments for failed creatives before processing
-        if isinstance(assignments, dict):
-            assignments = {cid: pkgs for cid, pkgs in assignments.items() if cid not in failed_creative_ids}
-        elif isinstance(assignments, list):
-            assignments = [a for a in assignments if a.get("creative_id") not in failed_creative_ids]
-
+    # Process assignments (spec-compliant: creative_id → package_ids mapping).
+    # Assignments for creatives that failed this sync are NOT filtered out here:
+    # _process_assignments owns that guard (it skips the FK-violating INSERT and
+    # records the skip in assignment_errors so the buyer learns the package was
+    # not assigned, per BR-RULE-033 INV-4). Pre-filtering here dropped those
+    # creatives before the guard ran, silently losing the errors (#1418).
     assignment_list = _process_assignments(
         assignments=assignments,
         results=results,
