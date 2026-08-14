@@ -94,10 +94,18 @@ class TestDiscoveryReturnsActiveProviders:
 
         with _TMPEnv() as env:
             tenant = TenantFactory(tenant_id="tmp_int_disc_t1")
-            TMPProviderFactory(tenant=tenant, name="Active Provider", status="active")
-            TMPProviderFactory(tenant=tenant, name="Draining Provider", status="draining")
-            TMPProviderFactory(tenant=tenant, name="Inactive Provider", status="inactive")
+            active = TMPProviderFactory(tenant=tenant, name="Active Provider", status="active")
+            draining = TMPProviderFactory(tenant=tenant, name="Draining Provider", status="draining")
+            inactive = TMPProviderFactory(tenant=tenant, name="Inactive Provider", status="inactive")
             env._commit_factory_data()
+            # Read the ids while the session is open — the wire identifies
+            # providers by provider_id, not by the admin-only `name` (absent
+            # from the closed provider-registration.json key set, #1197 review).
+            active_id, draining_id, inactive_id = (
+                active.provider_id,
+                draining.provider_id,
+                inactive.provider_id,
+            )
 
         with patch.dict(os.environ, {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
             client = TestClient(app, raise_server_exceptions=False)
@@ -106,10 +114,10 @@ class TestDiscoveryReturnsActiveProviders:
         assert response.status_code == 200
         data = response.json()
         assert data["tenant_id"] == "tmp_int_disc_t1"
-        names = {p["name"] for p in data["providers"]}
-        assert "Active Provider" in names
-        assert "Draining Provider" in names
-        assert "Inactive Provider" not in names
+        returned_ids = {p["provider_id"] for p in data["providers"]}
+        assert active_id in returned_ids
+        assert draining_id in returned_ids
+        assert inactive_id not in returned_ids
 
 
 # ---------------------------------------------------------------------------
