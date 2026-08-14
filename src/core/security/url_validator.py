@@ -14,19 +14,6 @@ logger = logging.getLogger(__name__)
 # Placeholder logged in place of a URL with no usable scheme+host.
 UNPARSEABLE_URL_FOR_LOG = "<unparseable-url>"
 
-# Control characters are the entire mechanism behind log forging: a CR/LF in
-# untrusted text lets it terminate the current record and append a fabricated one.
-_CONTROL_CHAR_ESCAPES = {codepoint: f"\\x{codepoint:02x}" for codepoint in range(0x20)} | {0x7F: "\\x7f"}
-
-
-def log_safe_text(value: object) -> str:
-    """Escape control characters so untrusted text cannot forge a log record.
-
-    Printable characters are left intact, so messages stay readable — only the
-    CR/LF/NUL class that makes log injection possible is neutralized.
-    """
-    return str(value).translate(_CONTROL_CHAR_ESCAPES)
-
 
 def url_for_log(url: str | None) -> str:
     """Render a URL for a log line: ``scheme://host/path``, percent-encoded.
@@ -121,7 +108,9 @@ def _check_hostname_resolution(hostname: str, *, resolve_dns: bool) -> tuple[boo
         # The resolver's exception text is diagnostic only and callers surface this
         # message verbatim to the requester, so keep it server-side (CodeQL
         # ``py/stack-trace-exposure``).
-        logger.warning("Hostname %s resolved to an unparseable address", log_safe_text(hostname), exc_info=True)
+        from src.core.logging_config import log_safe
+
+        logger.warning("Hostname %s resolved to an unparseable address", log_safe(hostname), exc_info=True)
         return False, "Hostname resolved to an invalid IP address"
 
     error = _blocked_ip_error(ip)

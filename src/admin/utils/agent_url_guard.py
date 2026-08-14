@@ -16,7 +16,8 @@ from typing import Any
 from flask import Response, flash, jsonify, redirect, url_for
 from werkzeug.wrappers import Response as WerkzeugResponse
 
-from src.core.security.url_validator import check_url_ssrf, log_safe_text, url_for_log
+from src.core.logging_config import log_safe
+from src.core.security.url_validator import check_url_ssrf, url_for_log
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,7 @@ def reject_if_unsafe_agent_url(
         agent_kind,
         action,
         url_for_log(agent_url),
-        log_safe_text(ssrf_error),
+        log_safe(ssrf_error),
     )
     message = f"Agent URL is not allowed: {ssrf_error}"
     if as_json:
