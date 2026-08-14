@@ -94,10 +94,6 @@ def create_test_product(
     if pricing_options is None:
         pricing_options = [create_test_cpm_pricing_option()]
 
-    # Default reporting_capabilities if not provided (required in adcp 4.3)
-    if "reporting_capabilities" not in kwargs:
-        kwargs["reporting_capabilities"] = {"metrics": ["impressions", "clicks"]}
-
     return Product(
         product_id=product_id,
         name=name,
@@ -690,6 +686,19 @@ def create_test_media_buy_request_dict(
     request.update(kwargs)
 
     return request
+
+
+def valid_reporting_webhook(url: str) -> dict[str, Any]:
+    """ReportingWebhook dict that clears auth MinLen=32 so SSRF gates are reachable.
+
+    Shared by unit SSRF helpers and BDD Given steps — credential length and shape
+    live in one place so auth-minimum drift cannot masquerade as an SSRF failure.
+    """
+    return {
+        "url": url,
+        "authentication": {"schemes": ["Bearer"], "credentials": "x" * 32},
+        "reporting_frequency": "daily",
+    }
 
 
 def create_test_media_buy_dict(
