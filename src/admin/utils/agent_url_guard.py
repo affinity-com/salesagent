@@ -16,18 +16,9 @@ from typing import Any
 from flask import Response, flash, jsonify, redirect, url_for
 from werkzeug.wrappers import Response as WerkzeugResponse
 
-from src.core.security.url_validator import check_url_ssrf
+from src.core.security.url_validator import check_url_ssrf, log_safe_text, url_for_log
 
 logger = logging.getLogger(__name__)
-
-
-def _sanitize_for_log(value: str, *, max_len: int = 200) -> str:
-    """Strip CR/LF (and truncate) so an admin-supplied URL cannot forge log lines.
-
-    The agent URL reaching these handlers is unvalidated request data — embedded
-    newlines would let it inject a fabricated log record (CodeQL ``log-injection``).
-    """
-    return value.replace("\r", "\\r").replace("\n", "\\n")[:max_len]
 
 
 def reject_if_unsafe_agent_url(
@@ -60,12 +51,15 @@ def reject_if_unsafe_agent_url(
     if is_safe:
         return None
 
+    # Both interpolated values derive from unvalidated request data: the URL is
+    # rendered structure-only + percent-encoded, and the reason has its control
+    # characters escaped, so neither can forge a log record.
     logger.warning(
-        "[SECURITY] %s %s rejected unsafe URL %r: %s",
+        "[SECURITY] %s %s rejected unsafe URL %s: %s",
         agent_kind,
         action,
-        _sanitize_for_log(agent_url or ""),
-        ssrf_error,
+        url_for_log(agent_url),
+        log_safe_text(ssrf_error),
     )
     message = f"Agent URL is not allowed: {ssrf_error}"
     if as_json:

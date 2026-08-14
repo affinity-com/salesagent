@@ -10,13 +10,12 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any
-from urllib.parse import urlparse
 
 from adcp.types import ContextObject, TaskType
 
 from src.core.config import is_production
 from src.core.exceptions import AdCPValidationError
-from src.core.security.url_validator import check_url_ssrf
+from src.core.security.url_validator import UNPARSEABLE_URL_FOR_LOG, check_url_ssrf, url_for_log
 
 # Fallback used when an action label is not a member of the SDK's closed
 # TaskType enum. create_mcp_webhook_payload() restricts task_type to that
@@ -33,8 +32,9 @@ WEBHOOK_SSRF_SUGGESTION_DEV = (
 )
 
 # Log fallback when sanitize_webhook_url_for_log cannot parse scheme/host —
-# never fall back to the raw buyer URL (credentials / query).
-UNPARSEABLE_WEBHOOK_URL_FOR_LOG = "<unparseable-url>"
+# never fall back to the raw buyer URL (credentials / query). Re-exported from
+# url_validator so the placeholder reads identically across every log site.
+UNPARSEABLE_WEBHOOK_URL_FOR_LOG = UNPARSEABLE_URL_FOR_LOG
 
 
 def _adcp_testing() -> bool:
@@ -83,13 +83,14 @@ def webhook_ssrf_suggestion() -> str:
 
 
 def sanitize_webhook_url_for_log(url: str | None) -> str | None:
-    """Return ``scheme://host/path`` for logs — never credentials or query."""
-    if not url:
-        return None
-    parsed = urlparse(str(url))
-    if parsed.scheme and parsed.hostname:
-        return f"{parsed.scheme}://{parsed.hostname}{parsed.path or ''}"
-    return None
+    """Return ``scheme://host/path`` for logs — never credentials or query.
+
+    Delegates to the shared ``url_for_log`` renderer (which also percent-encodes,
+    so a control character in the URL cannot forge a log record) and keeps this
+    function's ``None``-for-unusable contract.
+    """
+    rendered = url_for_log(url)
+    return None if rendered == UNPARSEABLE_URL_FOR_LOG else rendered
 
 
 def webhook_url_for_log(url: str | None) -> str:

@@ -7,9 +7,46 @@ property list resolution and webhook URL validation.
 import ipaddress
 import logging
 import socket
-from urllib.parse import ParseResult, urlparse
+from urllib.parse import ParseResult, quote, urlparse
 
 logger = logging.getLogger(__name__)
+
+# Placeholder logged in place of a URL with no usable scheme+host.
+UNPARSEABLE_URL_FOR_LOG = "<unparseable-url>"
+
+# Control characters are the entire mechanism behind log forging: a CR/LF in
+# untrusted text lets it terminate the current record and append a fabricated one.
+_CONTROL_CHAR_ESCAPES = {codepoint: f"\\x{codepoint:02x}" for codepoint in range(0x20)} | {0x7F: "\\x7f"}
+
+
+def log_safe_text(value: object) -> str:
+    """Escape control characters so untrusted text cannot forge a log record.
+
+    Printable characters are left intact, so messages stay readable — only the
+    CR/LF/NUL class that makes log injection possible is neutralized.
+    """
+    return str(value).translate(_CONTROL_CHAR_ESCAPES)
+
+
+def url_for_log(url: str | None) -> str:
+    """Render a URL for a log line: ``scheme://host/path``, percent-encoded.
+
+    Never logs a raw URL, guarding two hazards at once:
+
+    - **Log forging** — an admin- or buyer-supplied URL is unvalidated request
+      data; percent-encoding removes every control character it could carry.
+    - **Credential leakage** — userinfo and query string are dropped, so a token
+      embedded in either never reaches the log.
+
+    Returns :data:`UNPARSEABLE_URL_FOR_LOG` when there is no usable scheme+host.
+    """
+    if not url:
+        return UNPARSEABLE_URL_FOR_LOG
+    parsed = urlparse(str(url))
+    if not (parsed.scheme and parsed.hostname):
+        return UNPARSEABLE_URL_FOR_LOG
+    return quote(f"{parsed.scheme}://{parsed.hostname}{parsed.path or ''}", safe=":/._-~")
+
 
 # Blocked IP ranges (RFC 1918 private networks, loopback, link-local,
 # CGNAT shared space, and multicast).
@@ -80,8 +117,12 @@ def _check_hostname_resolution(hostname: str, *, resolve_dns: bool) -> tuple[boo
         ip = ipaddress.ip_address(socket.gethostbyname(hostname))
     except socket.gaierror:
         return False, f"Cannot resolve hostname: {hostname}"
-    except ValueError as e:
-        return False, f"Invalid IP address from hostname resolution: {e}"
+    except ValueError:
+        # The resolver's exception text is diagnostic only and callers surface this
+        # message verbatim to the requester, so keep it server-side (CodeQL
+        # ``py/stack-trace-exposure``).
+        logger.warning("Hostname %s resolved to an unparseable address", log_safe_text(hostname), exc_info=True)
+        return False, "Hostname resolved to an invalid IP address"
 
     error = _blocked_ip_error(ip)
     return (False, error) if error else (True, "")
@@ -132,5 +173,5 @@ def check_url_ssrf(
         # message verbatim to the requester (flash / JSON error), so keep the
         # exception text server-side rather than echoing it back — the raw text can
         # carry internal resolver state (CodeQL ``stack-trace-exposure``).
-        logger.warning("SSRF check could not parse URL %r", url, exc_info=True)
+        logger.warning("SSRF check could not parse URL %s", url_for_log(url), exc_info=True)
         return False, "URL could not be parsed or resolved"

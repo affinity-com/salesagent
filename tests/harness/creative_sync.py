@@ -54,6 +54,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from src.core.schemas import SyncCreativesResponse
 from tests.harness._base import IntegrationEnv
+from tests.harness._realize import e2e_unsupported, realize_e2e
 
 # Sink for the production error mapper's log calls in set_build_creative_sdk_error.
 _harness_logger = logging.getLogger(__name__)
@@ -107,6 +108,15 @@ class CreativeSyncEnv(IntegrationEnv):
         mock_config.gemini_api_key = None
         self.mock["config"].return_value = mock_config
 
+    @realize_e2e(
+        e2e_unsupported(
+            "generative setup injects a synthetic format (output_format_ids) plus a stubbed "
+            "build_creative into the in-process registry mock. Over e2e the live server resolves "
+            "formats against the real creative agent, which does not serve it — the sync is "
+            "rejected as an unknown format. Realizing this needs a generative format registered "
+            "with the pinned reference agent and present in the reference fixture."
+        )
+    )
     def setup_generative_build(
         self,
         format_id: str = "display_gen",
@@ -126,6 +136,11 @@ class CreativeSyncEnv(IntegrationEnv):
 
             fmt = env.setup_generative_build(format_id="gen_banner")
             creative = {"creative_id": "c1", "name": "Test", "format_id": fmt, ...}
+
+        Unrealizable over e2e (declared above): the format lives only in the
+        in-process registry mock, so the live server rejects it as unknown. The
+        BDD report hook turns that declaration into a non-strict xfail rather
+        than a ledger entry, per the e2e_rest ledger's stated convention.
         """
         from adcp.types import FormatId as LibraryFormatId
 
