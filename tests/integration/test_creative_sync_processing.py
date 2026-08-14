@@ -823,8 +823,9 @@ class TestBrandPersistence:
     """media_buy_brand is stored in creative data["brand"] (Change 5).
 
     Verifies that brand information from the media buy request is propagated
-    through _sync_creatives_impl and persisted in the creative's data field
-    so adapters can read brand.domain for routing decisions.
+    through _sync_creatives_internal_impl (the internal orchestration entry point —
+    media_buy_brand is not on the buyer-facing wire contract) and persisted in the
+    creative's data field so adapters can read brand.domain for routing decisions.
 
     media_buy_brand is typed as BrandReference end-to-end; serialization to
     dict happens only at the DB boundary inside _build_creative_data().
@@ -842,7 +843,7 @@ class TestBrandPersistence:
                 assets=build_assets(text_spec("message", content="Build me an ad")),
             )
 
-            result = env.call_impl(
+            result = env.call_internal_impl(
                 creatives=[creative],
                 media_buy_brand=BrandReference(domain="acme.com"),
             )
@@ -868,7 +869,7 @@ class TestBrandPersistence:
                 format_id=fmt,
                 assets=build_assets(text_spec("message", content="Initial")),
             )
-            env.call_impl(creatives=[creative], media_buy_brand=BrandReference(domain="original.com"))
+            env.call_internal_impl(creatives=[creative], media_buy_brand=BrandReference(domain="original.com"))
 
             # Second sync (UPDATE) without media_buy_brand — should NOT overwrite
             creative2 = _creative(
@@ -876,7 +877,7 @@ class TestBrandPersistence:
                 format_id=fmt,
                 assets=build_assets(text_spec("message", content="Updated")),
             )
-            result = env.call_impl(creatives=[creative2])
+            result = env.call_internal_impl(creatives=[creative2])
 
             assert result.creatives[0].action == "updated"
 
@@ -900,7 +901,7 @@ class TestBrandPersistence:
             fmt = env.setup_generative_build()
 
             # First CREATE with one brand
-            env.call_impl(
+            env.call_internal_impl(
                 creatives=[
                     _creative(
                         creative_id="c_brand_priority",
@@ -912,7 +913,7 @@ class TestBrandPersistence:
             )
 
             # UPDATE with a different media_buy_brand — must overwrite the stored brand
-            result = env.call_impl(
+            result = env.call_internal_impl(
                 creatives=[
                     _creative(
                         creative_id="c_brand_priority",
@@ -936,7 +937,7 @@ class TestBrandPersistence:
             fmt = env.setup_generative_build()
 
             # CREATE first (no brand)
-            env.call_impl(
+            env.call_internal_impl(
                 creatives=[
                     _creative(
                         creative_id="c_brand_mb_update",
@@ -953,7 +954,7 @@ class TestBrandPersistence:
                 assets=build_assets(text_spec("message", content="Updated")),
             )
 
-            result = env.call_impl(
+            result = env.call_internal_impl(
                 creatives=[creative],
                 media_buy_brand=BrandReference(domain="mediabuy.com"),
             )

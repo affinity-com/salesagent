@@ -523,7 +523,7 @@ def process_and_upload_package_creatives(
 
     For each package with a non-empty `creatives` array:
     1. Converts Creative objects to dicts
-    2. Uploads them via _sync_creatives_impl
+    2. Uploads them via _sync_creatives_internal_impl
     3. Extracts uploaded creative IDs
     4. Creates updated package with merged creative_ids
 
@@ -535,8 +535,9 @@ def process_and_upload_package_creatives(
         context: FastMCP context (for principal_id extraction)
         testing_ctx: Optional testing context for dry_run mode
         media_buy_brand: Optional BrandReference from the media buy request.
-            Forwarded to ``_sync_creatives_impl`` so adapters can read
-            ``brand.domain`` from stored creative data.
+            Forwarded to ``_sync_creatives_internal_impl`` (the orchestration-only
+            entry point — it is not on the buyer-facing sync contract) so adapters
+            can read ``brand.domain`` from stored creative data.
 
     Returns:
         Tuple of (updated_packages, uploaded_ids_by_product):
@@ -556,7 +557,7 @@ def process_and_upload_package_creatives(
 
     # Lazy import to avoid circular dependency
     from src.core.exceptions import AdCPAdapterError, AdCPCreativeRejectedError, AdCPError
-    from src.core.tools.creatives import _sync_creatives_impl
+    from src.core.tools.creatives import _sync_creatives_internal_impl
 
     logger = logging.getLogger(__name__)
     uploaded_by_product: dict[str, list[str]] = {}
@@ -573,9 +574,11 @@ def process_and_upload_package_creatives(
 
         try:
             # Step 1: Upload creatives to database via sync_creatives.
-            # Pass BrandReference typed model directly — _sync_creatives_impl now
+            # Pass BrandReference typed model directly — the internal sync entry point
             # accepts BrandReference | None and serializes once at the DB boundary.
-            sync_response = _sync_creatives_impl(
+            # media_buy_brand is orchestration-only, so it lives on
+            # _sync_creatives_internal_impl and not on the buyer-facing _sync_creatives_impl.
+            sync_response = _sync_creatives_internal_impl(
                 creatives=pkg.creatives,
                 # AdCP 2.5: Full upsert semantics (no patch parameter)
                 assignments=None,  # Assign separately after creation

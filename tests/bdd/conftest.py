@@ -1011,11 +1011,6 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
                 "_SyntheticError, spec expects structured AdCPError with suggestion "
                 "(preview-failure path, _processing.py:712-737)"
             ),
-            "T-UC-006-ext-i": (
-                "SPEC-PRODUCTION GAP: production returns plain-string errors[] via "
-                "_SyntheticError, spec expects structured AdCPError with suggestion "
-                "(GEMINI_API_KEY not configured path)"
-            ),
             # Creative unchanged: production returns action "updated" not "unchanged"
             "T-UC-006-main-unchanged": (
                 "SPEC-PRODUCTION GAP: production returns action 'updated', "
@@ -3372,7 +3367,7 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
 
     elif uc == "UC-006":
         marker_names = {m.name for m in request.node.iter_markers()}
-        if marker_names & {"account", "creative-invariant", "BR-RULE-034", "webhook-ssrf"}:
+        if marker_names & {"account", "creative-invariant", "BR-RULE-034", "webhook-ssrf", "generative-no-seller-key"}:
             # CreativeSyncEnv exercises the full sync_creatives transport wrappers.
             # @account scenarios drive account resolution (enrich_identity_with_account());
             # @creative-invariant scenarios (#1399 R3-F2) drive the success-variant
@@ -3381,6 +3376,10 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
             # creative lookup) — dormant until the cross-principal existence-gate
             # fix (PR #1430 review) made the surface safe to grade.
             # @webhook-ssrf scenarios grade registration SSRF on push_notification_config.url.
+            # @generative-no-seller-key grades that a generative build is delegated to
+            # the creative agent with no seller-side generation key in the contract
+            # (graduated in PR #1482 — was the CREATIVE_GEMINI_KEY_MISSING xfail, a
+            # code absent from enums/error-code.json @ 3.1.1 for a deleted gate).
             from tests.harness.creative_sync import CreativeSyncEnv
 
             with _db_scope_for(request, e2e_config), CreativeSyncEnv(e2e_config=e2e_config) as env:

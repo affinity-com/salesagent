@@ -23,6 +23,36 @@ def _make_creative_uow():
     return _make_creative_uow_shared(include_assignments=True)
 
 
+# The static-creative sync path really does call registry.preview_creative (and awaits
+# it), because _find_format resolves the legacy-shaped format used by these fixtures.
+# Pinned once here rather than pasted into each test that needs it.
+_STATIC_PREVIEW_RESULT = {"previews": [{"renders": [{"preview_url": "https://example.com/preview.png"}]}]}
+
+
+def _configure_registry(mock_registry_getter, *, list_all_formats, get_format=None, with_preview=False):
+    """Wire the creative-agent registry mock these tests share.
+
+    Args:
+        mock_registry_getter: The patched ``get_creative_agent_registry``.
+        list_all_formats: Async callable returning the format list.
+        get_format: Async callable for per-format lookup; omitted when a test
+            exercises a path that must not reach it.
+        with_preview: Configure ``preview_creative`` as an ``AsyncMock`` returning
+            ``_STATIC_PREVIEW_RESULT`` — required for tests whose creative reaches
+            the static preview path.
+
+    Returns the configured registry mock.
+    """
+    mock_registry = Mock()
+    mock_registry.list_all_formats = list_all_formats
+    if get_format is not None:
+        mock_registry.get_format = get_format
+    if with_preview:
+        mock_registry.preview_creative = AsyncMock(return_value=_STATIC_PREVIEW_RESULT)
+    mock_registry_getter.return_value = mock_registry
+    return mock_registry
+
+
 class TestSyncCreativesFormatValidation:
     """Test format validation in sync_creatives operation."""
 
@@ -84,15 +114,12 @@ class TestSyncCreativesFormatValidation:
             async def mock_get_format(agent_url, format_id):
                 return mock_format_spec
 
-            mock_registry = Mock()
-            mock_registry.list_all_formats = mock_list_all_formats
-            mock_registry.get_format = mock_get_format
-            # preview_creative must be AsyncMock: _find_format now correctly finds
-            # the legacy-shaped format, so the static path calls preview_creative.
-            mock_registry.preview_creative = AsyncMock(
-                return_value={"previews": [{"renders": [{"preview_url": "https://example.com/preview.png"}]}]}
+            _configure_registry(
+                mock_registry_getter,
+                list_all_formats=mock_list_all_formats,
+                get_format=mock_get_format,
+                with_preview=True,
             )
-            mock_registry_getter.return_value = mock_registry
 
             # Execute
             response = _sync_creatives_impl(creatives=[valid_creative_dict], identity=identity)
@@ -122,10 +149,9 @@ class TestSyncCreativesFormatValidation:
             async def mock_get_format(agent_url, format_id):
                 return None  # Format not found
 
-            mock_registry = Mock()
-            mock_registry.list_all_formats = mock_list_all_formats
-            mock_registry.get_format = mock_get_format
-            mock_registry_getter.return_value = mock_registry
+            _configure_registry(
+                mock_registry_getter, list_all_formats=mock_list_all_formats, get_format=mock_get_format
+            )
 
             # Execute
             response = _sync_creatives_impl(creatives=[valid_creative_dict], identity=identity)
@@ -170,10 +196,9 @@ class TestSyncCreativesFormatValidation:
             async def mock_get_format(agent_url, format_id):
                 raise AdCPServiceUnavailableError("Connection failed: agent unreachable — Connection refused")
 
-            mock_registry = Mock()
-            mock_registry.list_all_formats = mock_list_all_formats
-            mock_registry.get_format = mock_get_format
-            mock_registry_getter.return_value = mock_registry
+            _configure_registry(
+                mock_registry_getter, list_all_formats=mock_list_all_formats, get_format=mock_get_format
+            )
 
             with pytest.raises(AdCPServiceUnavailableError, match="Connection refused") as exc_info:
                 _sync_creatives_impl(creatives=[valid_creative_dict], identity=identity)
@@ -206,10 +231,9 @@ class TestSyncCreativesFormatValidation:
             async def mock_get_format(agent_url, format_id):
                 return mock_format_spec
 
-            mock_registry = Mock()
-            mock_registry.list_all_formats = mock_list_all_formats
-            mock_registry.get_format = mock_get_format
-            mock_registry_getter.return_value = mock_registry
+            _configure_registry(
+                mock_registry_getter, list_all_formats=mock_list_all_formats, get_format=mock_get_format
+            )
 
             # Execute
             response = _sync_creatives_impl(creatives=[creative_dict], identity=identity)
@@ -253,15 +277,12 @@ class TestSyncCreativesFormatValidation:
                     return mock_format_spec
                 return None
 
-            mock_registry = Mock()
-            mock_registry.list_all_formats = mock_list_all_formats
-            mock_registry.get_format = mock_get_format
-            # preview_creative must be AsyncMock: _find_format now correctly finds
-            # the legacy-shaped format, so the static path calls preview_creative.
-            mock_registry.preview_creative = AsyncMock(
-                return_value={"previews": [{"renders": [{"preview_url": "https://example.com/preview.png"}]}]}
+            _configure_registry(
+                mock_registry_getter,
+                list_all_formats=mock_list_all_formats,
+                get_format=mock_get_format,
+                with_preview=True,
             )
-            mock_registry_getter.return_value = mock_registry
 
             # Execute
             response = _sync_creatives_impl(creatives=creatives, identity=identity)
@@ -309,15 +330,12 @@ class TestSyncCreativesFormatValidation:
             async def mock_get_format(agent_url, format_id):
                 return mock_format_spec
 
-            mock_registry = Mock()
-            mock_registry.list_all_formats = mock_list_all_formats
-            mock_registry.get_format = mock_get_format
-            # preview_creative must be AsyncMock: now that _find_format correctly
-            # finds the legacy-shaped format, the static path calls preview_creative.
-            mock_registry.preview_creative = AsyncMock(
-                return_value={"previews": [{"renders": [{"preview_url": "https://example.com/preview.png"}]}]}
+            _configure_registry(
+                mock_registry_getter,
+                list_all_formats=mock_list_all_formats,
+                get_format=mock_get_format,
+                with_preview=True,
             )
-            mock_registry_getter.return_value = mock_registry
 
             # Execute
             response = _sync_creatives_impl(creatives=[creative1, creative2], identity=identity)
@@ -351,9 +369,7 @@ class TestSyncCreativesFormatValidation:
             async def mock_list_all_formats(tenant_id=None):
                 return []
 
-            mock_registry = Mock()
-            mock_registry.list_all_formats = mock_list_all_formats
-            mock_registry_getter.return_value = mock_registry
+            _configure_registry(mock_registry_getter, list_all_formats=mock_list_all_formats)
 
             # Execute
             response = _sync_creatives_impl(creatives=[creative_dict], identity=identity)
@@ -404,10 +420,9 @@ class TestSyncCreativesFormatValidation:
                 if "offline.example.com" in agent_url:
                     raise AdCPServiceUnavailableError("Connection failed: Connection refused")
 
-            mock_registry = Mock()
-            mock_registry.list_all_formats = mock_list_all_formats
-            mock_registry.get_format = mock_get_format
-            mock_registry_getter.return_value = mock_registry
+            _configure_registry(
+                mock_registry_getter, list_all_formats=mock_list_all_formats, get_format=mock_get_format
+            )
 
             # Unknown format: per-item terminal failure — the creative is wrong.
             response1 = _sync_creatives_impl(creatives=[creative_unknown_format], identity=identity)

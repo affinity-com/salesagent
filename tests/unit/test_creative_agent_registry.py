@@ -370,21 +370,26 @@ class TestKnownAssetTypes:
             "_KNOWN_ASSET_TYPES must be a frozenset so it cannot be mutated at runtime"
         )
 
-    def test_known_asset_types_derived_from_enum(self):
-        """_KNOWN_ASSET_TYPES must include image, video, and text from the AssetContentType enum.
+    def test_known_asset_types_covers_every_enum_member(self):
+        """No AssetContentType member may be missing from _KNOWN_ASSET_TYPES.
 
-        The pre-5.7 annotation-walk over Format.assets collected nothing under the
-        Annotated[…, Discriminator] shape introduced in adcp 5.7.  The fix derives
-        from the enum directly so the set is never silently empty.
+        A member left out would make the tolerant-ingestion path treat formats
+        using it as "unknown additive" and silently DROP them, even though the
+        pinned SDK models them.
+
+        The enum is iterated, never listed: an annotation-walk over Format.assets
+        collects nothing under the Annotated[…, Discriminator] shape the SDK uses,
+        so production derives from AssetContentType — and this test derives from it
+        too, so neither needs an edit when AdCP adds an asset type. It still catches
+        the regression that matters: replacing the derivation with a partial
+        hand-written list.
         """
-        assert "image" in _KNOWN_ASSET_TYPES, (
-            "'image' must be in _KNOWN_ASSET_TYPES — derivation from AssetContentType enum is broken"
-        )
-        assert "video" in _KNOWN_ASSET_TYPES, (
-            "'video' must be in _KNOWN_ASSET_TYPES — derivation from AssetContentType enum is broken"
-        )
-        assert "text" in _KNOWN_ASSET_TYPES, (
-            "'text' must be in _KNOWN_ASSET_TYPES — derivation from AssetContentType enum is broken"
+        from adcp.types import AssetContentType
+
+        missing = {member.value for member in AssetContentType} - set(_KNOWN_ASSET_TYPES)
+        assert not missing, (
+            f"_KNOWN_ASSET_TYPES is missing AssetContentType member(s) {sorted(missing)} — "
+            f"formats using them would be dropped as unknown-additive by _validate_formats_tolerant"
         )
 
     def test_zip_in_known_asset_types(self):
@@ -411,33 +416,27 @@ class TestKnownAssetTypes:
             "not covered by the AssetContentType enum"
         )
 
-    def test_known_asset_types_covers_full_sdk_union(self):
-        """_KNOWN_ASSET_TYPES must match all 17 asset_type Literals the SDK's
-        Format.assets discriminated union actually accepts (15 from
-        AssetContentType + zip + card), not just the response enum.
+    def test_zip_and_card_union_is_still_necessary(self):
+        """The explicit zip/card union must still be earning its place.
+
+        Production unions ``{"zip", "card"}`` on top of the enum precisely because
+        AssetContentType omits them. If a pin bump adds either to the enum, that
+        union becomes dead code — fail here so it is removed rather than lingering
+        as a stale special case.
+
+        (Replaces a hardcoded 17-name snapshot of the whole set: the snapshot
+        duplicated the enum listing in the creative schema-compliance obligations
+        test, needed an edit on every pin bump, and its stated claim about the
+        Format.assets union was wrong — the union discriminates
+        ``repeatable_group`` on ``item_type``, not ``asset_type``.)
         """
-        expected = {
-            "image",
-            "video",
-            "audio",
-            "text",
-            "markdown",
-            "html",
-            "css",
-            "javascript",
-            "vast",
-            "daast",
-            "url",
-            "webhook",
-            "brief",
-            "catalog",
-            "published_post",
-            "zip",
-            "card",
-        }
-        assert _KNOWN_ASSET_TYPES == expected, (
-            f"_KNOWN_ASSET_TYPES drifted from the SDK's full asset_type union: "
-            f"missing={expected - _KNOWN_ASSET_TYPES}, extra={_KNOWN_ASSET_TYPES - expected}"
+        from adcp.types import AssetContentType
+
+        enum_values = {member.value for member in AssetContentType}
+        overlap = enum_values & {"zip", "card"}
+        assert not overlap, (
+            f"AssetContentType now includes {sorted(overlap)} — drop it from the explicit "
+            f"union in _known_asset_types(), which exists only to cover the enum's omissions"
         )
 
 

@@ -1583,7 +1583,6 @@ def then_uc006_result_should_be(ctx: dict, outcome: str) -> None:
         "CREATIVE_FORMAT_UNKNOWN",
         "CREATIVE_AGENT_UNREACHABLE",
         "CREATIVE_NAME_EMPTY",
-        "CREATIVE_GEMINI_KEY_MISSING",
     ):
         _assert_per_creative_failure(ctx, outcome)
     elif outcome == "assignment updated":
@@ -2111,8 +2110,8 @@ def _promote_creative_errors_to_ctx(ctx: dict, errs: list) -> None:
     """Promote SyncCreativeResult.errors[] to ctx["error"] for downstream Then steps.
 
     Production stores per-creative failures as plain strings in errors[]. Some
-    error strings contain structured info (e.g. "GEMINI_API_KEY not configured")
-    that downstream steps can parse. We wrap the first error as a synthetic object
+    error strings contain structured info (e.g. "no previews returned") that
+    downstream steps can parse. We wrap the first error as a synthetic object
     with error_code/message/suggestion derived from the string content.
     """
     if not errs:
@@ -2142,8 +2141,6 @@ def _promote_creative_errors_to_ctx(ctx: dict, errs: list) -> None:
 def _infer_error_code_from_message(msg: str) -> str:
     """Map production error strings to spec error codes."""
     lower = msg.lower()
-    if "gemini_api_key" in lower and "not configured" in lower:
-        return "CREATIVE_GEMINI_KEY_MISSING"
     if "preview" in lower and ("failed" in lower or "no preview" in lower):
         return "CREATIVE_PREVIEW_FAILED"
     if "format" in lower and "required" in lower:
@@ -2156,8 +2153,6 @@ def _infer_error_code_from_message(msg: str) -> str:
 def _infer_suggestion_from_message(msg: str) -> str | None:
     """Extract or generate a suggestion from a production error message."""
     lower = msg.lower()
-    if "gemini_api_key" in lower:
-        return "Ask the seller to configure GEMINI_API_KEY in their agent settings"
     if "preview" in lower:
         return "Provide a media_url for the creative"
     return None
@@ -4747,10 +4742,12 @@ def given_no_prompt_assets_or_inputs(ctx: dict) -> None:
 
 @given("message asset but no GEMINI_API_KEY")
 def given_message_asset_no_gemini_key(ctx: dict) -> None:
-    """Add a message asset but remove the GEMINI_API_KEY from config.
+    """Add a message asset and clear GEMINI_API_KEY from config.
 
-    Production checks gemini_api_key early in the generative path and
-    raises ValueError when missing (BR-RULE-036, INV formerly-2).
+    Generation is delegated to the creative agent over AdCP (build_creative), so
+    the absence of a seller-side key must NOT change the outcome — the build still
+    proceeds with the message prompt. Reconciled in PR #1482 when the seller-side
+    gate was removed; the previous form of this step expected a ValueError.
     """
     creatives = ctx.get("creatives", [])
     assert creatives, "No creative in context to add message asset to"
@@ -4829,10 +4826,11 @@ def given_new_creative_generative_no_prompt_with_name(ctx: dict) -> None:
 
 @given("a creative with a generative format but GEMINI_API_KEY not configured")
 def given_creative_generative_no_gemini(ctx: dict) -> None:
-    """Set up a generative creative but with GEMINI_API_KEY removed (boundary).
+    """Set up a generative creative with GEMINI_API_KEY removed (boundary).
 
-    Production raises ValueError when gemini_api_key is not configured
-    for a generative format.
+    The seller-side key is not part of the generative contract — build_creative
+    delegates generation to the creative agent — so this boundary must behave
+    exactly like the key-present case (PR #1482).
     """
     env = ctx["env"]
     _ensure_tenant_principal(ctx, env)

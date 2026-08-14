@@ -23,7 +23,7 @@ from sqlalchemy import select
 
 from src.core.database.database_session import get_db_session
 from src.core.database.models import Creative as DBCreative
-from src.core.exceptions import AdCPAuthenticationError, AdCPNotFoundError
+from src.core.exceptions import AdCPAuthenticationError, AdCPConfigurationError, AdCPNotFoundError
 from tests.factories.creative_asset import build_assets, image_spec, text_spec
 from tests.harness import CreativeSyncEnv, Transport, assert_envelope, make_identity
 from tests.helpers.creative_test_helpers import assert_stored_creative_assets, creative_payload
@@ -677,6 +677,123 @@ class TestGenerativeBuildUserAssetPriority:
             assert db_creative.data.get("url") == "https://user.example.com/image.png"
         # User-provided headline preserved with its original content (not AI output)
         assert_stored_creative_assets("c_gen_08", user_headline, tenant_id="test_tenant")
+
+
+def _assert_creative_failed_with_recovery(result, transport, *, creative_id: str, recovery: str) -> None:
+    """Grade a per-creative advisory failure and its buyer-facing recovery hint.
+
+    A creative-agent failure is advisory (the envelope stays successful), so the
+    authority is ``SyncCreativeResult.errors[].recovery`` — not an error envelope.
+    Where the transport observes real wire bytes (``wire_response``: REST body,
+    MCP ``structured_content``), the serialized value is graded too: a
+    serialization drop of ``recovery`` would sail past the typed check alone.
+    """
+    assert result.is_success, f"per-creative failure must be advisory, not an envelope error: {result.error}"
+    assert_envelope(result, transport)
+
+    typed = result.payload.creatives[0]
+    assert typed.creative_id == creative_id
+    assert typed.action == "failed"
+    assert typed.errors, "a failed creative must carry an advisory error"
+    assert typed.errors[0].recovery == recovery
+
+    if result.wire_response is not None:
+        wire_results = [c for c in result.wire_response["creatives"] if c["creative_id"] == creative_id]
+        assert wire_results, f"{creative_id} missing from the serialized response"
+        assert wire_results[0]["errors"][0]["recovery"] == recovery
+
+
+def _fail_build_with_typed_auth_error(env) -> None:
+    """Raise the internal typed auth error the real registry produces.
+
+    ``AdCPAuthenticationError`` (``AUTH_REQUIRED``) is what ``build_creative``
+    raises after mapping the SDK's ``ADCPAuthenticationError``. Retrying the same
+    request unchanged cannot fix it — the agent credentials must change — so it
+    must not be reported as the blanket ``transient``.
+    """
+    env.set_build_creative_error(AdCPAuthenticationError("Authentication failed: invalid agent token"))
+
+
+def _fail_build_with_sdk_auth_error(env) -> None:
+    """Raise the SDK's own exception through the production error mapper.
+
+    Routes through ``raise_mapped_adcp_error`` exactly as the real
+    ``build_creative`` does, so the case pins BOTH halves of the two-layer fix:
+    the registry's SDK-exception translation AND the sync impl carrying the
+    resulting classification onto the result.
+    """
+    from adcp.exceptions import ADCPAuthenticationError as SDKAuthError
+
+    env.set_build_creative_sdk_error(SDKAuthError("401 rejected agent credentials"))
+
+
+def _fail_build_with_configuration_error(env) -> None:
+    """Raise a server-side misconfiguration — terminal, the buyer must not retry."""
+    env.set_build_creative_error(AdCPConfigurationError("Creative agent is not configured for this tenant"))
+
+
+def _fail_build_with_unknown_error(env) -> None:
+    """Raise an untyped failure (agent unreachable) — the transient fallback."""
+    env.set_build_creative_error(ConnectionError("creative agent unreachable"))
+
+
+# (case id, failure configurator, the recovery the buyer must be told)
+_BUILD_FAILURE_RECOVERY_CASES = [
+    ("typed_auth", _fail_build_with_typed_auth_error, "correctable"),
+    ("sdk_auth", _fail_build_with_sdk_auth_error, "correctable"),
+    ("configuration", _fail_build_with_configuration_error, "terminal"),
+    ("unknown", _fail_build_with_unknown_error, "transient"),
+]
+
+
+@pytest.mark.requires_db
+class TestGenerativeBuildFailureRecovery:
+    """A failed generative build reports the creative agent's recovery classification.
+
+    The buyer reads ``recovery`` to decide retry-vs-fix. Flattening every
+    creative-agent failure to ``transient`` loops the buyer on an unfixable error
+    (bad credentials, server misconfiguration), so the classification the typed
+    error carries must survive from ``registry.build_creative`` through
+    ``_failed_from_agent_error`` onto ``SyncCreativeResult.errors[].recovery``.
+
+    Graded per transport because ``recovery`` is wire-visible: a serialization drop
+    on one transport is exactly the failure these tests exist to catch.
+    """
+
+    @pytest.mark.parametrize("transport", ALL_TRANSPORTS, ids=lambda t: t.value)
+    @pytest.mark.parametrize(
+        "case,configure_failure,expected_recovery",
+        _BUILD_FAILURE_RECOVERY_CASES,
+        ids=[case for case, _, _ in _BUILD_FAILURE_RECOVERY_CASES],
+    )
+    def test_failed_build_reports_its_own_recovery(
+        self, integration_db, transport, case, configure_failure, expected_recovery
+    ):
+        """Each rung of the ladder reaches the buyer with its own recovery hint.
+
+        See the ``_fail_build_with_*`` configurators for why each case carries the
+        recovery it does.
+        """
+        creative_id = f"c_gen_fail_{case}"
+
+        with CreativeSyncEnv() as env:
+            env.setup_default_data()
+            fmt = env.setup_generative_build()
+            configure_failure(env)
+
+            result = env.call_via(
+                transport,
+                creatives=[
+                    {
+                        "creative_id": creative_id,
+                        "name": "Generative Build Failure",
+                        "format_id": fmt,
+                        "assets": build_assets(text_spec("message", content="Build me a banner")),
+                    }
+                ],
+            )
+
+        _assert_creative_failed_with_recovery(result, transport, creative_id=creative_id, recovery=expected_recovery)
 
 
 # ---------------------------------------------------------------------------

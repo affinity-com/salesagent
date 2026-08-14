@@ -46,9 +46,17 @@ def _sync_creatives_impl(
     push_notification_config: PushNotificationConfig | dict | None = None,
     context: ContextObject | dict | None = None,
     identity: ResolvedIdentity | None = None,
-    media_buy_brand: BrandReference | None = None,
 ) -> SyncCreativesResponse:
     """Sync creative assets to centralized library (AdCP v2.5 spec compliant endpoint).
+
+    Buyer-facing shared business logic behind the MCP/A2A/REST ``sync_creatives``
+    wrappers. Its signature is exactly the ``SyncCreativesRequest`` contract — every
+    parameter here is one a buyer can set on the wire, so each wrapper must forward
+    all of them (enforced by ``test_architecture_boundary_completeness.py``).
+
+    Internal orchestration that needs to pass inputs the AdCP request schema does
+    not define calls :func:`_sync_creatives_internal_impl` instead; see its
+    docstring.
 
     Primary creative management endpoint that handles:
     - Bulk creative upload/update with upsert semantics
@@ -69,6 +77,48 @@ def _sync_creatives_impl(
         push_notification_config: Push notification config for status updates (AdCP spec, optional)
         context: Application level context per adcp spec
         identity: ResolvedIdentity with principal/tenant info (transport-agnostic)
+
+    Returns:
+        SyncCreativesResponse with synced creatives and assignments
+    """
+    # Forward every parameter, leaving media_buy_brand at its default. ``locals()``
+    # here is exactly this function's parameters — this MUST remain the first
+    # statement in the body, and no local may be introduced above it. Spelling the
+    # nine names out instead would make this a third copy of the forwarding block
+    # the two transport wrappers already carry (DRY: pylint R0801 flags it), and a
+    # copy that silently drifts when a buyer-facing parameter is added.
+    return _sync_creatives_internal_impl(**locals())
+
+
+def _sync_creatives_internal_impl(
+    creatives: Sequence[CreativeAsset | BaseModel | dict[str, Any]],
+    assignments: dict | None = None,
+    creative_ids: list[str] | None = None,
+    delete_missing: bool = False,
+    dry_run: bool = False,
+    validation_mode: str = "strict",
+    push_notification_config: PushNotificationConfig | dict | None = None,
+    context: ContextObject | dict | None = None,
+    identity: ResolvedIdentity | None = None,
+    media_buy_brand: BrandReference | None = None,
+) -> SyncCreativesResponse:
+    """Internal sync entry point: the buyer-facing contract plus orchestration-only inputs.
+
+    Everything :func:`_sync_creatives_impl` documents applies here — this holds the
+    actual implementation and that function is a thin buyer-facing delegate. The
+    split exists so orchestration-only inputs stay OFF the buyer-facing signature:
+    a wire wrapper's signature is the buyer contract (FastMCP derives the advertised
+    MCP tool schema from it), and advertising an input the pinned AdCP request
+    schema does not define would be a spec violation, not a missing forward.
+
+    Only in-process callers use this entry point.
+
+    Args:
+        media_buy_brand: Typed brand from the ``create_media_buy`` request, threaded
+            in by ``process_and_upload_package_creatives`` so adapters can read
+            ``brand.domain`` from the stored creative data. ``SyncCreativesRequest``
+            has no ``brand`` field in the pinned spec and no transport caller sets it.
+        (all other args: see :func:`_sync_creatives_impl`)
 
     Returns:
         SyncCreativesResponse with synced creatives and assignments

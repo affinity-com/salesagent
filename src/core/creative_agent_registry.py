@@ -23,6 +23,7 @@ import copy
 import logging
 import os
 import uuid as _uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -55,19 +56,21 @@ from src.core.format_cache import load_reference_formats
 from src.core.schema_helpers import to_brand_reference
 from src.core.schemas import Format, FormatId, canonical_agent_url
 
+logger = logging.getLogger(__name__)
+
 
 def _known_asset_types() -> frozenset[str]:
     """Asset-type Literals the adcp SDK models.
 
-    Derived from the AssetContentType enum (adcp 5.7+) so the tolerant
-    ingestion stays correct across adcp version bumps — what counts as
-    "additive" is always "not in the enum the pinned library knows about".
+    Derived from the AssetContentType enum so the tolerant ingestion stays
+    correct across adcp version bumps — what counts as "additive" is always
+    "not in the enum the pinned library knows about". Deriving (rather than
+    hardcoding a list) is why this needs no edit when the pin moves; an
+    annotation-walk over ``Format.assets`` is not an option because the
+    ``Annotated[…, Discriminator]`` shape the SDK uses collects nothing.
 
-    The pre-5.7 annotation-walk over Format.assets collected nothing under
-    the Annotated[…, Discriminator] shape introduced in 5.7, so we derive
-    from the enum directly instead.
-
-    AssetContentType (14 members) is the response-level content-type enum
+    AssetContentType (15 members under the pinned adcp 6.6.0 / AdCP 3.1.1 —
+    see docs/adcp-spec-version.md) is the response-level content-type enum
     and doesn't cover every asset_type Literal the SDK's asset-shape models
     use as a discriminator: "zip" (individual zip-bundle asset) and "card"
     (RepeatableAssetGroup member asset) are modeled elsewhere in the schema
@@ -409,9 +412,6 @@ class CreativeAgentRegistry:
         Returns:
             List of Format objects from the agent
         """
-        import logging
-
-        logger = logging.getLogger(__name__)
 
         try:
             # Convert string asset_types to AssetType enums
@@ -525,11 +525,9 @@ class CreativeAgentRegistry:
         endpoint directly via HTTP and parses the JSON response.
         """
         import json
-        import logging
 
         import httpx
 
-        logger = logging.getLogger(__name__)
         agent_url = str(agent.agent_url).rstrip("/")
         # MCP endpoint may be at /mcp (as per adcp SDK fallback behavior)
         mcp_url = f"{agent_url}/mcp" if not agent_url.endswith("/mcp") else agent_url
@@ -771,10 +769,6 @@ class CreativeAgentRegistry:
         When all agents succeed, errors is empty.
         When some agents fail, returns partial results + errors for failed agents.
         """
-        import logging
-
-        logger = logging.getLogger(__name__)
-
         # In testing mode (ADCP_TESTING=true), serve the checked-in reference formats
         # to avoid external HTTP calls (and to match the e2e server by construction).
         if os.environ.get("ADCP_TESTING", "").lower() == "true":
@@ -900,7 +894,7 @@ class CreativeAgentRegistry:
         return None
 
     async def preview_creative(
-        self, agent_url: str, format_id: str, creative_manifest: dict[str, Any]
+        self, agent_url: str, format_id: str, creative_manifest: Mapping[str, Any]
     ) -> dict[str, Any]:
         """Generate preview renderings for a creative using the creative agent.
 
@@ -972,7 +966,7 @@ class CreativeAgentRegistry:
         promoted_offerings: dict[str, Any] | None = None,
         context_id: str | None = None,
         brand: dict[str, Any] | BrandReference | str | None = None,
-        creative_manifest: dict[str, Any] | None = None,
+        creative_manifest: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build a creative using AI generation via the creative agent.
 
@@ -1021,8 +1015,8 @@ class CreativeAgentRegistry:
         # field validators are enforced rather than silently skipped. (The
         # ≥16-char idempotency_key constraint below is on BuildCreativeRequest, not
         # on CreativeManifest — model_validate() here guards the manifest's own
-        # fields, e.g. asset shape.) CreativeManifest(…) trips mypy under adcp 5.7
-        # (alias hides kwargs) — use .model_validate(dict) instead.
+        # fields, e.g. asset shape.) A direct CreativeManifest(…) construction trips
+        # mypy (the field alias hides the kwargs) — use .model_validate(dict) instead.
         manifest: CreativeManifest | None = (
             CreativeManifest.model_validate(creative_manifest) if creative_manifest else None
         )
@@ -1046,10 +1040,6 @@ class CreativeAgentRegistry:
         transient_agent = CreativeAgent(agent_url=str(agent_url), name=agent_name)
         client = self._build_adcp_client([transient_agent])
 
-        import logging
-
-        logger = logging.getLogger(__name__)
-
         try:
             result = await client.agent(agent_name).build_creative(request)
         except ADCPError as e:
@@ -1059,7 +1049,9 @@ class CreativeAgentRegistry:
             # hierarchy into the internal typed AdCPError taxonomy so recovery
             # (terminal for auth, transient for timeout/connection) survives to
             # the caller instead of being flattened by a blanket `except Exception`.
-            raise_mapped_adcp_error(e, agent_label=agent_name, logger=logger)
+            # Same label form as the _fetch_formats_from_agent sibling (:518) so the
+            # shared ERROR log reads consistently across both creative-agent paths.
+            raise_mapped_adcp_error(e, agent_label=f"creative agent {agent_name}", logger=logger)
 
         # Return the result as a plain dict for downstream processing
         if hasattr(result, "model_dump"):

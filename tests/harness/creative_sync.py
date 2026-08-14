@@ -48,11 +48,15 @@ Available mocks via env.mock:
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 from src.core.schemas import SyncCreativesResponse
 from tests.harness._base import IntegrationEnv
+
+# Sink for the production error mapper's log calls in set_build_creative_sdk_error.
+_harness_logger = logging.getLogger(__name__)
 
 
 class CreativeSyncEnv(IntegrationEnv):
@@ -156,6 +160,33 @@ class CreativeSyncEnv(IntegrationEnv):
 
         return {"agent_url": agent, "id": format_id}
 
+    def set_build_creative_error(self, error: BaseException) -> None:
+        """Make ``build_creative`` raise *error* on the generative path.
+
+        Use after :meth:`setup_generative_build`. The real ``CreativeAgentRegistry``
+        raises the *internal* typed ``AdCPError`` taxonomy from ``build_creative``
+        (it translates the SDK's ``ADCPError`` via ``raise_mapped_adcp_error``), so
+        pass an internal ``AdCPError`` to exercise recovery classification, or a
+        bare ``Exception`` for the unknown-failure fallback.
+        """
+        self.mock["registry"].return_value.build_creative = AsyncMock(side_effect=error)
+
+    def set_build_creative_sdk_error(self, sdk_error: Any) -> None:
+        """Make ``build_creative`` fail exactly as the real registry does for an SDK error.
+
+        Routes *sdk_error* (an ``adcp.exceptions.ADCPError``) through the production
+        ``raise_mapped_adcp_error`` — the same call the real ``build_creative``
+        makes in its ``except ADCPError`` arm — so a test pins the whole
+        SDK-error → internal-typed-error → wire-recovery chain rather than only the
+        half after the mapping.
+        """
+        from src.core.helpers.adapter_helpers import raise_mapped_adcp_error
+
+        def _raise_mapped(*_args: Any, **_kwargs: Any) -> None:
+            raise_mapped_adcp_error(sdk_error, agent_label="creative agent test", logger=_harness_logger)
+
+        self.mock["registry"].return_value.build_creative = AsyncMock(side_effect=_raise_mapped)
+
     def set_run_async_result(self, formats: list[Any]) -> None:
         """Configure run_async_in_sync_context to return *formats*.
 
@@ -188,6 +219,23 @@ class CreativeSyncEnv(IntegrationEnv):
             kwargs["identity"] = enrich_identity_with_account(kwargs["identity"], account)
 
         return _sync_creatives_impl(**kwargs)
+
+    def call_internal_impl(self, **kwargs: Any) -> SyncCreativesResponse:
+        """Call _sync_creatives_internal_impl with real DB.
+
+        The internal orchestration entry point, used by
+        ``process_and_upload_package_creatives``. It takes everything
+        ``call_impl`` takes plus orchestration-only inputs that the buyer-facing
+        ``_sync_creatives_impl`` deliberately does not accept (currently
+        ``media_buy_brand``) — those are not on the wire contract, so there is no
+        transport equivalent to compare against.
+        """
+        from src.core.tools.creatives._sync import _sync_creatives_internal_impl
+
+        self._commit_factory_data()
+        kwargs.setdefault("identity", self.identity)
+        kwargs.setdefault("creatives", [])
+        return _sync_creatives_internal_impl(**kwargs)
 
     def call_a2a(self, **kwargs: Any) -> SyncCreativesResponse:
         """Call sync_creatives_raw (A2A wrapper) with real DB.

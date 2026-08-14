@@ -19,17 +19,19 @@ logger = logging.getLogger(__name__)
 
 
 def _extract_attr_from_asset_value(asset: Any, *attr_names: str) -> str | None:
-    """Extract a named attribute from an SDK 5.7 asset value.
+    """Extract a named attribute from an SDK asset value, whatever shape it takes.
 
-    SDK 5.7 wraps asset slot values in an ``Assets`` RootModel containing a
-    ``list[AssetVariant]`` where each ``AssetVariant`` is itself a RootModel
-    proxying the concrete typed asset.
+    The adcp SDK (since 5.7; still the shape under the pinned 6.6.0 / AdCP 3.1.1
+    — see docs/adcp-spec-version.md) wraps asset slot values in an ``Assets``
+    RootModel containing a ``list[AssetVariant]`` where each ``AssetVariant`` is
+    itself a RootModel proxying the concrete typed asset.
 
     This helper walks three paths in priority order:
     1. **dict** -- legacy/test code that passes plain dicts.
     2. **RootModel** -- unwrap ``.root`` to get the variant list, then check
        the first variant's inner ``.root`` object and the variant itself.
-    3. **Plain object** -- pre-5.7 single-asset models.
+    3. **Plain object** -- unwrapped single-asset models (older SDK shape,
+       and anything test code hands in directly).
 
     Multiple *attr_names* are tried left-to-right (e.g. ``"content", "text"``);
     the first truthy value wins.
@@ -73,7 +75,7 @@ def _extract_url_from_asset_value(asset: Any) -> str | None:
 
 
 def _extract_text_from_asset_value(asset: Any) -> str | None:
-    """Extract text content from an SDK 5.7 asset value.
+    """Extract text content from an SDK asset value.
 
     Tries ``content`` first, then ``text`` (TextAsset uses ``content``,
     some legacy payloads use ``text``).

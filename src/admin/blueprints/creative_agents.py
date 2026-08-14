@@ -6,10 +6,10 @@ from flask import Blueprint, flash, jsonify, redirect, render_template, request,
 from sqlalchemy import select
 
 from src.admin.utils import require_tenant_access
+from src.admin.utils.agent_url_guard import reject_if_unsafe_agent_url
 from src.admin.utils.audit_decorator import log_admin_action
 from src.core.database.database_session import get_db_session
 from src.core.database.models import CreativeAgent, Tenant
-from src.core.security.url_validator import check_url_ssrf
 
 logger = logging.getLogger(__name__)
 
@@ -103,11 +103,15 @@ def add_creative_agent(tenant_id):
                 flash("Agent URL is required", "error")
                 return redirect(url_for("creative_agents.add_creative_agent", tenant_id=tenant_id))
 
-            is_safe, ssrf_error = check_url_ssrf(agent_url)
-            if not is_safe:
-                logger.warning("[SECURITY] Creative agent add rejected unsafe URL %r: %s", agent_url, ssrf_error)
-                flash(f"Agent URL is not allowed: {ssrf_error}", "error")
-                return redirect(url_for("creative_agents.add_creative_agent", tenant_id=tenant_id))
+            rejection = reject_if_unsafe_agent_url(
+                agent_url,
+                agent_kind="Creative agent",
+                action="add",
+                redirect_endpoint="creative_agents.add_creative_agent",
+                tenant_id=tenant_id,
+            )
+            if rejection is not None:
+                return rejection
 
             if not name:
                 flash("Agent name is required", "error")
@@ -199,11 +203,16 @@ def edit_creative_agent(tenant_id, agent_id):
                 return redirect(url_for("creative_agents.edit_creative_agent", tenant_id=tenant_id, agent_id=agent_id))
 
             # Validate the newly submitted URL — agent.agent_url is the form value set above.
-            is_safe, ssrf_error = check_url_ssrf(agent.agent_url)
-            if not is_safe:
-                logger.warning("[SECURITY] Creative agent edit rejected unsafe URL %r: %s", agent.agent_url, ssrf_error)
-                flash(f"Agent URL is not allowed: {ssrf_error}", "error")
-                return redirect(url_for("creative_agents.edit_creative_agent", tenant_id=tenant_id, agent_id=agent_id))
+            rejection = reject_if_unsafe_agent_url(
+                agent.agent_url,
+                agent_kind="Creative agent",
+                action="edit",
+                redirect_endpoint="creative_agents.edit_creative_agent",
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+            )
+            if rejection is not None:
+                return rejection
 
             if not agent.name:
                 flash("Agent name is required", "error")
@@ -264,14 +273,16 @@ def test_creative_agent(tenant_id, agent_id):
 
             # Validate URL before making outbound request (defence-in-depth: stored URLs
             # may pre-date the add/edit SSRF checks)
-            is_safe, ssrf_error = check_url_ssrf(agent.agent_url)
-            if not is_safe:
-                logger.warning(
-                    "[SECURITY] Creative agent test-connection rejected unsafe URL %r: %s",
-                    agent.agent_url,
-                    ssrf_error,
-                )
-                return jsonify({"success": False, "error": f"Agent URL is not allowed: {ssrf_error}"}), 400
+            rejection = reject_if_unsafe_agent_url(
+                agent.agent_url,
+                agent_kind="Creative agent",
+                action="test-connection",
+                redirect_endpoint="creative_agents.list_creative_agents",
+                as_json=True,
+                tenant_id=tenant_id,
+            )
+            if rejection is not None:
+                return rejection
 
             # Build agent config
             auth = None

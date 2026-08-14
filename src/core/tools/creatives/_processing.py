@@ -6,15 +6,20 @@ import logging
 import time
 import uuid
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NotRequired, TypedDict, cast
 
 from adcp.types import BrandReference, CreativeAsset
 from adcp.types import Error as AdCPErrorDetail
 from pydantic import BaseModel
 
-from src.core.exceptions import AdCPConfigurationError, AdCPError
+from src.core.exceptions import AdCPConfigurationError, AdCPError, RecoveryHint
 from src.core.helpers import _extract_format_info, _validate_creative_assets
-from src.core.schemas import CreativeStatusEnum, SyncCreativeResult, canonical_agent_url
+
+# Format/FormatId come from src.core.schemas, not adcp.types: the local models
+# subclass the library ones (Pattern #1), so annotating against the local types
+# keeps the extension point in play and lets callers pass extended instances.
+# Enforced by test_architecture_local_schema_imports.py.
+from src.core.schemas import CreativeStatusEnum, Format, FormatId, SyncCreativeResult, canonical_agent_url
 from src.core.validation_helpers import run_async_in_sync_context
 
 from ._assets import _build_creative_data, _extract_message_from_assets, _extract_url_from_assets
@@ -25,12 +30,42 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _get_format_agent_url(format_obj: Any) -> str | None:
+class _ManifestFormatId(TypedDict):
+    """The structured ``format_id`` federation identity carried in a manifest."""
+
+    id: str
+    agent_url: str
+
+
+class CreativeManifestPayload(TypedDict):
+    """The closed key set of the ``creative_manifest`` payload this module sends.
+
+    Mirrors the AdCP ``CreativeManifest`` fields we populate — ``format_id`` as
+    the structured federation identity object (never a bare string) and
+    ``assets`` keyed by the format's asset slot ids.
+
+    ``url`` is deliberately ``NotRequired``: it is *not* an AdCP
+    ``CreativeManifest`` field, it is an extra key the static-creative
+    ``preview_creative`` path adds so the agent can render an existing media
+    URL. The ``build_creative`` path never sets it (``build_creative`` runs the
+    payload through ``CreativeManifest.model_validate``).
+    """
+
+    format_id: _ManifestFormatId
+    assets: dict[str, Any]
+    url: NotRequired[str | None]
+
+
+def _get_format_agent_url(format_obj: Format | Any) -> str | None:
     """Extract the agent_url from a format object, handling both shapes.
 
+    ``format_obj`` is an SDK :class:`~adcp.types.Format` on every production
+    path. The ``Any`` half of the annotation covers the legacy/mock shape below,
+    which is structurally a ``Format`` with a bare-string ``format_id``.
+
     Handles two format shapes:
-    - Structured: ``format_obj.format_id`` is an object with ``.agent_url``
-      (the canonical AdCP FormatId shape from the SDK ``Format`` type).
+    - Structured: ``format_obj.format_id`` is a :class:`~adcp.types.FormatId`
+      with ``.agent_url`` (the canonical AdCP shape from the SDK ``Format``).
     - Legacy/mock: ``format_obj.agent_url`` is a top-level attribute
       (used by some test mocks and older code paths).
 
@@ -51,49 +86,54 @@ def _get_format_agent_url(format_obj: Any) -> str | None:
     return None
 
 
-def _find_format(all_formats: list[Any], creative_format: Any) -> Any | None:
+def _get_format_id_value(format_obj: Format | Any) -> str | None:
+    """Extract the bare format id from a format object, handling both shapes.
+
+    Counterpart to :func:`_get_format_agent_url` for the ``id`` half of the
+    composite key: structured ``format_obj.format_id.id``, or the legacy/mock
+    shape where ``format_obj.format_id`` is already the bare string id.
+    """
+    fmt_format_id = getattr(format_obj, "format_id", None)
+    if isinstance(fmt_format_id, str):
+        return fmt_format_id
+    if fmt_format_id is None:
+        return None
+    fmt_id = getattr(fmt_format_id, "id", None)
+    return cast(str | None, fmt_id)
+
+
+def _find_format(all_formats: list[Format | Any], creative_format: FormatId) -> Format | Any | None:
     """Find a format by canonical composite (agent_url, id) key.
 
-    Canonicalizes agent_url on both sides per AdCP URL canonicalization (spec
-    MUST — ``core/format-id.json`` / ``reference/url-canonicalization.mdx``):
-    lowercased host, default ports stripped, trailing slash stripped (see
-    ``schemas.canonical_agent_url`` / ``format_id_identity``, the same
-    canonical form used for federation identity and the format cache key).
-    Unlike ``normalize_agent_url`` (used elsewhere for lenient endpoint-suffix
-    matching), this does NOT strip ``/mcp``/``/a2a`` transport suffixes —
-    canonicalization must preserve the path, so a reference carrying a
-    transport suffix is a genuinely different agent_url and correctly fails
-    to match.
+    Canonicalization of both sides is delegated to :func:`_get_format_agent_url`
+    (and the id half to :func:`_get_format_id_value`) so the structured-vs-legacy
+    discrimination and the canonical form live in exactly one place — the match
+    path cannot drift from the extract path used to build the manifest.
 
-    Handles two format shapes:
-    - Structured: ``fmt.format_id`` is an object with ``.agent_url`` and ``.id``
-      (the canonical AdCP FormatId shape from the SDK).
-    - Legacy/mock: ``fmt.format_id`` is a plain string ID and ``fmt.agent_url``
-      is a top-level attribute (used by some test mocks and older code paths).
+    Canonicalization is a spec MUST (``core/format-id.json`` /
+    ``reference/url-canonicalization.mdx``): lowercased host, default ports
+    stripped, trailing slash stripped (see ``schemas.canonical_agent_url`` /
+    ``format_id_identity``, the same canonical form used for federation identity
+    and the format cache key). Unlike ``normalize_agent_url`` (used elsewhere for
+    lenient endpoint-suffix matching), this does NOT strip ``/mcp``/``/a2a``
+    transport suffixes — canonicalization must preserve the path, so a reference
+    carrying a transport suffix is a genuinely different agent_url and correctly
+    fails to match.
     """
     target_agent = canonical_agent_url(creative_format.agent_url)
     target_id = creative_format.id
     for fmt in all_formats:
-        fmt_format_id = fmt.format_id
-        if isinstance(fmt_format_id, str):
-            # Legacy shape: format_id is a bare string ID; agent_url is top-level
-            fmt_agent = getattr(fmt, "agent_url", None)
-            if fmt_agent is None:
-                continue
-            if canonical_agent_url(fmt_agent) == target_agent and fmt_format_id == target_id:
-                return fmt
-        else:
-            # Structured shape: format_id has .agent_url and .id
-            fmt_agent_url = getattr(fmt_format_id, "agent_url", None)
-            fmt_id = getattr(fmt_format_id, "id", None)
-            if fmt_agent_url is None or fmt_id is None:
-                continue
-            if canonical_agent_url(fmt_agent_url) == target_agent and fmt_id == target_id:
-                return fmt
+        fmt_agent = _get_format_agent_url(fmt)
+        if fmt_agent is None:
+            continue
+        if fmt_agent == target_agent and _get_format_id_value(fmt) == target_id:
+            return fmt
     return None
 
 
-def _build_generative_manifest(creative_format: Any, format_obj: Any, creative: CreativeAsset) -> dict[str, Any]:
+def _build_generative_manifest(
+    creative_format: FormatId, format_obj: Format | Any, creative: CreativeAsset
+) -> CreativeManifestPayload:
     """Build an AdCP-compliant creative_manifest for the generative path.
 
     Returns a manifest with the required ``assets`` field and a structured
@@ -114,11 +154,12 @@ def _build_generative_manifest(creative_format: Any, format_obj: Any, creative: 
             f"format object has no resolvable agent_url. "
             f"Ensure the format was fetched from a registered creative agent."
         )
-    manifest: dict[str, Any] = {
-        "format_id": {"id": creative_format.id, "agent_url": agent_url},
-        "assets": _validate_creative_assets(creative.assets) if creative.assets else {},
-    }
-    return manifest
+    return CreativeManifestPayload(
+        format_id=_ManifestFormatId(id=creative_format.id, agent_url=agent_url),
+        # _validate_creative_assets returns None only for falsy input, which the
+        # guard above already excludes; `or {}` keeps the TypedDict field non-optional.
+        assets=(_validate_creative_assets(creative.assets) or {}) if creative.assets else {},
+    )
 
 
 def _failed_sync_result(
@@ -148,6 +189,53 @@ def _failed_sync_result(
         assigned_to=None,
         assignment_errors=None,
     )
+
+
+def _failed_from_agent_error(
+    creative_id: str, error: BaseException, *, action_label: str
+) -> tuple[SyncCreativeResult, bool]:
+    """Classify a creative-agent failure into a failed ``(result, needs_approval)``.
+
+    Single home for the recovery ladder shared by the update and create paths
+    (``_update_existing_creative`` / ``_create_new_creative``), which previously
+    each carried their own byte-identical copy:
+
+    - :class:`AdCPConfigurationError` → ``terminal``: server-side
+      misconfiguration is admin-fixable, not a transient creative-agent outage.
+      Surface it honestly so the buyer does not retry a misconfiguration.
+    - any other :class:`AdCPError` → the error's own ``recovery``:
+      ``build_creative`` maps the SDK's ``ADCPError`` through
+      ``raise_mapped_adcp_error``, so an auth failure stays terminal and a
+      malformed manifest stays correctable instead of flattening to transient.
+    - anything else → ``transient``: a genuinely unknown failure (network error,
+      agent down) is the spec-endorsed fallback recovery.
+
+    Args:
+        creative_id: Creative the failure applies to (reported on the result).
+        error: The caught exception.
+        action_label: Names the operation in the ERROR log ("update", "create").
+
+    Returns:
+        ``(failed SyncCreativeResult, needs_approval=False)`` — the tuple shape
+        both callers return.
+    """
+    recovery: RecoveryHint
+    if isinstance(error, AdCPConfigurationError):
+        recovery = "terminal"
+        error_msg = str(error)
+    elif isinstance(error, AdCPError):
+        recovery = error.recovery
+        error_msg = str(error)
+    else:
+        recovery = "transient"
+        error_msg = (
+            f"Creative agent unreachable or validation error: {str(error)}. "
+            f"Retry recommended - creative agent may be temporarily unavailable."
+        )
+    logger.error(
+        "[sync_creatives] %s - rejecting %s of creative %s", error_msg, action_label, creative_id, exc_info=True
+    )
+    return (_failed_sync_result(creative_id, error_msg, recovery=recovery), False)
 
 
 def _update_existing_creative(
@@ -409,7 +497,7 @@ def _update_existing_creative(
                 else:
                     # Static creative - use preview_creative
                     # Build AdCP-compliant creative manifest
-                    creative_manifest: dict[str, Any] = _build_generative_manifest(
+                    creative_manifest: CreativeManifestPayload = _build_generative_manifest(
                         creative_format, format_obj, creative
                     )
                     if data.get("url"):
@@ -493,41 +581,10 @@ def _update_existing_creative(
                     logger.error(f"[sync_creatives] {error_msg}")
                     return (_failed_sync_result(existing_creative.creative_id, error_msg), False)
 
-        except AdCPConfigurationError as config_error:
-            # Server-side misconfiguration (e.g. GEMINI_API_KEY missing) is terminal
-            # and admin-fixable — not a transient creative-agent outage. Surface it
-            # honestly so the buyer does not retry a misconfiguration.
-            error_msg = str(config_error)
-            logger.error(
-                "[sync_creatives] %s for update of %s", error_msg, existing_creative.creative_id, exc_info=True
-            )
-            return (_failed_sync_result(existing_creative.creative_id, error_msg, recovery="terminal"), False)
-        except AdCPError as adcp_error:
-            # Typed creative-agent failure (build_creative maps the SDK's ADCPError
-            # via raise_mapped_adcp_error before this point) — carry its recovery
-            # classification through instead of flattening to "transient" below.
-            # An auth failure is terminal (fix credentials, don't retry); a
-            # malformed manifest is correctable; only a genuine outage is transient.
-            error_msg = str(adcp_error)
-            logger.error(
-                "[sync_creatives] %s for update of %s", error_msg, existing_creative.creative_id, exc_info=True
-            )
-            return (
-                _failed_sync_result(existing_creative.creative_id, error_msg, recovery=adcp_error.recovery),
-                False,
-            )
-        except Exception as validation_error:
-            # Genuinely unknown failure (network error, agent down, etc.) —
-            # transient is the spec-endorsed fallback recovery.
-            error_msg = (
-                f"Creative agent unreachable or validation error: {str(validation_error)}. "
-                f"Retry recommended - creative agent may be temporarily unavailable."
-            )
-            logger.error(
-                f"[sync_creatives] {error_msg} for update of {existing_creative.creative_id}",
-                exc_info=True,
-            )
-            return (_failed_sync_result(existing_creative.creative_id, error_msg, recovery="transient"), False)
+        except Exception as agent_error:
+            # Recovery classification (config→terminal / AdCPError→its own /
+            # unknown→transient) lives in _failed_from_agent_error.
+            return _failed_from_agent_error(existing_creative.creative_id, agent_error, action_label="update")
 
     # In full upsert, consider all fields as changed
     changes.extend(["url", "click_url", "width", "height", "duration"])
@@ -689,7 +746,7 @@ def _create_new_creative(
                 else:
                     # Static creative - use preview_creative
                     # Build AdCP-compliant creative manifest
-                    creative_manifest: dict[str, Any] = _build_generative_manifest(
+                    creative_manifest: CreativeManifestPayload = _build_generative_manifest(
                         creative_format, format_obj, creative
                     )
                     if data.get("url"):
@@ -765,34 +822,10 @@ def _create_new_creative(
                         logger.error(f"[sync_creatives] {error_msg}")
                         return (_failed_sync_result(creative_id, error_msg), False)
 
-        except AdCPConfigurationError as config_error:
-            # Server-side misconfiguration (e.g. GEMINI_API_KEY missing) is terminal
-            # and admin-fixable — not a transient creative-agent outage. Surface it
-            # honestly so the buyer does not retry a misconfiguration.
-            error_msg = str(config_error)
-            logger.error("[sync_creatives] %s - rejecting creative %s", error_msg, creative_id, exc_info=True)
-            return (_failed_sync_result(creative_id, error_msg, recovery="terminal"), False)
-        except AdCPError as adcp_error:
-            # Typed creative-agent failure (build_creative maps the SDK's ADCPError
-            # via raise_mapped_adcp_error before this point) — carry its recovery
-            # classification through instead of flattening to "transient" below.
-            # An auth failure is terminal (fix credentials, don't retry); a
-            # malformed manifest is correctable; only a genuine outage is transient.
-            error_msg = str(adcp_error)
-            logger.error("[sync_creatives] %s - rejecting creative %s", error_msg, creative_id, exc_info=True)
-            return (_failed_sync_result(creative_id, error_msg, recovery=adcp_error.recovery), False)
-        except Exception as validation_error:
-            # Genuinely unknown failure (network error, agent down, etc.) —
-            # transient is the spec-endorsed fallback recovery.
-            error_msg = (
-                f"Creative agent unreachable or validation error: {str(validation_error)}. "
-                f"Retry recommended - creative agent may be temporarily unavailable."
-            )
-            logger.error(
-                f"[sync_creatives] {error_msg} - rejecting creative {creative_id}",
-                exc_info=True,
-            )
-            return (_failed_sync_result(creative_id, error_msg, recovery="transient"), False)
+        except Exception as agent_error:
+            # Recovery classification (config→terminal / AdCPError→its own /
+            # unknown→transient) lives in _failed_from_agent_error.
+            return _failed_from_agent_error(creative_id, agent_error, action_label="create")
 
     # Determine creative status based on approval mode
 

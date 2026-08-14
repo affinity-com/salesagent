@@ -5,8 +5,11 @@ property list resolution and webhook URL validation.
 """
 
 import ipaddress
+import logging
 import socket
 from urllib.parse import ParseResult, urlparse
+
+logger = logging.getLogger(__name__)
 
 # Blocked IP ranges (RFC 1918 private networks, loopback, link-local,
 # CGNAT shared space, and multicast).
@@ -124,5 +127,10 @@ def check_url_ssrf(
 
         return _check_hostname_resolution(hostname, resolve_dns=resolve_dns)
 
-    except Exception as e:
-        return False, f"Invalid URL: {e}"
+    except Exception:
+        # The parse/resolve failure detail is diagnostic only. Callers surface this
+        # message verbatim to the requester (flash / JSON error), so keep the
+        # exception text server-side rather than echoing it back — the raw text can
+        # carry internal resolver state (CodeQL ``stack-trace-exposure``).
+        logger.warning("SSRF check could not parse URL %r", url, exc_info=True)
+        return False, "URL could not be parsed or resolved"
