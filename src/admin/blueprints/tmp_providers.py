@@ -21,6 +21,11 @@ from collections.abc import Mapping
 
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
 
+# werkzeug's Response, not flask's: `redirect()` returns the werkzeug base class
+# while `jsonify()` returns the flask subclass, so the base type is the one that
+# annotates both helper families here.
+from werkzeug.wrappers import Response
+
 from src.admin.utils import require_tenant_access
 from src.admin.utils.audit_decorator import log_admin_action
 from src.core.database.repositories.uow import TMPProviderUoW
@@ -37,7 +42,7 @@ tmp_providers_bp = Blueprint("tmp_providers", __name__)
 # ---------------------------------------------------------------------------
 
 
-def _log_and_500(action: str, exc: Exception):
+def _log_and_500(action: str, exc: Exception) -> tuple[Response, int]:
     """Log *exc* at ERROR level and return a JSON 500 response.
 
     Collapses the copy-pasted ``except Exception as e: logger.error(...)``
@@ -58,7 +63,7 @@ def _log_and_500(action: str, exc: Exception):
     return jsonify({"error": f"Error {action}"}), 500
 
 
-def _log_flash_and_redirect(action: str, exc: Exception, redirect_response):
+def _log_flash_and_redirect(action: str, exc: Exception, redirect_response: Response) -> Response:
     """Log *exc* at ERROR level, flash an error message, and return *redirect_response*.
 
     Collapses the copy-pasted ``except Exception as e: logger.error(...); flash(...);
@@ -80,7 +85,7 @@ def _log_flash_and_redirect(action: str, exc: Exception, redirect_response):
     return redirect_response
 
 
-def _tenant_not_found_redirect():
+def _tenant_not_found_redirect() -> Response:
     """Flash an error and redirect to the index when a tenant cannot be found.
 
     Returns the redirect response so callers can ``return`` it directly::
@@ -93,7 +98,7 @@ def _tenant_not_found_redirect():
     return redirect(url_for("core.index"))
 
 
-def _provider_not_found_json():
+def _provider_not_found_json() -> tuple[Response, int]:
     """Return a JSON 404 response when a TMP provider cannot be found.
 
     Returns the response so callers can ``return`` it directly::
@@ -105,7 +110,7 @@ def _provider_not_found_json():
     return jsonify({"error": "TMP provider not found"}), 404
 
 
-def _provider_not_found_redirect(tenant_id: str):
+def _provider_not_found_redirect(tenant_id: str) -> Response:
     """Flash an error and redirect to the provider list when a TMP provider cannot be found.
 
     Returns the redirect response so callers can ``return`` it directly::
@@ -188,6 +193,33 @@ def _validate_provider_form(form: Mapping[str, str]) -> TMPProviderRegistration:
     )
 
 
+def _validated_registration_or_redirect(
+    form: Mapping[str, str], on_error_redirect: Response
+) -> TMPProviderRegistration | Response:
+    """Parse and validate *form*, or flash the rejection and return *on_error_redirect*.
+
+    The add and edit POST handlers ran the identical
+    parse-or-flash-and-bounce-back block, differing only in the redirect target
+    (#1197 review), so a change to the rejection UX meant two edits.  They now
+    each pass their own target and express nothing else::
+
+        registration = _validated_registration_or_redirect(request.form, redirect(...))
+        if isinstance(registration, Response):
+            return registration
+
+    The rejection is handled here rather than by the handlers' generic
+    ``except Exception``: a validation failure must flash its own
+    operator-facing message, not the generic "Error adding TMP provider".
+    Returning the redirect (rather than raising) keeps that distinction
+    structural — there is no exception for the generic handler to swallow.
+    """
+    try:
+        return _validate_provider_form(form)
+    except TMPProviderValidationError as exc:
+        flash(str(exc), "error")
+        return on_error_redirect
+
+
 @tmp_providers_bp.route("/")
 @require_tenant_access()
 def list_tmp_providers(tenant_id):
@@ -204,11 +236,12 @@ def list_tmp_providers(tenant_id):
 
             providers_list = []
             for p in providers:
-                # include_conditional=False: always emit countries/uid_types/properties
-                # (None means "accepts all") — same contract as the edit path and the
-                # discovery endpoint. Avoids manually overwriting the same three fields
-                # that to_dict(include_conditional=False) already handles.
-                entry = p.to_dict(include_conditional=False)
+                # to_admin_dict(): the UI serialization — carries `name` for the
+                # table and always emits countries/uid_types/properties (None
+                # means "accepts all"). The discovery wire uses
+                # to_discovery_dict() instead, which omits absent conditionals
+                # and drops `name` to stay inside the closed AdCP schema.
+                entry = p.to_admin_dict()
                 entry["created_at"] = p.created_at
                 providers_list.append(entry)
 
@@ -257,14 +290,12 @@ def add_tmp_provider(tenant_id):
             if not tenant:
                 return _tenant_not_found_redirect()
 
-            # Caught here, not by the handler's generic `except Exception` below:
-            # a validation rejection must flash its own operator-facing message,
-            # not the generic "Error adding TMP provider".
-            try:
-                registration = _validate_provider_form(request.form)
-            except TMPProviderValidationError as exc:
-                flash(str(exc), "error")
-                return redirect(url_for("tmp_providers.add_tmp_provider", tenant_id=tenant_id))
+            registration = _validated_registration_or_redirect(
+                request.form,
+                redirect(url_for("tmp_providers.add_tmp_provider", tenant_id=tenant_id)),
+            )
+            if isinstance(registration, Response):
+                return registration
 
             # create_from_fields is symmetric with update_fields used in the edit path:
             # both take the same TMPProviderFields record without inline ORM construction.
@@ -298,17 +329,22 @@ def edit_tmp_provider(tenant_id, provider_id):
             if not provider:
                 return _provider_not_found_redirect(tenant_id)
 
-            provider_dict = provider.to_dict(include_conditional=False)
+            provider_dict = provider.to_admin_dict()
             # Form fields need comma-separated strings, not lists
             provider_dict["countries"] = ",".join(provider.countries or [])
             provider_dict["uid_types"] = ",".join(provider.uid_types or [])
             provider_dict["properties"] = ",".join(provider.properties or [])
-            # Auth fields are not in to_dict() (sensitive / not part of TMP Router contract).
-            # Render a placeholder instead of the plaintext credential so it is never
-            # echoed back to the browser — the POST side preserves the existing value
-            # when the field is left empty.
+            # Auth fields are not in to_admin_dict() (sensitive / not part of the
+            # TMP Router contract). Render a placeholder instead of the plaintext
+            # credential so it is never echoed back to the browser — the POST side
+            # preserves the existing value when the field is left empty.
+            #
+            # has_auth_credentials is the model's presence accessor: it answers
+            # "is a credential set?" without decrypting (the decrypting getter
+            # raises on a rotated ciphertext) and without reading the private
+            # column the model forbids touching (#1197 review).
             provider_dict["auth_type"] = provider.auth_type
-            provider_dict["auth_credentials"] = "••••••••" if provider._auth_credentials else ""
+            provider_dict["auth_credentials"] = "••••••••" if provider.has_auth_credentials else ""
 
             return render_template(
                 "tmp_provider_form.html",
@@ -326,15 +362,12 @@ def edit_tmp_provider(tenant_id, provider_id):
             if not provider:
                 return _provider_not_found_redirect(tenant_id)
 
-            # See the add handler: caught before the generic `except Exception`
-            # so the specific rejection message reaches the operator.
-            try:
-                registration = _validate_provider_form(request.form)
-            except TMPProviderValidationError as exc:
-                flash(str(exc), "error")
-                return redirect(
-                    url_for("tmp_providers.edit_tmp_provider", tenant_id=tenant_id, provider_id=provider_id)
-                )
+            registration = _validated_registration_or_redirect(
+                request.form,
+                redirect(url_for("tmp_providers.edit_tmp_provider", tenant_id=tenant_id, provider_id=provider_id)),
+            )
+            if isinstance(registration, Response):
+                return registration
 
             # auth_credentials is written only when a new non-empty value was
             # submitted — otherwise the stored (encrypted) value is preserved.

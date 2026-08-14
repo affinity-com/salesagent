@@ -137,27 +137,66 @@ def _auth_headers(token: str) -> dict[str, str]:
     return {"x-adcp-auth": token, "x-adcp-tenant": _TENANT_SUBDOMAIN}
 
 
-def _wait_for_sync(received: list, timeout: float = 30.0) -> dict:
+def _wait_for_sync(received: list, timeout: float = 30.0, *, after: int = 0) -> dict:
     """Poll until the server's sync thread delivers a ``/packages/sync`` POST.
 
     The sync is fire-and-forget server-side, so there is no response to await —
     the arrival at this collector IS the observable. Fails with the captured
     paths so a wrong-path delivery is distinguishable from no delivery at all.
+
+    ``after`` is the number of ``/packages/sync`` deliveries already accounted
+    for; the wait returns the first one beyond that count.  The update test
+    needs it because its own create already produced one — without it the
+    update assertion would pass on the create's delivery.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        for entry in received:
-            if entry["path"].endswith("/packages/sync"):
-                return entry
+        syncs = [e for e in received if e["path"].endswith("/packages/sync")]
+        if len(syncs) > after:
+            return syncs[after]
         time.sleep(0.5)
     raise AssertionError(
-        f"No POST /packages/sync arrived within {timeout}s. "
+        f"No POST /packages/sync (beyond the first {after}) arrived within {timeout}s. "
         f"Captured requests: {json.dumps([e['path'] for e in received])}"
     )
 
 
+def _create_media_buy_over_rest(base_url: str, token: str) -> str:
+    """Create a media buy over the live REST surface and return its id.
+
+    Built by the shared e2e request builder so this tracks the AdCP package
+    shape (plain-number budget, required pricing_option_id) with every other
+    e2e create instead of hand-rolling its own.
+    """
+    product_id, pricing_option_id = _first_product(base_url, token)
+    start_time, end_time = get_test_date_range()
+
+    request_body = build_adcp_media_buy_request(
+        product_ids=[product_id],
+        total_budget=5000.0,
+        start_time=start_time,
+        end_time=end_time,
+        brand={"domain": "tmp-e2e-brand.example.com"},
+        pricing_option_id=pricing_option_id,
+    )
+    response = httpx.post(
+        f"{base_url}/api/v1/media-buys",
+        json=request_body,
+        headers=_auth_headers(token),
+        timeout=60,
+    )
+    assert response.status_code == 200, f"create_media_buy failed: {response.status_code} {response.text}"
+    media_buy_id = response.json().get("media_buy_id")
+    assert media_buy_id, f"create_media_buy returned no media_buy_id: {response.text}"
+    return media_buy_id
+
+
 class TestTmpSyncOverLiveRest:
-    """create_media_buy over real HTTP delivers packages to a real provider endpoint."""
+    """create_media_buy and update_media_buy over real HTTP both deliver packages.
+
+    One class, two halves of the same contract: the sync fires on create and
+    again whenever the media buy materially changes.
+    """
 
     def test_package_sync_reaches_provider_over_the_wire(
         self,
@@ -177,30 +216,7 @@ class TestTmpSyncOverLiveRest:
 
         tenant_id = _register_provider(live_server, tmp_provider_endpoint["base_url"])
         try:
-            product_id, pricing_option_id = _first_product(base_url, test_auth_token)
-            start_time, end_time = get_test_date_range()
-
-            # Built by the shared e2e request builder so this test tracks the
-            # AdCP package shape (plain-number budget, required pricing_option_id)
-            # with every other e2e create instead of hand-rolling its own.
-            request_body = build_adcp_media_buy_request(
-                product_ids=[product_id],
-                total_budget=5000.0,
-                start_time=start_time,
-                end_time=end_time,
-                brand={"domain": "tmp-e2e-brand.example.com"},
-                pricing_option_id=pricing_option_id,
-            )
-            response = httpx.post(
-                f"{base_url}/api/v1/media-buys",
-                json=request_body,
-                headers=_auth_headers(test_auth_token),
-                timeout=60,
-            )
-            assert response.status_code == 200, f"create_media_buy failed: {response.status_code} {response.text}"
-            media_buy_id = response.json().get("media_buy_id")
-            assert media_buy_id, f"create_media_buy returned no media_buy_id: {response.text}"
-
+            media_buy_id = _create_media_buy_over_rest(base_url, test_auth_token)
             entry = _wait_for_sync(tmp_provider_endpoint["received"])
         finally:
             _cleanup_provider(live_server, tenant_id)
@@ -217,6 +233,65 @@ class TestTmpSyncOverLiveRest:
         # available-package.json is additionalProperties: false with exactly
         # these three required keys — assert the closed shape survived the wire,
         # not just that the fields are present.
+        assert set(package) == {"package_id", "media_buy_id", "seller_agent"}, (
+            f"live wire body diverged from available-package.json: {sorted(package)}"
+        )
+        assert package["media_buy_id"] == media_buy_id
+        assert package["seller_agent"] == {"agent_url": f"https://{_SELLER_AGENT_HOST}/mcp"}
+
+    def test_package_sync_fires_again_on_update_over_the_wire(
+        self,
+        live_server,
+        test_auth_token,
+        auto_approval_adapter,
+        tmp_provider_endpoint,
+    ):
+        """A live REST update re-syncs packages, not just the create.
+
+        The in-process update sibling
+        (``TestFireTmpSyncDispatchedOnUpdate``) patches ``httpx.Client`` and
+        ``threading.Thread`` inside the test process, so it cannot observe the
+        server-side thread at all — the same gap the create test closes, on the
+        other half of the feature. Until this existed, the create was graded
+        across the process boundary and the update was not, while the
+        ``_DISPATCHED_TRANSPORTS`` comment claimed e2e coverage for both
+        (#1197 review).
+
+        The create that seeds the media buy fires its own sync, so this waits
+        for the *second* delivery (``after=1``) — otherwise a wrapper that
+        dropped ``fire_tmp_sync`` from the update path would still pass.
+        """
+        base_url = live_server["mcp"]
+        wait_for_server_readiness(base_url)
+
+        tenant_id = _register_provider(live_server, tmp_provider_endpoint["base_url"])
+        try:
+            media_buy_id = _create_media_buy_over_rest(base_url, test_auth_token)
+            # Await the create's own sync first so the update's delivery is the
+            # next one, rather than racing two in-flight threads.
+            _wait_for_sync(tmp_provider_endpoint["received"])
+
+            response = httpx.put(
+                f"{base_url}/api/v1/media-buys/{media_buy_id}",
+                json={"budget": 7500.0},
+                headers=_auth_headers(test_auth_token),
+                timeout=60,
+            )
+            assert response.status_code == 200, f"update_media_buy failed: {response.status_code} {response.text}"
+
+            entry = _wait_for_sync(tmp_provider_endpoint["received"], after=1)
+        finally:
+            _cleanup_provider(live_server, tenant_id)
+
+        assert entry["path"] == "/tmp/packages/sync", (
+            f"provider_url() built the wrong path on the live wire: {entry['path']!r}"
+        )
+
+        body = entry["body"]
+        assert isinstance(body, list), f"packages sync body must be a JSON array, got {type(body).__name__}"
+        assert body, "packages sync body was an empty array"
+
+        package = body[0]
         assert set(package) == {"package_id", "media_buy_id", "seller_agent"}, (
             f"live wire body diverged from available-package.json: {sorted(package)}"
         )

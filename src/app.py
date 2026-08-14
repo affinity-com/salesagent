@@ -48,6 +48,7 @@ from src.core.http_utils import get_header_case_insensitive as _get_header_case_
 from src.core.lifecycle import run_all_shutdown_callbacks
 from src.core.main import mcp
 from src.core.resolved_identity import resolve_identity
+from src.core.security.url_validator import is_local_host
 from src.core.tool_error_logging import handle_tool_error, record_boundary_error
 from src.landing import generate_tenant_landing_page
 from src.landing.landing_page import generate_fallback_landing_page
@@ -360,11 +361,12 @@ def _create_dynamic_agent_card(request: Request):
             proto = forwarded_proto.split(",")[0].strip().lower()
             if proto in ("http", "https"):
                 return proto
-        # Use exact equality (not startswith) to avoid the substring class bug:
-        # "startswith('localhost')" would misclassify "localhost.evil.com" as local.
-        # Strip the port component first so "localhost:8080" is handled correctly.
-        bare = hostname.split(":", 1)[0]
-        return "http" if bare in {"localhost", "127.0.0.1"} else "https"
+        # Shared predicate (src.core.security.url_validator.is_local_host): exact
+        # equality / suffix checks, port stripped, and *.localhost counted as
+        # local so a per-tenant dev host like "tenant.localhost" advertises http.
+        # The TMP seller-URL resolver asks the same question and calls the same
+        # function — they disagreed on *.localhost before (#1197 review).
+        return "http" if is_local_host(hostname) else "https"
 
     apx_incoming_host = _get_header_case_insensitive(request.headers, "Apx-Incoming-Host")
     if apx_incoming_host and not _is_valid_hostname(apx_incoming_host):

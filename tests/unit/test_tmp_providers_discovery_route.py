@@ -16,7 +16,7 @@ Covers:
 - Fail-closed auth: unset/empty TMP_DISCOVERY_API_KEYS → 500 (CONFIGURATION_ERROR)
 - Explicit opt-out: TMP_DISCOVERY_API_KEYS=OPEN disables auth
 - uow.tenant_config is None → 500 (not an assert)
-- TMPProvider.to_dict() serializes both conditional paths correctly
+- TMPProvider.to_discovery_dict() / to_admin_dict() serialize their own contracts
 """
 
 from unittest.mock import MagicMock, patch
@@ -27,7 +27,7 @@ from sqlalchemy.orm.exc import DetachedInstanceError
 
 from src.core.database.models import TMPProvider
 from tests.helpers.envelope_assertions import assert_envelope_shape
-from tests.unit._tmp_helpers import _make_provider, _make_tmp_uow
+from tests.unit._tmp_helpers import _make_provider, _make_tmp_uow, _mock_cm
 
 
 def _make_tenant(tenant_id="si-host"):
@@ -172,9 +172,12 @@ class TestDiscoveryResponseShape:
         assert response.status_code == 200
         entry = response.json()["providers"][0]
 
-        required_fields = {
+        # The closed key set of provider-registration.json — asserted as
+        # EQUALITY, not a subset: additionalProperties is false, so an extra key
+        # (e.g. re-adding the admin-only `name`) is a schema violation a subset
+        # check would wave through.
+        assert set(entry) == {
             "provider_id",
-            "name",
             "endpoint",
             "context_match",
             "identity_match",
@@ -184,13 +187,38 @@ class TestDiscoveryResponseShape:
             "priority",
             "status",
         }
-        assert required_fields.issubset(set(entry.keys()))
 
-    def test_null_countries_uid_types_for_legacy_rows(self, client):
-        """Legacy rows with null countries/uid_types return null (router treats as 'all')."""
+    def test_name_is_not_on_the_machine_wire(self, client):
+        """`name` is not in the closed schema, so the discovery wire must not carry it.
+
+        It stays on the admin serialization (``to_admin_dict``) — see
+        ``TestTMPProviderSerializers``.  The TMP Router uses ``name`` only as a
+        fallback identifier when ``provider_id`` is empty, and this endpoint
+        always emits ``provider_id``.
+        """
+        tenant = _make_tenant()
+        providers = [_make_provider(name="Admin Only Label")]
+
+        mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
+
+        with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
+            with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
+                response = client.get("/tenant/si-host/tmp-providers/discovery")
+
+        assert response.status_code == 200
+        assert "name" not in response.json()["providers"][0]
+
+    def test_absent_countries_uid_types_are_omitted_not_null(self, client):
+        """Rows that restrict nothing omit the conditional arrays — `null` is a type violation.
+
+        ``provider-registration.json`` types ``countries``/``uid_types``/
+        ``properties`` as ``array`` with ``minItems: 1``, so ``null`` is not a
+        permitted value and a strictly-validating router rejects the body.
+        Omission is how the schema spells "no restriction" (#1197 review).
+        """
         tenant = _make_tenant()
         providers = [
-            _make_provider(countries=None, uid_types=None),
+            _make_provider(countries=None, uid_types=None, properties=None),
         ]
 
         mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
@@ -201,15 +229,22 @@ class TestDiscoveryResponseShape:
 
         assert response.status_code == 200
         entry = response.json()["providers"][0]
-        assert entry["countries"] is None
-        assert entry["uid_types"] is None
+        assert "countries" not in entry
+        assert "uid_types" not in entry
+        assert "properties" not in entry
 
 
 class TestDiscoveryOrdering:
     """Providers are ordered by priority ASC, name ASC."""
 
     def test_providers_ordered_by_priority_then_name(self, client):
-        """The repository returns providers in priority ASC, name ASC order."""
+        """The repository's priority ASC, name ASC order survives to the wire.
+
+        Asserted on ``provider_id`` rather than ``name``: the ordering key is
+        the repository's, but ``name`` is admin-only and not on this wire, so
+        each row's id stands in for it (ids are assigned to match the expected
+        name order).
+        """
         tenant = _make_tenant()
         # Simulate DB returning in correct order (priority 0 before 1, alpha within same priority)
         providers = [
@@ -225,8 +260,8 @@ class TestDiscoveryOrdering:
                 response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 200
-        names = [p["name"] for p in response.json()["providers"]]
-        assert names == ["Alpha", "Beta", "Gamma"]
+        provider_ids = [p["provider_id"] for p in response.json()["providers"]]
+        assert provider_ids == ["uuid-a", "uuid-b", "uuid-c"]
 
 
 # ---------------------------------------------------------------------------
@@ -448,13 +483,16 @@ class TestDiscoveryRepositoryUnavailable:
 
     @staticmethod
     def _uow_cls_with(*, tenant_config, tmp_providers) -> MagicMock:
+        """A UoW class whose yielded UoW exposes the two repositories as given.
+
+        Unlike ``_make_tmp_uow``, either repository may be ``None`` — that is
+        the condition under test. The context-manager plumbing itself is
+        ``_mock_cm``'s job, not this factory's.
+        """
         mock_uow = MagicMock()
         mock_uow.tenant_config = tenant_config
         mock_uow.tmp_providers = tmp_providers
-        mock_uow_cls = MagicMock()
-        mock_uow_cls.return_value.__enter__ = MagicMock(return_value=mock_uow)
-        mock_uow_cls.return_value.__exit__ = MagicMock(return_value=False)
-        return mock_uow_cls
+        return _mock_cm(mock_uow)
 
     def test_returns_503_when_tenant_config_is_none(self, client):
         """If TMPProviderUoW yields uow.tenant_config=None the endpoint returns 503 (service unavailable).
@@ -524,7 +562,7 @@ class TestDiscoverySingleTransactionAndNoDetachedInstance:
     """
 
     class _DetachAfterCloseProvider:
-        """Fake provider whose to_dict() raises DetachedInstanceError once the UoW has closed."""
+        """Fake provider whose to_discovery_dict() raises DetachedInstanceError once the UoW closed."""
 
         def __init__(self, closed_flag: list[bool]):
             self._closed_flag = closed_flag
@@ -533,17 +571,13 @@ class TestDiscoverySingleTransactionAndNoDetachedInstance:
             if self._closed_flag[0]:
                 raise DetachedInstanceError("Instance is not bound to a Session; attribute access failed")
 
-        def to_dict(self, *, include_conditional: bool = True) -> dict:
+        def to_discovery_dict(self) -> dict:
             self._check()
             return {
                 "provider_id": "fake-uuid",
-                "name": "Fake Provider",
                 "endpoint": "http://fake:3000",
                 "context_match": True,
                 "identity_match": True,
-                "countries": None,
-                "uid_types": None,
-                "properties": None,
                 "timeout_ms": 200,
                 "priority": 0,
                 "status": "active",
@@ -562,11 +596,12 @@ class TestDiscoverySingleTransactionAndNoDetachedInstance:
         mock_tmp_uow_cls.assert_called_once_with("si-host")
 
     def test_to_dict_called_before_uow_exits(self, client):
-        """provider.to_dict() is called inside the UoW block, not after it closes.
+        """provider.to_discovery_dict() is called inside the UoW block, not after it closes.
 
-        Uses a fake provider whose to_dict() raises DetachedInstanceError once
-        the UoW __exit__ sets a closed_flag. If the route calls to_dict() after
-        the block exits, the request would 500; if it calls it inside, it succeeds.
+        Uses a fake provider whose to_discovery_dict() raises
+        DetachedInstanceError once the UoW __exit__ sets a closed_flag. If the
+        route serializes after the block exits, the request would 500; if it
+        serializes inside, it succeeds.
         """
         closed_flag = [False]
         provider = self._DetachAfterCloseProvider(closed_flag)
@@ -581,9 +616,7 @@ class TestDiscoverySingleTransactionAndNoDetachedInstance:
             closed_flag[0] = True
             return False
 
-        mock_uow_cls = MagicMock()
-        mock_uow_cls.return_value.__enter__ = MagicMock(return_value=mock_uow)
-        mock_uow_cls.return_value.__exit__ = MagicMock(side_effect=_mark_closed)
+        mock_uow_cls = _mock_cm(mock_uow, on_exit=_mark_closed)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_uow_cls):
             with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
@@ -597,80 +630,92 @@ class TestDiscoverySingleTransactionAndNoDetachedInstance:
 
 
 # ---------------------------------------------------------------------------
-# TMPProvider.to_dict() unit tests (no DB required)
+# TMPProvider serializer unit tests (no DB required)
 # ---------------------------------------------------------------------------
 
 
-class TestTMPProviderToDict:
-    """TMPProvider.to_dict() serializes both conditional paths correctly.
+class TestTMPProviderSerializers:
+    """The two serializers carry two different contracts and must not converge.
+
+    ``to_discovery_dict()`` is the machine wire — the closed key set of
+    ``provider-registration.json``, absent conditionals omitted, no ``name``.
+    ``to_admin_dict()`` is the Jinja-facing shape — ``name`` plus all three
+    conditional keys always present (``None`` meaning "no restriction").
 
     These tests use real TMPProvider instances (no DB session) to ensure the
     production serialization contract is tested directly — not a MagicMock
     reimplementation that can silently diverge.
     """
 
-    def test_include_conditional_true_omits_none_fields(self):
-        """include_conditional=True (default) omits countries/uid_types/properties when None."""
+    def test_discovery_dict_omits_absent_conditionals(self):
+        """Absent countries/uid_types/properties are omitted — never emitted as null."""
         p = _make_provider(countries=None, uid_types=None, properties=None)
-        result = p.to_dict(include_conditional=True)
+        result = p.to_discovery_dict()
         assert "countries" not in result
         assert "uid_types" not in result
         assert "properties" not in result
 
-    def test_include_conditional_true_includes_non_none_fields(self):
-        """include_conditional=True includes countries/uid_types/properties when set."""
+    def test_discovery_dict_includes_populated_conditionals(self):
+        """Populated countries/uid_types/properties are carried through verbatim."""
         p = _make_provider(countries=["US", "GB"], uid_types=["uid2"], properties=["rid-1"])
-        result = p.to_dict(include_conditional=True)
+        result = p.to_discovery_dict()
         assert result["countries"] == ["US", "GB"]
         assert result["uid_types"] == ["uid2"]
         assert result["properties"] == ["rid-1"]
 
-    def test_include_conditional_false_always_includes_fields(self):
-        """include_conditional=False always includes countries/uid_types/properties (even as None)."""
-        p = _make_provider(countries=None, uid_types=None, properties=None)
-        result = p.to_dict(include_conditional=False)
-        assert "countries" in result
-        assert result["countries"] is None
-        assert "uid_types" in result
-        assert result["uid_types"] is None
-        assert "properties" in result
-        assert result["properties"] is None
-
-    def test_include_conditional_false_with_values(self):
-        """include_conditional=False includes populated countries/uid_types/properties."""
-        p = _make_provider(countries=["DE"], uid_types=["id5"], properties=["rid-2", "rid-3"])
-        result = p.to_dict(include_conditional=False)
-        assert result["countries"] == ["DE"]
-        assert result["uid_types"] == ["id5"]
-        assert result["properties"] == ["rid-2", "rid-3"]
-
-    def test_core_fields_always_present(self):
-        """Core fields are always present regardless of include_conditional."""
+    def test_discovery_dict_key_set_is_closed(self):
+        """The emitted key set stays inside the closed schema — and excludes `name`."""
         p = _make_provider(
             provider_id="test-uuid",
             name="Test Provider",
             endpoint="http://example.com",
             context_match=False,
             identity_match=True,
+            countries=["DE"],
+            uid_types=["id5"],
+            properties=["rid-2"],
             timeout_ms=300,
             priority=2,
             status="draining",
         )
-        for include_conditional in (True, False):
-            result = p.to_dict(include_conditional=include_conditional)
-            assert result["provider_id"] == "test-uuid"
-            assert result["name"] == "Test Provider"
-            assert result["endpoint"] == "http://example.com"
-            assert result["context_match"] is False
-            assert result["identity_match"] is True
-            assert result["timeout_ms"] == 300
-            assert result["priority"] == 2
-            assert result["status"] == "draining"
+        result = p.to_discovery_dict()
+        assert set(result) == {
+            "provider_id",
+            "endpoint",
+            "context_match",
+            "identity_match",
+            "countries",
+            "uid_types",
+            "properties",
+            "timeout_ms",
+            "priority",
+            "status",
+        }
+        assert result["provider_id"] == "test-uuid"
+        assert result["endpoint"] == "http://example.com"
+        assert result["context_match"] is False
+        assert result["identity_match"] is True
+        assert result["timeout_ms"] == 300
+        assert result["priority"] == 2
+        assert result["status"] == "draining"
 
-    def test_discovery_endpoint_uses_include_conditional_false(self, client):
-        """The discovery endpoint calls to_dict(include_conditional=False) so null fields are explicit."""
+    def test_admin_dict_keeps_name_and_null_conditionals(self):
+        """The admin shape carries `name` and all three conditional keys, `None` included.
+
+        The edit template renders those three fields unconditionally, so the
+        admin serialization must not adopt the wire's omission rule.
+        """
+        p = _make_provider(name="Test Provider", countries=None, uid_types=None, properties=None)
+        result = p.to_admin_dict()
+        assert result["name"] == "Test Provider"
+        assert result["countries"] is None
+        assert result["uid_types"] is None
+        assert result["properties"] is None
+
+    def test_discovery_endpoint_uses_the_wire_serializer(self, client):
+        """The route serializes with to_discovery_dict(), not the admin shape."""
         tenant = _make_tenant()
-        providers = [_make_provider(countries=None, uid_types=None, properties=None)]
+        providers = [_make_provider(name="Admin Only Label", countries=None, uid_types=None, properties=None)]
 
         mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
 
@@ -680,13 +725,10 @@ class TestTMPProviderToDict:
 
         assert response.status_code == 200
         entry = response.json()["providers"][0]
-        # include_conditional=False → null fields must be present (not omitted)
-        assert "countries" in entry
-        assert entry["countries"] is None
-        assert "uid_types" in entry
-        assert entry["uid_types"] is None
-        assert "properties" in entry
-        assert entry["properties"] is None
+        assert "name" not in entry
+        assert "countries" not in entry
+        assert "uid_types" not in entry
+        assert "properties" not in entry
 
 
 # ---------------------------------------------------------------------------

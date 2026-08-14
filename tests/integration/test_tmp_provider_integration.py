@@ -265,7 +265,9 @@ def _future(days: int) -> str:
 # Transports that run the real wrapper chain in-process.  IMPL is excluded
 # deliberately: it bypasses the wrappers, which is where fire_tmp_sync lives.
 # E2E_REST is graded separately in tests/e2e/test_tmp_provider_sync_e2e.py —
-# in-process patching cannot reach the server process.
+# in-process patching cannot reach the server process — and that file covers
+# BOTH halves: ``test_package_sync_reaches_provider_over_the_wire`` (create) and
+# ``test_package_sync_fires_again_on_update_over_the_wire`` (update).
 _DISPATCHED_TRANSPORTS = [Transport.MCP, Transport.A2A, Transport.REST]
 
 _SELLER_AGENT_URL = "https://salesagent.example.com/mcp"
@@ -321,6 +323,22 @@ def _assert_synced_once(mock_client: MagicMock, *, media_buy_id: str, transport:
     assert body[0]["seller_agent"]["agent_url"] == _SELLER_AGENT_URL
 
 
+def _seed_fire_provider(tenant) -> None:
+    """Register the active TMP provider both dispatch classes fan out to.
+
+    The create and update siblings seeded an identical provider row; extracted
+    so a new required column is a one-site edit (CLAUDE.md DRY invariant,
+    #1197 review). Shares ``_PROVIDER_ENDPOINT`` with ``_assert_synced_once``,
+    which asserts the POST landed on that endpoint.
+    """
+    TMPProviderFactory(
+        tenant=tenant,
+        name="Fire Provider",
+        endpoint=_PROVIDER_ENDPOINT,
+        status="active",
+    )
+
+
 class TestFireTmpSyncDispatched:
     """create_media_buy on each real transport reaches fire_tmp_sync and POSTs.
 
@@ -339,12 +357,7 @@ class TestFireTmpSyncDispatched:
         """create_media_buy via *transport* fires a real POST to the TMP provider."""
         with MediaBuyCreateEnv() as env:
             tenant, _principal, product, _pricing_option = env.setup_media_buy_data()
-            TMPProviderFactory(
-                tenant=tenant,
-                name="Fire Provider",
-                endpoint=_PROVIDER_ENDPOINT,
-                status="active",
-            )
+            _seed_fire_provider(tenant)
             env._commit_factory_data()
 
             with _captured_tmp_sync() as mock_client:
@@ -409,12 +422,7 @@ class TestFireTmpSyncDispatchedOnUpdate:
                 media_buy=media_buy,
                 package_config={"product_id": "prod-001", "name": "Update Package", "is_active": True},
             )
-            TMPProviderFactory(
-                tenant=tenant,
-                name="Fire Provider",
-                endpoint=_PROVIDER_ENDPOINT,
-                status="active",
-            )
+            _seed_fire_provider(tenant)
             env._commit_factory_data()
 
             with _captured_tmp_sync() as mock_client:

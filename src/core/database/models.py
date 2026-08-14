@@ -35,6 +35,7 @@ from sqlalchemy.sql import func
 from src.core.database.json_type import JSONType
 from src.core.exceptions import AdCPConfigurationError
 from src.core.json_validators import JSONValidatorMixin
+from src.core.schemas.tmp_provider import TMPProviderDiscoveryDict
 
 logger = logging.getLogger(__name__)
 
@@ -1486,49 +1487,90 @@ class TMPProvider(Base):
 
         self._auth_credentials = encrypt_api_key(value)
 
-    def to_dict(self, *, include_conditional: bool = True) -> dict:
-        """Serialize provider to a dict matching the TMP Router contract.
+    @property
+    def has_auth_credentials(self) -> bool:
+        """True when a credential is stored, without decrypting it.
 
-        Args:
-            include_conditional: When True (default), include countries/uid_types/
-                properties only if they are non-None.  When False, always include
-                them (as None for legacy rows).
-
-        NOTE — deliberate divergences from the pinned discovery schema.
-        This dict is shared by the admin UI (list/edit views, which need
-        ``name`` to render) and the discovery wire
-        (``GET /tenant/{id}/tmp-providers/discovery``).
-        ``dist/schemas/3.1.1/trusted-match/provider-registration.json`` is a closed
-        object (``additionalProperties: false``, 11 properties), and this wire
-        carries two things that schema does not describe:
-
-          1. ``name`` — not in the schema at all. Kept as a human-readable label
-             for router-side logging/debugging; splitting admin vs. wire
-             serialization would duplicate this method for one field.
-          2. ``countries`` / ``uid_types`` / ``properties`` emitted as ``null``
-             when ``include_conditional=False`` (the mode the discovery route
-             uses). The schema types all three as ``array`` with ``minItems: 1``,
-             so ``null`` is a *type* violation rather than an unknown key — and
-             for ``identity_match: true`` rows its if/then branch requires both
-             ``countries`` and ``uid_types`` non-empty. The router reads ``null``
-             as "no restriction" (see
-             ``test_null_countries_uid_types_for_legacy_rows``).
-
-        Neither divergence is sanctioned by the pin: a closed object grants no
-        tolerant-reader allowance, so a strictly-validating router rejects both.
-        They are accepted because today's only consumer is the TMP Router
-        deployed alongside this agent, which reads the fields it knows. Emitting
-        a schema-valid response means dropping ``name`` and omitting — not
-        nulling — absent conditional fields; left as a follow-up.
-
-        Also not carried: ``tmpx_macros``, the 11th property, added by spec 3.1.1.
-        It declares the provider-namespaced ad-server macro names a provider's
-        TMPX response fills. It is optional in the schema, so omitting it is
-        conformant, and there is no column, admin field, or router consumer for
-        it yet — registering TMPX macros is its own feature, not part of TMP
-        provider registration + package sync.
+        The public presence check for the private ``_auth_credentials`` column.
+        Callers that only need "is a credential set?" (the admin edit form,
+        which renders a placeholder rather than the value) must not reach past
+        the property API into the column, and must not go through the
+        decrypting :attr:`auth_credentials` getter either — that raises on a
+        rotated or corrupted ciphertext, turning a form render into a 500
+        (#1197 review).
         """
-        result: dict = {
+        return self._auth_credentials is not None
+
+    def to_discovery_dict(self) -> TMPProviderDiscoveryDict:
+        """Serialize for the machine wire: ``GET /tenant/{id}/tmp-providers/discovery``.
+
+        Conforms to ``dist/schemas/3.1.1/trusted-match/provider-registration.json``,
+        a closed object (``additionalProperties: false``).  Two consequences that
+        this method — unlike the admin serialization — must respect:
+
+          1. ``name`` is not in the schema, so it is not emitted here.  It stays
+             on :meth:`to_admin_dict` for the Jinja views.  (The TMP Router
+             reads ``name`` only as a fallback identifier when ``provider_id``
+             is empty; this endpoint always emits ``provider_id``, the UUID
+             primary key.)
+          2. ``countries`` / ``uid_types`` / ``properties`` are typed ``array``
+             with ``minItems: 1``, so an absent value is **omitted**, never sent
+             as ``null`` — ``null`` is a type violation, not an unknown key, and
+             for ``identity_match: true`` rows the schema's if/then branch
+             additionally requires ``countries`` and ``uid_types`` non-empty.
+             Consumers read an omitted field as "no restriction" (the router
+             decodes a missing key to a nil slice, exactly as it did the
+             previous ``null``).
+
+        Both divergences were previously emitted and documented as tolerated;
+        a closed object grants no tolerant-reader allowance, so they are now
+        fixed rather than described (#1197 review).
+
+        One residue is a *data* state, not a serialization choice: a legacy
+        ``identity_match: true`` row with no countries/uid_types cannot satisfy
+        the schema's if/then no matter how it is serialized. Every row written
+        through ``TMPProviderRegistration`` is rejected in that state, so this
+        can only arise from rows predating the validator.
+
+        Not carried: ``tmpx_macros``, the schema's remaining optional property
+        (added by 3.1.1). It declares the provider-namespaced ad-server macro
+        names a provider's TMPX response fills. Optional, so omitting it is
+        conformant, and there is no column, admin field, or router consumer for
+        it yet — registering TMPX macros is its own feature.
+        """
+        result = TMPProviderDiscoveryDict(
+            provider_id=self.provider_id,
+            endpoint=self.endpoint,
+            context_match=self.context_match,
+            identity_match=self.identity_match,
+            timeout_ms=self.timeout_ms,
+            priority=self.priority,
+            status=self.status,
+        )
+        # Omit rather than null: see (2) above.
+        if self.countries:
+            result["countries"] = self.countries
+        if self.uid_types:
+            result["uid_types"] = self.uid_types
+        if self.properties:
+            result["properties"] = self.properties
+        return result
+
+    def to_admin_dict(self) -> dict:
+        """Serialize for the admin UI (list + edit views).
+
+        Not the machine wire — see :meth:`to_discovery_dict` for that.  This
+        shape is what the Jinja templates read, so it carries ``name`` and it
+        always includes ``countries`` / ``uid_types`` / ``properties`` (``None``
+        for a row that restricts nothing) rather than omitting them: the edit
+        template renders those three fields unconditionally and the list view
+        distinguishes "no restriction" from "not shown".
+
+        Auth fields are deliberately absent — the edit handler adds
+        ``auth_type`` plus a masked ``auth_credentials`` placeholder itself, so
+        a credential is never serialized here by accident.
+        """
+        return {
             "provider_id": self.provider_id,
             "name": self.name,
             "endpoint": self.endpoint,
@@ -1537,19 +1579,10 @@ class TMPProvider(Base):
             "timeout_ms": self.timeout_ms,
             "priority": self.priority,
             "status": self.status,
+            "countries": self.countries,
+            "uid_types": self.uid_types,
+            "properties": self.properties,
         }
-        if include_conditional:
-            if self.countries:
-                result["countries"] = self.countries
-            if self.uid_types:
-                result["uid_types"] = self.uid_types
-            if self.properties:
-                result["properties"] = self.properties
-        else:
-            result["countries"] = self.countries
-            result["uid_types"] = self.uid_types
-            result["properties"] = self.properties
-        return result
 
 
 class GAMInventory(Base):

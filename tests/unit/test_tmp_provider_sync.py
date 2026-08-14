@@ -20,7 +20,6 @@ from sqlalchemy.orm.exc import DetachedInstanceError
 
 from src.services.tmp_provider_sync import (
     _build_package_payload,
-    _is_local_host,
     _post_packages_sync,
     _resolve_seller_agent_url,
     sync_packages_for_media_buy,
@@ -554,41 +553,14 @@ class TestResolveSellAgentUrl:
 
 
 # ---------------------------------------------------------------------------
-# _is_local_host tests
+# Local-host predicate
 # ---------------------------------------------------------------------------
-
-
-class TestIsLocalHost:
-    """_is_local_host distinguishes real local dev hosts from public hosts
-
-    that merely contain "localhost" as a substring.
-    """
-
-    @pytest.mark.parametrize(
-        "host",
-        [
-            "localhost",
-            "localhost:8001",
-            "tenant.localhost",
-            "tenant.sales-agent.localhost:8001",
-            "127.0.0.1",
-            "127.0.0.1:8000",
-        ],
-    )
-    def test_local_hosts_return_true(self, host):
-        assert _is_local_host(host) is True
-
-    @pytest.mark.parametrize(
-        "host",
-        [
-            "tenant.salesagent.example.com",
-            "my-localhost-mirror.example.com",
-            "example.com",
-            "localhost.evil.com",
-        ],
-    )
-    def test_public_hosts_return_false(self, host):
-        assert _is_local_host(host) is False
+#
+# The predicate itself now lives in src.core.security.url_validator.is_local_host
+# — shared with src/app.py's agent-card scheme choice, which forked from it on
+# *.localhost (#1197 review). Its own cases are in
+# tests/unit/test_ssrf_url_validator.py::TestIsLocalHost; the seller-URL
+# behaviour that depends on it is graded by TestResolveSellAgentUrl above.
 
 
 # ---------------------------------------------------------------------------

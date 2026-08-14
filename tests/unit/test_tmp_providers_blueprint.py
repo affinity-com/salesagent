@@ -7,7 +7,7 @@ Covers:
 - CRUD route responses (list, add GET, deactivate, delete, health check)
 - TMPProviderUoW used instead of raw DB calls
 - @log_admin_action on destructive routes
-- TMPProvider.to_dict() serialization (real model, not mock)
+- TMPProvider.to_admin_dict() serialization (real model, not mock)
 
 Note: Discovery endpoint tests are in test_tmp_providers_discovery_route.py
 (the canonical discovery endpoint is the FastAPI route, not Flask).
@@ -210,6 +210,10 @@ class TestTMPProviderInputValidation:
 
         assert response.status_code == 302
         assert "add" in response.headers.get("Location", "")
+        # The bounce alone doesn't prove the write was suppressed — a regression
+        # that flashes, redirects, AND persists the row would pass on the two
+        # assertions above. Matches the SSRF / identity-match rejection siblings.
+        mock_uow.tmp_providers.create_from_fields.assert_not_called()
 
     def test_add_rejects_missing_name(self):
         """POST /tmp-providers/add without name must redirect with error."""
@@ -232,6 +236,10 @@ class TestTMPProviderInputValidation:
 
         assert response.status_code == 302
         assert "add" in response.headers.get("Location", "")
+        # The bounce alone doesn't prove the write was suppressed — a regression
+        # that flashes, redirects, AND persists the row would pass on the two
+        # assertions above. Matches the SSRF / identity-match rejection siblings.
+        mock_uow.tmp_providers.create_from_fields.assert_not_called()
 
     def test_add_rejects_non_numeric_timeout_ms(self):
         """POST /tmp-providers/add with non-numeric timeout_ms must redirect with error."""
@@ -253,6 +261,10 @@ class TestTMPProviderInputValidation:
 
         assert response.status_code == 302
         assert "add" in response.headers.get("Location", "")
+        # The bounce alone doesn't prove the write was suppressed — a regression
+        # that flashes, redirects, AND persists the row would pass on the two
+        # assertions above. Matches the SSRF / identity-match rejection siblings.
+        mock_uow.tmp_providers.create_from_fields.assert_not_called()
 
     def test_add_rejects_invalid_status(self):
         """POST /tmp-providers/add with invalid status must redirect with error."""
@@ -276,6 +288,10 @@ class TestTMPProviderInputValidation:
 
         assert response.status_code == 302
         assert "add" in response.headers.get("Location", "")
+        # The bounce alone doesn't prove the write was suppressed — a regression
+        # that flashes, redirects, AND persists the row would pass on the two
+        # assertions above. Matches the SSRF / identity-match rejection siblings.
+        mock_uow.tmp_providers.create_from_fields.assert_not_called()
 
     def test_add_passes_status_to_create_from_fields(self):
         """POST /tmp-providers/add with explicit status passes it to create_from_fields."""
@@ -598,13 +614,14 @@ class TestTMPProviderAuthFields:
     def test_edit_get_includes_auth_fields_in_provider_dict(self):
         """GET /tmp-providers/<id>/edit includes auth_type and auth_credentials in template context.
 
-        Uses a real TMPProvider instance (not a MagicMock) so that to_dict() is
-        exercised against the production implementation — avoids the missing-properties
-        regression that was caught in review (same pattern as test_tmp_providers_discovery_route.py).
+        Uses a real TMPProvider instance (not a MagicMock) so that to_admin_dict()
+        and has_auth_credentials are exercised against the production implementation —
+        avoids the missing-properties regression that was caught in review (same
+        pattern as test_tmp_providers_discovery_route.py).
         """
         client = _make_tmp_provider_client()
 
-        # Real TMPProvider instance — to_dict() is the production implementation.
+        # Real TMPProvider instance — to_admin_dict() is the production implementation.
         existing_provider = TMPProvider(
             provider_id="test-uuid-1234",
             tenant_id="default",
@@ -639,7 +656,7 @@ class TestTMPProviderAuthFields:
                         )
 
         assert response.status_code == 200
-        # Production calls to_dict(include_conditional=False) then overwrites
+        # Production calls to_admin_dict() then overwrites
         # list fields with comma-separated strings and adds auth fields with
         # placeholder masking (credentials are never echoed back to the browser).
         mock_render.assert_called_once_with(
@@ -763,7 +780,7 @@ class TestTMPProviderAuthFields:
         )
 
 
-# TestTMPProviderToDict lives in test_tmp_providers_discovery_route.py (the
+# TestTMPProviderSerializers lives in test_tmp_providers_discovery_route.py (the
 # canonical home for model contract tests — uses _tmp_helpers._make_provider).
-# Keeping a second copy here would require parallel edits on every to_dict()
+# Keeping a second copy here would require parallel edits on every serializer
 # change and one copy would inevitably drift (CLAUDE.md DRY invariant).

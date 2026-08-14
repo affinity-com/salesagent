@@ -16,10 +16,13 @@ What remains, and why each is distinct:
 - ``test_no_thread_when_*_raises`` — the *no-fire* contract: a failed create or
   update must not sync. A dispatched test cannot express this as sharply
   (a failed dispatch has no media_buy_id to assert absence against).
-- ``TestFireTmpSyncInternals`` — the ``media_buy_id`` extraction (direct vs
-  inner ``.response``) and the ``if not media_buy_id or not tenant_id`` guard,
-  which is a *silent* no-op on either falsy value. These are pure-function
-  behaviors of ``fire_tmp_sync`` with no transport involved.
+- ``TestFireTmpSyncInternals`` — the ``media_buy_id`` extraction across the
+  members of the result union, and the ``if not media_buy_id or not tenant_id``
+  guard. These are pure-function behaviors of ``fire_tmp_sync`` with no
+  transport involved.  They construct REAL result models: extraction narrows
+  the union with ``isinstance`` (so a rename is a type error rather than a
+  silent switch-off, #1197 review), and a ``MagicMock`` stand-in would take the
+  unrecognised-type branch instead of the one under test.
 
 ``fire_tmp_sync`` accepts a ``ResolvedIdentity`` (not a bare ``tenant_id``
 string) — the tenant_id extraction is centralised inside the function.  The
@@ -30,7 +33,17 @@ beads: salesagent-tmp-sync
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import ANY, MagicMock, patch
+
+from src.core.schemas import Error
+from src.core.schemas._base import (
+    CreateMediaBuyResult,
+    CreateMediaBuySuccess,
+    UpdateMediaBuyError,
+    UpdateMediaBuyResult,
+    UpdateMediaBuySuccess,
+)
 
 
 def _make_identity(tenant_id: str = "tenant-1") -> MagicMock:
@@ -123,28 +136,43 @@ class TestFireTmpSyncOnUpdate:
 
 
 class TestFireTmpSyncInternals:
-    """Unit tests for fire_tmp_sync media_buy_id extraction and thread-spawn logic.
+    """media_buy_id extraction across the result union, plus the tenant guard.
 
-    The function must handle two response shapes:
-    - ``CreateMediaBuyResult`` wrapper: media_buy_id is on ``.response.media_buy_id``
-    - ``UpdateMediaBuySuccess | UpdateMediaBuyError``: media_buy_id is directly on the object
+    ``fire_tmp_sync`` accepts ``CreateMediaBuyResult | UpdateMediaBuyResult |
+    UpdateMediaBuySubmitted``.  Both envelope shapes hold the domain response in
+    ``.response``, and only the ``*Success`` members carry a ``media_buy_id`` —
+    so these tests build real models rather than attribute-carrying mocks.
 
-    ``fire_tmp_sync`` accepts a ``ResolvedIdentity`` (not a bare tenant_id string).
-    The identity mock's ``.tenant_id`` attribute is used for thread args.
+    ``fire_tmp_sync`` accepts a ``ResolvedIdentity`` (not a bare tenant_id
+    string). The identity mock's ``.tenant_id`` attribute is used for thread args.
     """
 
-    def test_spawns_thread_for_direct_media_buy_id(self):
-        """Update path: media_buy_id directly on response — thread is spawned."""
+    @staticmethod
+    def _create_result(media_buy_id: str) -> CreateMediaBuyResult:
+        """A successful create envelope carrying *media_buy_id* on its inner response."""
+        return CreateMediaBuyResult(
+            status="completed",
+            response=CreateMediaBuySuccess(media_buy_id=media_buy_id, packages=[]),
+        )
+
+    @staticmethod
+    def _update_result(media_buy_id: str) -> UpdateMediaBuyResult:
+        """A successful update envelope carrying *media_buy_id* on its inner response."""
+        return UpdateMediaBuyResult(
+            status="completed",
+            response=UpdateMediaBuySuccess(media_buy_id=media_buy_id, affected_packages=[]),
+        )
+
+    def test_spawns_thread_for_update_result(self):
+        """Update path: media_buy_id on the UpdateMediaBuySuccess inner response."""
         from src.services.tmp_provider_sync import fire_tmp_sync
 
-        resp = MagicMock()
-        resp.media_buy_id = "mb-direct-001"
         identity = _make_identity("tenant-1")
 
         with patch("src.services.tmp_provider_sync.threading.Thread") as mock_thread_cls:
             mock_thread = MagicMock()
             mock_thread_cls.return_value = mock_thread
-            fire_tmp_sync(resp, identity)
+            fire_tmp_sync(self._update_result("mb-direct-001"), identity)
 
         mock_thread_cls.assert_called_once_with(
             target=ANY,
@@ -154,28 +182,20 @@ class TestFireTmpSyncInternals:
         )
         mock_thread.start.assert_called_once_with()
 
-    def test_spawns_thread_for_inner_response_media_buy_id(self):
-        """Create path: media_buy_id on .response.media_buy_id — thread is spawned.
+    def test_spawns_thread_for_create_result(self):
+        """Create path: media_buy_id on the CreateMediaBuySuccess inner response.
 
-        CreateMediaBuyResult has no direct media_buy_id — it wraps a
+        CreateMediaBuyResult has no media_buy_id of its own — it wraps a
         CreateMediaBuySuccess in its .response field.
         """
         from src.services.tmp_provider_sync import fire_tmp_sync
-
-        inner = MagicMock()
-        inner.media_buy_id = "mb-inner-001"
-
-        class _WrapperWithNoMediaBuyId:
-            """Minimal stand-in for CreateMediaBuyResult (no media_buy_id attribute)."""
-
-            response = inner
 
         identity = _make_identity("tenant-1")
 
         with patch("src.services.tmp_provider_sync.threading.Thread") as mock_thread_cls:
             mock_thread = MagicMock()
             mock_thread_cls.return_value = mock_thread
-            fire_tmp_sync(_WrapperWithNoMediaBuyId(), identity)
+            fire_tmp_sync(self._create_result("mb-inner-001"), identity)
 
         mock_thread_cls.assert_called_once_with(
             target=ANY,
@@ -185,17 +205,29 @@ class TestFireTmpSyncInternals:
         )
         mock_thread.start.assert_called_once_with()
 
-    def test_no_thread_when_media_buy_id_absent(self):
-        """No thread spawned when neither direct nor inner response has media_buy_id."""
+    def test_no_thread_for_error_response(self):
+        """An error inner response carries no media_buy_id, so nothing is synced."""
         from src.services.tmp_provider_sync import fire_tmp_sync
 
-        class _NoIdResponse:
-            """Response with no media_buy_id anywhere."""
+        result = UpdateMediaBuyResult(
+            status="failed",
+            response=UpdateMediaBuyError(errors=[Error(code="update_failed", message="nope")]),
+        )
+        identity = _make_identity("tenant-1")
+
+        with patch("src.services.tmp_provider_sync.threading.Thread") as mock_thread_cls:
+            fire_tmp_sync(result, identity)
+
+        mock_thread_cls.assert_not_called()
+
+    def test_no_thread_when_response_is_none(self):
+        """A None response (no result to read) syncs nothing."""
+        from src.services.tmp_provider_sync import fire_tmp_sync
 
         identity = _make_identity("tenant-1")
 
         with patch("src.services.tmp_provider_sync.threading.Thread") as mock_thread_cls:
-            fire_tmp_sync(_NoIdResponse(), identity)
+            fire_tmp_sync(None, identity)
 
         mock_thread_cls.assert_not_called()
 
@@ -203,11 +235,8 @@ class TestFireTmpSyncInternals:
         """No thread spawned when identity is None (tenant_id cannot be resolved)."""
         from src.services.tmp_provider_sync import fire_tmp_sync
 
-        resp = MagicMock()
-        resp.media_buy_id = "mb-001"
-
         with patch("src.services.tmp_provider_sync.threading.Thread") as mock_thread_cls:
-            fire_tmp_sync(resp, None)
+            fire_tmp_sync(self._create_result("mb-001"), None)
 
         mock_thread_cls.assert_not_called()
 
@@ -215,28 +244,46 @@ class TestFireTmpSyncInternals:
         """No thread spawned when identity.tenant_id is None."""
         from src.services.tmp_provider_sync import fire_tmp_sync
 
-        resp = MagicMock()
-        resp.media_buy_id = "mb-001"
         identity = MagicMock()
         identity.tenant_id = None
 
         with patch("src.services.tmp_provider_sync.threading.Thread") as mock_thread_cls:
-            fire_tmp_sync(resp, identity)
+            fire_tmp_sync(self._create_result("mb-001"), identity)
 
         mock_thread_cls.assert_not_called()
+
+    def test_unrecognised_result_type_is_logged_not_silent(self, caplog):
+        """A result type outside the union warns instead of vanishing.
+
+        This is the regression the typed extraction exists to surface: if a
+        member is renamed or a new result type reaches fire_tmp_sync, sync stops
+        — and the operator gets a log line naming the type rather than silence
+        (#1197 review).
+        """
+        from src.services.tmp_provider_sync import fire_tmp_sync
+
+        class _NotAResult:
+            pass
+
+        identity = _make_identity("tenant-1")
+
+        with patch("src.services.tmp_provider_sync.threading.Thread") as mock_thread_cls:
+            with caplog.at_level(logging.WARNING, logger="src.services.tmp_provider_sync"):
+                fire_tmp_sync(_NotAResult(), identity)  # type: ignore[arg-type]
+
+        mock_thread_cls.assert_not_called()
+        assert "_NotAResult" in caplog.text
 
     def test_thread_targets_sync_packages_for_media_buy(self):
         """Thread is created with sync_packages_for_media_buy as target and correct args."""
         from src.services.tmp_provider_sync import fire_tmp_sync, sync_packages_for_media_buy
 
-        resp = MagicMock()
-        resp.media_buy_id = "mb-xyz"
         identity = _make_identity("tenant-99")
 
         with patch("src.services.tmp_provider_sync.threading.Thread") as mock_thread_cls:
             mock_thread = MagicMock()
             mock_thread_cls.return_value = mock_thread
-            fire_tmp_sync(resp, identity)
+            fire_tmp_sync(self._update_result("mb-xyz"), identity)
 
         mock_thread_cls.assert_called_once_with(
             target=sync_packages_for_media_buy,

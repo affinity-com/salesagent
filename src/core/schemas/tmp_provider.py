@@ -62,6 +62,8 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "VALID_STATUSES",
     "VALID_UID_TYPES",
+    "TMPDiscoveryResponse",
+    "TMPProviderDiscoveryDict",
     "TMPProviderFields",
     "TMPProviderRegistration",
     "TMPProviderValidationError",
@@ -108,6 +110,55 @@ class TMPProviderFields(TypedDict, total=False):
     status: str
     auth_type: str | None
     auth_credentials: str | None
+
+
+class _TMPProviderDiscoveryRequired(TypedDict):
+    """The always-emitted half of :class:`TMPProviderDiscoveryDict` (see there)."""
+
+    provider_id: str
+    endpoint: str
+    context_match: bool
+    identity_match: bool
+    timeout_ms: int
+    priority: int
+    status: str
+
+
+class TMPProviderDiscoveryDict(_TMPProviderDiscoveryRequired, total=False):
+    """One provider entry on the discovery wire, typed against the closed schema.
+
+    ``dist/schemas/3.1.1/trusted-match/provider-registration.json`` is a closed
+    object (``additionalProperties: false``), so this is the exact key set the
+    discovery endpoint may emit — not a partial view.  The three keys declared
+    here are ``total=False`` because the schema types each as ``array`` with
+    ``minItems: 1``: an absent value must be **omitted**, never sent as ``null``
+    (``null`` is a type violation a strictly-validating router rejects).
+
+    ``name`` is deliberately absent: it is not in the closed schema.  It stays
+    on the admin serialization (:meth:`TMPProvider.to_admin_dict`), which feeds
+    Jinja templates rather than the machine wire (#1197 review).
+
+    ``tmpx_macros`` — the schema's remaining optional property, added by 3.1.1
+    for provider-namespaced ad-server macro names — is not carried: there is no
+    column, admin field, or router consumer for it yet, and omitting an optional
+    property is conformant.
+    """
+
+    countries: list[str]
+    uid_types: list[str]
+    properties: list[str]
+
+
+class TMPDiscoveryResponse(SalesAgentBaseModel):
+    """Body of ``GET /tenant/{tenant_id}/tmp-providers/discovery``.
+
+    Used as the route's ``response_model`` so FastAPI publishes an OpenAPI
+    schema for the discovery contract and validates the outgoing keys, instead
+    of the route hand-building an unvalidated ``JSONResponse`` (#1197 review).
+    """
+
+    tenant_id: str
+    providers: list[TMPProviderDiscoveryDict]
 
 
 class TMPProviderRegistration(SalesAgentBaseModel):

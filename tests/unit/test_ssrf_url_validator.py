@@ -4,14 +4,58 @@ Covers:
 - check_url_ssrf: core validator used across signals agents, webhooks, property lists
 - validate_agent_url: media_buy_create wrapper
 - BLOCKED_HOSTNAMES: Docker-internal and cloud metadata hostname coverage
+- is_local_host: the shared local-dev-host predicate (agent card + TMP seller URL)
 - Flask endpoint-level wiring for signals agents add/edit handlers
 """
 
 import os
 from unittest.mock import MagicMock, patch
 
-from src.core.security.url_validator import BLOCKED_HOSTNAMES, check_url_ssrf
+import pytest
+
+from src.core.security.url_validator import BLOCKED_HOSTNAMES, check_url_ssrf, is_local_host
 from tests.unit._tmp_helpers import make_super_admin_client
+
+
+class TestIsLocalHost:
+    """is_local_host distinguishes real local dev hosts from public hosts.
+
+    The single predicate behind two call sites — the A2A agent card's scheme
+    choice (``src/app.py``) and the TMP seller-agent URL resolver
+    (``src/services/tmp_provider_sync.py``). They forked on ``*.localhost``
+    before it existed, so a per-tenant dev host was public to one and local to
+    the other (#1197 review). Substring-style near misses are covered
+    explicitly: ``my-localhost-mirror.example.com`` and ``localhost.evil.com``
+    must both be public.
+    """
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "localhost",
+            "localhost:8001",
+            "tenant.localhost",
+            "tenant.sales-agent.localhost:8001",
+            "LOCALHOST",
+            "127.0.0.1",
+            "127.0.0.1:8000",
+        ],
+    )
+    def test_local_hosts_return_true(self, host):
+        assert is_local_host(host) is True
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "tenant.salesagent.example.com",
+            "my-localhost-mirror.example.com",
+            "example.com",
+            "localhost.evil.com",
+            "127.0.0.1.evil.com",
+        ],
+    )
+    def test_public_hosts_return_false(self, host):
+        assert is_local_host(host) is False
 
 
 class TestCheckUrlSsrf:

@@ -30,18 +30,25 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, Any
 
 import httpx
+from adcp.types import AvailablePackage, SellerAgentReference
 
 from src.core.database.models import MediaPackage
 from src.core.database.repositories.uow import MediaBuyUoW, TenantConfigUoW, TMPProviderUoW
-from src.core.security.url_validator import sanitize_for_log
+from src.core.schemas._base import (
+    CreateMediaBuyResult,
+    CreateMediaBuySuccess,
+    UpdateMediaBuyResult,
+    UpdateMediaBuySubmitted,
+    UpdateMediaBuySuccess,
+)
+from src.core.security.url_validator import is_local_host, sanitize_for_log
 from src.services._provider_http import bearer_headers, provider_client_kwargs, provider_url
 
 if TYPE_CHECKING:
     from src.core.resolved_identity import ResolvedIdentity
-    from src.core.schemas._base import CreateMediaBuyResult, UpdateMediaBuyResult, UpdateMediaBuySubmitted
 
 logger = logging.getLogger(__name__)
 
@@ -69,10 +76,9 @@ def fire_tmp_sync(
 
     ``response`` is whatever the two ``_impl`` functions return:
     ``CreateMediaBuyResult`` (create path) or
-    ``UpdateMediaBuyResult | UpdateMediaBuySubmitted`` (update path). The
-    ``TaskResultEnvelope`` shapes serialize flat but store the domain response in
-    their ``.response`` field — ``media_buy_id`` lives there, not on the wrapper.
-    Uses ``getattr`` with an inner-response fallback to handle both shapes.
+    ``UpdateMediaBuyResult | UpdateMediaBuySubmitted`` (update path).  The id is
+    read by ``_extract_media_buy_id`` as a typed attribute after narrowing the
+    union, never by attribute name — see that function.
 
     Keep this union in step with those two return annotations: it is what caught
     the update path's type change when the pin moved to adcp 6.6.0 / spec 3.1.1
@@ -84,17 +90,19 @@ def fire_tmp_sync(
     callers don't need to repeat ``identity.tenant_id if identity else None`` at
     every call site (four transport wrappers).
 
-    No-ops silently when ``media_buy_id`` or ``tenant_id`` is absent (e.g. on
-    error responses that carry no ID).
+    No-ops when ``media_buy_id`` or ``tenant_id`` is absent (e.g. on error or
+    submitted responses, which carry no ID); every no-op is logged.
     """
     tenant_id = identity.tenant_id if identity is not None else None
 
-    media_buy_id = getattr(response, "media_buy_id", None)
-    if media_buy_id is None:
-        inner = getattr(response, "response", None)
-        media_buy_id = getattr(inner, "media_buy_id", None)
+    media_buy_id = _extract_media_buy_id(response)
 
     if not media_buy_id or not tenant_id:
+        if media_buy_id and not tenant_id:
+            logger.warning(
+                "[TMP sync] Skipping sync for media_buy=%s — no tenant on the resolved identity",
+                media_buy_id,
+            )
         return
 
     t = threading.Thread(
@@ -104,6 +112,54 @@ def fire_tmp_sync(
         name=f"tmp-sync-{media_buy_id}",
     )
     t.start()
+
+
+def _extract_media_buy_id(
+    response: CreateMediaBuyResult | UpdateMediaBuyResult | UpdateMediaBuySubmitted | None,
+) -> str | None:
+    """Read ``media_buy_id`` off a media-buy result as a *typed* attribute.
+
+    The union is narrowed with ``isinstance`` and the id is read from the
+    concrete member, so renaming ``media_buy_id`` on any member is a type-check
+    error here.  The previous ``getattr(response, "media_buy_id", None)`` dodged
+    the union entirely: a rename would have switched TMP sync off on all four
+    transports with no error and no log line — the exact regression the union
+    annotation exists to prevent (#1197 review).
+
+    Only the ``*Success`` members carry an id.  ``*Error`` and ``*Submitted``
+    have no ``media_buy_id`` field at all, so "no id" is the correct, expected
+    outcome there — logged at DEBUG.  An unrecognised type is a contract drift
+    rather than an expected shape, so it is logged at WARNING instead of
+    vanishing.
+
+    ``CreateMediaBuyResult`` / ``UpdateMediaBuyResult`` are ``TaskResultEnvelope``
+    shapes: they serialize flat but store the domain response in ``.response``,
+    so the id lives on the inner model, not the envelope.
+    """
+    if response is None:
+        return None
+
+    if isinstance(response, CreateMediaBuyResult | UpdateMediaBuyResult):
+        inner = response.response
+        if isinstance(inner, CreateMediaBuySuccess | UpdateMediaBuySuccess):
+            return inner.media_buy_id
+        logger.debug(
+            "[TMP sync] No media_buy_id on %s.response (%s) — skipping sync",
+            type(response).__name__,
+            type(inner).__name__,
+        )
+        return None
+
+    if isinstance(response, UpdateMediaBuySubmitted):
+        logger.debug("[TMP sync] Update submitted for async completion — no media_buy_id yet, skipping sync")
+        return None
+
+    logger.warning(
+        "[TMP sync] Unrecognised media-buy result type %s — skipping sync. "
+        "Add it to fire_tmp_sync's union and to _extract_media_buy_id.",
+        type(response).__name__,
+    )
+    return None
 
 
 def _resolve_seller_agent_url(tenant_id: str) -> str | None:
@@ -150,7 +206,7 @@ def _resolve_seller_agent_url(tenant_id: str) -> str | None:
             tenant = uow.tenant_config.get_tenant()
             if tenant and tenant.virtual_host:
                 host = tenant.virtual_host
-                if not _is_local_host(host):
+                if not is_local_host(host):
                     return f"https://{host}/mcp"
     except Exception:
         logger.warning(
@@ -171,68 +227,42 @@ def _resolve_seller_agent_url(tenant_id: str) -> str | None:
     return None
 
 
-def _is_local_host(host: str) -> bool:
-    """True if *host* (a hostname, optionally with ``:port``) is a local dev host.
-
-    Uses exact equality / suffix checks rather than substring tests.
-    A substring test (``"localhost" not in host``) misclassifies a host like
-    ``my-localhost-mirror.example.com`` as local.  Likewise,
-    ``hostname.startswith("127.0.0.1")`` misclassifies ``127.0.0.1.evil.com``
-    as loopback — use ``== "127.0.0.1"`` instead.
-    """
-    hostname = host.split(":", 1)[0]
-    return hostname == "localhost" or hostname.endswith(".localhost") or hostname == "127.0.0.1"
-
-
-class SellerAgentRef(TypedDict):
-    """``seller_agent`` object per ``dist/schemas/3.1.1/core/seller-agent-ref.json``."""
-
-    agent_url: str
-
-
-class AvailablePackagePayload(TypedDict):
-    """One ``POST /packages/sync`` body element.
-
-    Names the exact three keys ``dist/schemas/3.1.1/trusted-match/available-package.json``
-    requires — the schema sets ``additionalProperties: false``, so this is a
-    closed shape, not a partial one.  ``dict[str, Any]`` left the key set
-    documented only in prose (#1197 review).
-    """
-
-    package_id: str
-    media_buy_id: str
-    seller_agent: SellerAgentRef
-
-
 def _build_package_payload(
     media_buy_id: str,
     pkg_row: MediaPackage,
     seller_agent_url: str,
-) -> AvailablePackagePayload:
+) -> dict[str, Any]:
     """Build the POST /packages/sync payload from a MediaPackage DB row.
 
-    Conforms to ``dist/schemas/3.1.1/trusted-match/available-package.json``
-    (AdCP 3.1.1), which has ``additionalProperties: false`` and
-    requires exactly: ``package_id``, ``media_buy_id``, ``seller_agent``.
-    Optional fields allowed by the schema: ``format_ids``, ``catalogs``.
+    The body is produced by the pinned SDK's ``AvailablePackage`` — the codegen
+    of ``dist/schemas/3.1.1/trusted-match/available-package.json`` — rather than
+    a hand-written TypedDict copy.  The schema is closed
+    (``additionalProperties: false``) and requires exactly ``package_id``,
+    ``media_buy_id``, ``seller_agent``; ``format_ids`` and ``catalogs`` are the
+    optional members.  Constructing the model validates the shape here, and a
+    spec bump that renames or adds a required field becomes a construction
+    error instead of silently shipping the old body (#1197 review).
 
-    ``seller_agent`` is a structured object per
-    ``dist/schemas/3.1.1/core/seller-agent-ref.json``:
-      ``{"agent_url": "<https://...>"}``
+    ``seller_agent`` is ``SellerAgentReference``
+    (``dist/schemas/3.1.1/core/seller-agent-ref.json``): ``{"agent_url": ...}``,
+    whose ``agent_url`` MUST use the ``https://`` scheme.  Callers must resolve a
+    valid https URL before calling this (see ``_resolve_seller_agent_url``); an
+    invalid one raises out of the model rather than reaching a provider.
 
-    ``agent_url`` MUST use the ``https://`` scheme per the spec.  Callers
-    must ensure ``seller_agent_url`` is a valid https URL before calling
-    this function (see ``_resolve_seller_agent_url``).
+    ``mode="json"`` renders ``AnyUrl`` as a plain string so the result is
+    directly JSON-serializable; ``exclude_none=True`` drops the optional
+    members (and ``seller_agent.id``, reserved and unpopulated per the spec)
+    so the emitted object stays inside the closed key set.
     """
-    return AvailablePackagePayload(
+    return AvailablePackage(
         package_id=pkg_row.package_id,
         media_buy_id=media_buy_id,
         # seller_agent is required by the schema; agent_url MUST be https.
-        seller_agent=SellerAgentRef(agent_url=seller_agent_url),
-    )
+        seller_agent=SellerAgentReference(agent_url=seller_agent_url),
+    ).model_dump(mode="json", exclude_none=True)
 
 
-def _post_packages_sync(endpoint: str, payloads: list[AvailablePackagePayload], auth_credentials: str = "") -> None:
+def _post_packages_sync(endpoint: str, payloads: list[dict[str, Any]], auth_credentials: str = "") -> None:
     """POST /packages/sync to a single TMP Provider endpoint.
 
     Sends the full list as a JSON array.  The TMP Provider's handler accepts

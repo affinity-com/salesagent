@@ -10,7 +10,7 @@ it independently.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TypedDict
 
 # Default timeout for synchronous package-sync calls (seconds).
 # Kept short — TMP Provider is an internal service on the same network.
@@ -45,7 +45,19 @@ def bearer_headers(auth_credentials: str) -> dict[str, str]:
     return {}
 
 
-def provider_client_kwargs(timeout: float = _DEFAULT_SYNC_TIMEOUT_SECONDS) -> dict[str, Any]:
+class ProviderClientKwargs(TypedDict):
+    """The exact ``httpx`` client kwargs every outbound TMP Provider call sets.
+
+    A closed two-key contract, so the ``**``-unpack into ``httpx.Client(...)``
+    is checked: ``dict[str, Any]`` gave the call sites nothing to check against
+    and left the key set documented only in prose (#1197 review).
+    """
+
+    timeout: float
+    follow_redirects: bool
+
+
+def provider_client_kwargs(timeout: float = _DEFAULT_SYNC_TIMEOUT_SECONDS) -> ProviderClientKwargs:
     """Return shared ``httpx.Client`` / ``httpx.AsyncClient`` constructor kwargs.
 
     Centralises the two flags that every outbound TMP Provider call must set:
@@ -69,4 +81,4 @@ def provider_client_kwargs(timeout: float = _DEFAULT_SYNC_TIMEOUT_SECONDS) -> di
         async with httpx.AsyncClient(**provider_client_kwargs(timeout=5)) as client:
             resp = await client.get(health_url)
     """
-    return {"timeout": timeout, "follow_redirects": False}
+    return ProviderClientKwargs(timeout=timeout, follow_redirects=False)

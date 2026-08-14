@@ -46,6 +46,7 @@ Usage::
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from unittest.mock import MagicMock
 
 from src.core.database.models import TMPProvider
@@ -55,7 +56,7 @@ from src.core.database.models import TMPProvider
 _UNSET = object()
 
 
-def _mock_cm(inner: MagicMock) -> MagicMock:
+def _mock_cm(inner: MagicMock, *, on_exit: Callable[..., bool] | None = None) -> MagicMock:
     """Wrap *inner* in a mock class whose instances are context managers yielding it.
 
     The one primitive every UoW factory below is built on::
@@ -64,13 +65,23 @@ def _mock_cm(inner: MagicMock) -> MagicMock:
         with patch("...TMPProviderUoW", mock_uow_cls):
             ...          # production's `with TMPProviderUoW(t) as uow:` yields mock_uow
 
+    ``on_exit`` replaces the default no-op ``__exit__`` for tests that need to
+    observe the close — e.g. flipping a flag so a fake provider can raise
+    ``DetachedInstanceError`` once the UoW has closed.  It must return falsy so
+    exceptions still propagate, like the default.  Without it those tests
+    hand-rolled the ``__enter__`` / ``__exit__`` pair this function exists to
+    own (CLAUDE.md DRY invariant, #1197 review).
+
     Before this existed, the identical ``.__enter__`` / ``.__exit__`` assignment
     pair was re-typed in every factory here and hand-rolled again in
-    ``test_tmp_health_scheduler.py`` (CLAUDE.md DRY invariant, #1197 review).
+    ``test_tmp_health_scheduler.py``.
     """
     mock_cls = MagicMock()
     mock_cls.return_value.__enter__ = MagicMock(return_value=inner)
-    mock_cls.return_value.__exit__ = MagicMock(return_value=False)
+    if on_exit is None:
+        mock_cls.return_value.__exit__ = MagicMock(return_value=False)
+    else:
+        mock_cls.return_value.__exit__ = MagicMock(side_effect=on_exit)
     return mock_cls
 
 

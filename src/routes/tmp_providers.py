@@ -19,13 +19,13 @@ Accepted auth headers (any one is sufficient):
   - ``X-API-Key: <key>``
   - ``Authorization: Bearer <key>``
 
-Response schema (mirrors the plan's discovery response format):
+Response schema — ``TMPDiscoveryResponse``.  Each provider entry is the closed
+key set of ``dist/schemas/3.1.1/trusted-match/provider-registration.json``:
 {
   "tenant_id": "si-host",
   "providers": [
     {
       "provider_id": "<uuid>",
-      "name": "si-agent-demo",
       "endpoint": "http://si-agent.localhost:3003",
       "context_match": true,
       "identity_match": true,
@@ -38,6 +38,12 @@ Response schema (mirrors the plan's discovery response format):
   ]
 }
 
+``countries`` / ``uid_types`` / ``properties`` are omitted — not ``null`` — when
+the provider restricts nothing: the schema types all three ``array`` with
+``minItems: 1``.  ``name`` is not on this wire at all (it is not in the closed
+schema); it lives on the admin serialization.  See
+``TMPProvider.to_discovery_dict``.
+
 Only providers whose status is 'active' or 'draining' are returned.
 Providers with status 'inactive' are excluded entirely.
 """
@@ -49,7 +55,6 @@ import os
 import secrets
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse
 
 from src.core.database.repositories.uow import TMPProviderUoW
 from src.core.exceptions import (
@@ -59,6 +64,7 @@ from src.core.exceptions import (
     AdCPServiceUnavailableError,
 )
 from src.core.http_utils import parse_bearer_token as _parse_bearer_token
+from src.core.schemas.tmp_provider import TMPDiscoveryResponse
 from src.core.security.url_validator import sanitize_for_log
 
 logger = logging.getLogger(__name__)
@@ -128,12 +134,18 @@ async def require_api_key(request: Request) -> None:
         )
 
 
-@router.get("/tenant/{tenant_id}/tmp-providers/discovery")
-async def tmp_providers_discovery(tenant_id: str, _: None = Depends(require_api_key)) -> JSONResponse:
+@router.get("/tenant/{tenant_id}/tmp-providers/discovery", response_model=TMPDiscoveryResponse)
+async def tmp_providers_discovery(tenant_id: str, _: None = Depends(require_api_key)) -> TMPDiscoveryResponse:
     """Return the active TMP provider set for a tenant.
 
     Polled by the TMP Router every 30 s.  Requires API key authentication
     via ``TMP_DISCOVERY_API_KEYS`` (fail-closed: returns 500 when unset).
+
+    Returns the typed :class:`TMPDiscoveryResponse` rather than a hand-built
+    ``JSONResponse``: FastAPI then publishes an OpenAPI schema for this
+    versioned contract and validates the outgoing keys against
+    ``provider-registration.json``'s closed key set, which an unvalidated
+    ``JSONResponse`` did not (#1197 review).
 
     Lifecycle filtering:
       active   → included
@@ -172,10 +184,10 @@ async def tmp_providers_discovery(tenant_id: str, _: None = Depends(require_api_
 
         providers = uow.tmp_providers.list_syncable()
 
-        # include_conditional=False: the TMP Router expects countries/uid_types
-        # to always be present in the response shape (see TMPProvider.to_dict
-        # docstring for the full contract, including the tolerated `name` field).
-        provider_list = [p.to_dict(include_conditional=False) for p in providers]
+        # to_discovery_dict() is the machine-wire serializer: the closed key set
+        # of provider-registration.json, with absent conditional arrays omitted
+        # rather than nulled. The admin views use to_admin_dict() instead.
+        provider_list = [p.to_discovery_dict() for p in providers]
 
     logger.debug(
         "[TMP discovery] tenant=%s returned %d provider(s)",
@@ -183,9 +195,4 @@ async def tmp_providers_discovery(tenant_id: str, _: None = Depends(require_api_
         len(provider_list),
     )
 
-    return JSONResponse(
-        content={
-            "tenant_id": tenant_id,
-            "providers": provider_list,
-        }
-    )
+    return TMPDiscoveryResponse(tenant_id=tenant_id, providers=provider_list)

@@ -47,6 +47,36 @@ BLOCKED_HOSTNAMES = {
 }
 
 
+def is_local_host(host: str) -> bool:
+    """True if *host* (a hostname, optionally with ``:port``) is a local dev host.
+
+    The single local-host predicate in the codebase.  Two call sites need it and
+    they must not disagree:
+
+    - ``src/app.py`` (``_create_dynamic_agent_card``) — picks ``http`` vs
+      ``https`` for the advertised A2A agent-card URL when no
+      ``X-Forwarded-Proto`` is present.
+    - ``src/services/tmp_provider_sync.py`` (``_resolve_seller_agent_url``) —
+      skips a tenant ``virtual_host`` that cannot produce a valid https
+      ``seller_agent.agent_url``.
+
+    Both answer the same question ("can this host serve https?"), so they share
+    one implementation; before this existed they forked on ``*.localhost``
+    (``tenant.localhost`` was public to one and local to the other, #1197 review).
+
+    Uses exact equality / suffix checks rather than substring tests: a substring
+    test (``"localhost" in host``) misclassifies ``my-localhost-mirror.example.com``
+    as local, and ``host.startswith("127.0.0.1")`` misclassifies
+    ``127.0.0.1.evil.com`` as loopback.
+
+    Note this is a *deployment-shape* predicate, not a security boundary — SSRF
+    checks live in :func:`check_url_ssrf`, which resolves DNS and rejects the
+    whole loopback/private range rather than these three literal forms.
+    """
+    hostname = host.split(":", 1)[0].lower()
+    return hostname == "localhost" or hostname.endswith(".localhost") or hostname == "127.0.0.1"
+
+
 def check_url_ssrf(url: str, *, require_https: bool = False) -> tuple[bool, str]:
     """Check a URL for SSRF safety.
 
