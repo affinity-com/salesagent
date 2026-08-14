@@ -50,8 +50,8 @@ from a2a.types import (
 from a2a.utils.errors import A2AError
 from adcp import create_a2a_webhook_payload
 from adcp.types import ContextObject, CreativeAsset, GeneratedTaskStatus
+from adcp.types.base import AdCPBaseModel
 from google.protobuf import json_format, struct_pb2
-from pydantic import BaseModel
 
 from src.core.audit_logger import get_audit_logger
 from src.core.auth import AUTH_REQUIRED_SUGGESTION
@@ -112,9 +112,48 @@ from src.core.validation_helpers import (
     adcp_validation_boundary,
 )
 from src.core.version import get_version
+from src.core.webhook_validator import (
+    reject_unsafe_webhook_registration_url,
+    webhook_ssrf_suggestion,
+    webhook_url_for_log,
+)
 from src.services.protocol_webhook_service import get_protocol_webhook_service
 
 logger = logging.getLogger(__name__)
+
+
+def _invalid_params_from_ssrf_error(exc: Exception) -> InvalidParamsError:
+    """Wrap an SSRF rejection as A2A InvalidParamsError with AdCP ``data`` envelope."""
+    if isinstance(exc, AdCPValidationError):
+        adcp_err = exc
+    else:
+        adcp_err = AdCPValidationError(
+            str(exc),
+            field="push_notification_config.url",
+            suggestion=webhook_ssrf_suggestion(),
+            recovery="correctable",
+        )
+    return InvalidParamsError(
+        message=adcp_err.message,
+        data=build_two_layer_error_envelope(adcp_err),
+    )
+
+
+def _reject_unsafe_a2a_webhook_url(url: str) -> None:
+    """Raise InvalidParamsError when ``url`` fails the registration SSRF gate.
+
+    A2A push-config endpoints (message/send configuration, setTaskPushNotificationConfig)
+    translate SSRF failures to ``InvalidParamsError`` (-32602) while attaching the
+    two-layer AdCP envelope in ``data`` (``VALIDATION_ERROR`` / ``recovery=correctable``
+    + suggestion) — same pattern as the auth rejection on ``on_message_send``.
+    Delegates to ``reject_unsafe_webhook_registration_url`` so recovery/suggestion/field
+    cannot drift from the tool-path gate. AdCP tool wrappers raise ``AdCPValidationError``
+    directly for the same helper.
+    """
+    try:
+        reject_unsafe_webhook_registration_url(url, field="push_notification_config.url")
+    except AdCPValidationError as e:
+        raise _invalid_params_from_ssrf_error(e) from e
 
 
 def _dict_to_value(d: dict) -> struct_pb2.Value:
@@ -437,90 +476,17 @@ class AdCPRequestHandler(RequestHandler):
                 "task_type": skills[0] if skills else "unknown",
             }
 
-            await push_notification_service.send_notification(
+            sent = await push_notification_service.send_notification(
                 push_notification_config=push_notification_config, payload=payload, metadata=metadata
             )
+            if not sent:
+                logger.warning(
+                    "Protocol webhook not delivered for task %s (send_notification returned False)",
+                    task.id,
+                )
         except Exception as e:
             # Don't fail the task if webhook fails
             logger.warning("Failed to send protocol-level webhook for task %s: %s", task.id, e)
-
-    def _reconstruct_response_object(self, skill_name: str, data: dict) -> Any:
-        """Reconstruct a response object from skill result data to call __str__().
-
-        Args:
-            skill_name: Name of the skill that produced the result
-            data: Dictionary containing the response data
-
-        Returns:
-            Reconstructed response object, or None if reconstruction fails
-        """
-        try:
-            # Import response classes - for union types, import the concrete variants
-            from src.core.schemas import (
-                CreateMediaBuyError,
-                CreateMediaBuySuccess,
-                GetMediaBuyDeliveryResponse,
-                GetMediaBuysResponse,
-                GetProductsResponse,
-                ListAccountsResponse,
-                ListAuthorizedPropertiesResponse,
-                ListCreativeFormatsResponse,
-                ListCreativesResponse,
-                SyncAccountsResponse,
-                SyncCreativesResponse,
-                UpdateMediaBuyError,
-                UpdateMediaBuySubmitted,
-                UpdateMediaBuySuccess,
-            )
-
-            # For union types (CreateMediaBuyResponse, UpdateMediaBuyResponse),
-            # determine which concrete class based on data content
-            if skill_name == "create_media_buy":
-                # Success responses have media_buy_id, error responses have errors.
-                # No CreateMediaBuySubmitted branch on purpose: submitted results
-                # take the status=="submitted" early-return in on_message_send
-                # (Task state=SUBMITTED, no artifacts) BEFORE artifact/text
-                # reconstruction, so a submitted body can never reach here —
-                # same control-flow fact as update_media_buy (PR #1567 round-2 follow-up).
-                if "media_buy_id" in data:
-                    return CreateMediaBuySuccess(**data)
-                else:
-                    return CreateMediaBuyError(**data)
-            elif skill_name == "update_media_buy":
-                # Submitted (pending-approval) responses carry status="submitted" + task_id
-                # and no applied media_buy_id; success responses have media_buy_id; error
-                # responses have errors. Check submitted first — a submitted envelope must not
-                # be mis-reconstructed as UpdateMediaBuySuccess (whose status is Literal completed).
-                # NB: on the normal path a submitted result takes the status=="submitted"
-                # early-return in on_message_send (Task state=SUBMITTED, no artifacts) BEFORE
-                # artifact/text reconstruction reaches here (PR #1567 round-2); this branch is a
-                # defensive backstop guarded by test_a2a_update_media_buy_submitted_guard.py.
-                if data.get("status") == "submitted":
-                    return UpdateMediaBuySubmitted(**data)
-                elif "media_buy_id" in data:
-                    return UpdateMediaBuySuccess(**data)
-                else:
-                    return UpdateMediaBuyError(**data)
-
-            # Non-union response types - use the concrete class directly
-            response_map: dict[str, type] = {
-                "get_media_buy_delivery": GetMediaBuyDeliveryResponse,
-                "get_media_buys": GetMediaBuysResponse,
-                "get_products": GetProductsResponse,
-                "list_accounts": ListAccountsResponse,
-                "sync_accounts": SyncAccountsResponse,
-                "list_authorized_properties": ListAuthorizedPropertiesResponse,
-                "list_creative_formats": ListCreativeFormatsResponse,
-                "list_creatives": ListCreativesResponse,
-                "sync_creatives": SyncCreativesResponse,
-            }
-
-            response_class = response_map.get(skill_name)
-            if response_class:
-                return response_class(**data)
-        except Exception as e:
-            logger.debug("Could not reconstruct response object for %s: %s", skill_name, e)
-        return None
 
     async def on_message_send(
         self,
@@ -574,14 +540,12 @@ class AdCPRequestHandler(RequestHandler):
         msg_id = params.message.message_id or None
         context_id = params.message.context_id or msg_id or f"ctx_{task_id}"
 
-        # Extract push notification config from protocol layer (A2A SendMessageConfiguration)
+        # Extract push notification config from protocol layer (A2A SendMessageConfiguration).
+        # SSRF gate runs after auth resolution below (defense-in-depth: AUTH_REQUIRED
+        # before scheme/blocked-host checks when the request requires credentials).
         push_notification_config: TaskPushNotificationConfig | None = None
         if params.HasField("configuration") and params.configuration.HasField("task_push_notification_config"):
             push_notification_config = params.configuration.task_push_notification_config
-            if push_notification_config.url:
-                logger.info(
-                    f"Protocol-level push notification config provided for task {task_id}: {push_notification_config.url}"
-                )
 
         # Prepare task metadata (JSON-serializable only — protobuf Struct)
         task_metadata: dict[str, Any] = {
@@ -597,9 +561,6 @@ class AdCPRequestHandler(RequestHandler):
             status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
             metadata=_dict_to_struct(task_metadata),
         )
-        # Store push notification config outside protobuf metadata (not JSON-serializable)
-        if push_notification_config:
-            self._task_push_configs[task_id] = push_notification_config
         self.tasks[task_id] = task
 
         try:
@@ -632,6 +593,18 @@ class AdCPRequestHandler(RequestHandler):
                         )
                     ),
                 )
+
+            # SSRF-reject unsafe push URLs after the auth-required gate so callers
+            # that need credentials see AUTH_REQUIRED before scheme/blocked-host checks.
+            if push_notification_config and push_notification_config.url:
+                _reject_unsafe_a2a_webhook_url(push_notification_config.url)
+                logger.info(
+                    "Protocol-level push notification config provided for task %s: %s",
+                    task_id,
+                    webhook_url_for_log(push_notification_config.url),
+                )
+            if push_notification_config:
+                self._task_push_configs[task_id] = push_notification_config
 
             # ── Transport boundary: resolve identity ONCE ──
             # Like REST's _resolve_auth(), identity is resolved here and passed
@@ -733,14 +706,18 @@ class AdCPRequestHandler(RequestHandler):
 
                     # Generate human-readable text from response __str__()
                     # Per A2A spec, use TextPart + DataPart pattern (not description field)
+                    #
+                    # The text is READ from the payload, never re-derived from it:
+                    # _stamp_a2a_protocol_fields already stamped str(response) onto
+                    # artifact_data["message"] at serialization time. An outbound
+                    # payload is finished — feeding it back through Model(**data)
+                    # to recover the same string handed pydantic before-validators
+                    # a reference to the dict about to go on the wire, and one of
+                    # them mutated it in place (the list_creatives format_id
+                    # bare-string defect). Nothing rebuilds an outbound payload.
                     text_message = None
                     if res["success"] and isinstance(artifact_data, dict):
-                        try:
-                            response_obj = self._reconstruct_response_object(res["skill"], artifact_data)
-                            if response_obj and hasattr(response_obj, "__str__"):
-                                text_message = str(response_obj)
-                        except Exception:
-                            logger.debug("Response reconstruction failed, skipping text part", exc_info=True)
+                        text_message = artifact_data.get("message")
 
                     # Build parts list per A2A spec: optional text Part + required data Part
                     parts = []
@@ -1204,23 +1181,30 @@ class AdCPRequestHandler(RequestHandler):
             if not url:
                 raise InvalidParamsError(message="Missing required parameter: url")
 
+            _reject_unsafe_a2a_webhook_url(url)
+
             auth_type = None
             auth_token_value = None
             if params.HasField("authentication"):
                 auth_type = params.authentication.scheme or None
                 auth_token_value = params.authentication.credentials or None
 
-            with PushNotificationConfigUoW(tool_context.tenant_id) as uow:
-                assert uow.push_notification_configs is not None
-                _config, created = uow.push_notification_configs.upsert(
-                    config_id=config_id,
-                    principal_id=tool_context.principal_id,
-                    url=url,
-                    authentication_type=auth_type,
-                    authentication_token=auth_token_value,
-                    validation_token=validation_token,
-                    session_id=None,
-                )
+            try:
+                with PushNotificationConfigUoW(tool_context.tenant_id) as uow:
+                    assert uow.push_notification_configs is not None
+                    _config, created = uow.push_notification_configs.upsert(
+                        config_id=config_id,
+                        principal_id=tool_context.principal_id,
+                        url=url,
+                        authentication_type=auth_type,
+                        authentication_token=auth_token_value,
+                        validation_token=validation_token,
+                        session_id=None,
+                    )
+            except ValueError as e:
+                # Repository SSRF gate (defense in depth) — same enveloped path as
+                # _reject_unsafe_a2a_webhook_url above.
+                raise _invalid_params_from_ssrf_error(e) from e
 
             logger.info(
                 f"Push notification config {'created' if created else 'updated'}: {config_id} for tenant {tool_context.tenant_id}"
@@ -1363,19 +1347,57 @@ class AdCPRequestHandler(RequestHandler):
         raise UnsupportedOperationError(message="Extended agent card not supported")
 
     @staticmethod
-    def _serialize_for_a2a(response: BaseModel | dict) -> dict:
+    def _stamp_a2a_protocol_fields(response: AdCPBaseModel) -> dict[str, Any]:
+        """Dump a Pydantic response and stamp the A2A protocol fields onto it.
+
+        ``message`` and ``success`` are not spec fields on any response
+        model — they are A2A transport-envelope markers (like MCP's
+        ``task_id``/``adcp_version``; see
+        ``tests/integration/test_harness_wire_response.py::ENVELOPE_MARKERS``),
+        a deliberate A2A-binding deviation (#1868 review).
+        ``success`` is derived from ``errors`` so a response carrying
+        per-item errors reports ``success=False`` uniformly, regardless of
+        which caller stamped it.
+
+        Single point for this derivation — three sites used to duplicate it
+        inline, and two of the three (the get_products explicit-skill and
+        NL handlers, which need the dict pre-stamped before
+        ``apply_version_compat`` sees it) omitted the errors-derivation
+        entirely, always forcing ``success=True``.
+
+        Args:
+            response: Pydantic model from a skill handler.
+
+        Returns:
+            Dict with ``message``/``success`` stamped, ready for A2A.
+        """
+        response_data = response.model_dump(mode="json")
+        response_data["message"] = str(response)
+
+        # Derive success from errors field if present, default True otherwise
+        if "errors" in response_data:
+            response_data["success"] = not bool(response_data["errors"])
+        else:
+            response_data.setdefault("success", True)
+
+        return response_data
+
+    @staticmethod
+    def _serialize_for_a2a(response: AdCPBaseModel | dict) -> dict[str, Any]:
         """Serialize a handler response for A2A protocol at the framework boundary.
 
         Single serialization point for all explicit-skill A2A responses.
 
         - Pydantic models: serialized via ``model_dump(mode="json")`` here,
-          and the protocol fields (``message``, ``success``) are added.
+          and the protocol fields (``message``, ``success``) are added via
+          ``_stamp_a2a_protocol_fields``.
         - Dicts: passed through. Only skill handlers that pre-apply version
           compat (e.g., ``_handle_get_products_skill`` calls
           ``apply_version_compat`` and emits a dict already populated with
-          ``message``/``success``) use this path. Error dicts that bypass
-          the envelope contract were retired in this PR — NL handlers now
-          raise typed ``AdCPError`` instead.
+          ``message``/``success`` via ``_stamp_a2a_protocol_fields``) use
+          this path. Error dicts that bypass the envelope contract were
+          retired in this PR — NL handlers now raise typed ``AdCPError``
+          instead.
 
         Args:
             response: Pydantic model OR pre-serialized dict from a skill
@@ -1387,16 +1409,7 @@ class AdCPRequestHandler(RequestHandler):
         if isinstance(response, dict):
             return response
 
-        response_data = response.model_dump(mode="json")
-        response_data["message"] = str(response)
-
-        # Derive success from errors field if present, default True otherwise
-        if "errors" in response_data:
-            response_data["success"] = not bool(response_data["errors"])
-        else:
-            response_data.setdefault("success", True)
-
-        return response_data
+        return AdCPRequestHandler._stamp_a2a_protocol_fields(response)
 
     async def _handle_explicit_skill(
         self,
@@ -1556,13 +1569,9 @@ class AdCPRequestHandler(RequestHandler):
         if isinstance(response, dict):
             response_data = response
         else:
-            # Capture human-readable message before converting to dict
-            message = str(response)
-            response_data = response.model_dump(mode="json")
-            # Add protocol fields that _serialize_for_a2a would add for Pydantic models,
-            # since returning a dict bypasses that logic
-            response_data["message"] = message
-            response_data.setdefault("success", True)
+            # Stamp protocol fields (message, success) before apply_version_compat
+            # sees the dict, since a dict bypasses _serialize_for_a2a's own stamping.
+            response_data = self._stamp_a2a_protocol_fields(response)
         return apply_version_compat("get_products", response_data, adcp_version)
 
     async def _handle_create_media_buy_skill(
@@ -2104,11 +2113,10 @@ class AdCPRequestHandler(RequestHandler):
         # Convert to A2A response format with v2.x backward compatibility
         from src.core.version_compat import apply_version_compat
 
-        products = [product.model_dump(mode="json") for product in (response.products or [])]
-        response_data = {
-            "products": products,
-            "message": str(response),  # Use __str__ method for human-readable message
-        }
+        # Dump the full response (not just products) so schema-required
+        # envelope fields (cache_scope, status, ...) survive — matching
+        # _handle_get_products_skill's explicit-skill serialization.
+        response_data = self._stamp_a2a_protocol_fields(response)
         return apply_version_compat("get_products", response_data, None)
 
     def _extract_brand_name_from_query(self, query: str) -> str:
