@@ -180,6 +180,26 @@ EXPECTED_UNSUPPORTED_DECLARATIONS: frozenset[tuple[str, str, str]] = frozenset(
             "live stack always serves the agent catalog; an empty catalog cannot be realized over e2e",
         ),
         ("tests/harness/creative_formats.py", "_validate_registry_formats", "<dynamic>"),
+        # Justification (PR #1482): graduating @T-UC-006-ext-i made the generative
+        # sync scenario live on every transport, e2e_rest included. Its setup injects
+        # a synthetic format (plus a stubbed build_creative) into the in-process
+        # registry mock; over e2e the live server resolves formats against the real
+        # creative agent, which does not serve it, so the sync is rejected as an
+        # unknown format. This is the same "format-injection has no surface" class the
+        # ledger retirement already owns for CreativeFormatsEnv — not a way to dodge a
+        # production gap. It stays live on a2a/mcp/rest, where it grades the actual
+        # obligation (a generative build needs no seller-side generation key).
+        # Retiring this hatch means registering a generative format with the pinned
+        # reference agent and refreshing the reference fixture.
+        (
+            "tests/harness/creative_sync.py",
+            "setup_generative_build",
+            "generative setup injects a synthetic format (output_format_ids) plus a stubbed "
+            "build_creative into the in-process registry mock. Over e2e the live server resolves "
+            "formats against the real creative agent, which does not serve it — the sync is "
+            "rejected as an unknown format. Realizing this needs a generative format registered "
+            "with the pinned reference agent and present in the reference fixture.",
+        ),
     }
 )
 
