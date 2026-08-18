@@ -16,12 +16,20 @@ Layering:
   - **The repository** owns *persistence*, typed against
     :class:`TMPProviderFields` instead of a runtime ``hasattr`` guard.
 
-Spec grounding (pin: ``adcp==6.6.0``, AdCP spec 3.1.1):
-  - ``dist/schemas/3.1.1/trusted-match/provider-registration.json`` — the
-    ``anyOf`` requiring ``context_match`` or ``identity_match``, and the
+Spec grounding (pin: ``adcp==6.6.0``, AdCP spec 3.1.1). Paths are given in the
+form that RESOLVES in this tree — the installed SDK's pinned schema tree, which
+``tests/helpers/pinned_schema`` reads and the tests below validate against. The
+``dist/schemas/…`` prefix these citations used to carry resolves to nothing here
+(``dist/`` is gitignored and absent), so it could not be checked (#1197 review):
+  - ``adcp/_schemas/3.1/trusted-match/provider-registration.json`` (declared once
+    as :data:`src.routes.tmp_providers.PROVIDER_REGISTRATION_SCHEMA`) — the
+    ``anyOf`` requiring ``context_match`` or ``identity_match``, the
     ``identity_match ⇒ countries/uid_types non-empty`` rule (mirrored by the
-    SDK's own ``_require_identity_match_dimensions`` model validator).
-  - ``dist/schemas/3.1.1/enums/uid-type.json`` → ``adcp.types.UidType``.
+    SDK's own ``_require_identity_match_dimensions`` model validator), and the
+    per-field value constraints carried by the fields below.
+  - ``adcp/_schemas/3.1/enums/uid-type.json`` →
+    ``adcp.types.generated_poc.enums.uid_type.UidType`` (the symbol imported
+    below; ``adcp.types.UidType`` does not exist in the pinned SDK).
   - The ``status`` enum → the SDK's ``provider_registration.Status``.
 
 Both enums are derived from the pinned SDK rather than hand-maintained
@@ -44,11 +52,13 @@ SDK enums and pinned against the library model by
 from __future__ import annotations
 
 import logging
-from typing import TypedDict
+from datetime import datetime
+from typing import Annotated, TypedDict
+from uuid import UUID
 
 from adcp.types.generated_poc.enums.uid_type import UidType
 from adcp.types.generated_poc.trusted_match.provider_registration import Status as ProviderStatus
-from pydantic import ValidationError, model_validator
+from pydantic import AfterValidator, Field, StringConstraints, ValidationError, model_validator
 
 from src.core.schemas._base import SalesAgentBaseModel
 from src.core.security.url_validator import check_url_ssrf, sanitize_for_log
@@ -62,9 +72,13 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "VALID_STATUSES",
     "VALID_UID_TYPES",
+    "CountryCode",
+    "PropertyRid",
     "TMPDiscoveryResponse",
+    "TMPProviderAdminDict",
     "TMPProviderDiscoveryDict",
     "TMPProviderFields",
+    "TMPProviderFormDict",
     "TMPProviderRegistration",
     "TMPProviderValidationError",
 ]
@@ -73,6 +87,31 @@ __all__ = [
 # adds a uid type or a lifecycle status widens these automatically.
 VALID_UID_TYPES: frozenset[str] = frozenset(t.value for t in UidType)
 VALID_STATUSES: frozenset[str] = frozenset(s.value for s in ProviderStatus)
+
+
+def _require_uuid(value: str) -> str:
+    """Reject a property RID that is not a UUID, keeping the value a ``str``.
+
+    ``provider-registration.json`` types ``properties`` items as
+    ``{"type": "string", "format": "uuid"}``.  The constraint is enforced by
+    parsing, but the value stays a string rather than becoming a ``UUID``
+    object: the RID is persisted into a ``JSONType`` column and re-emitted on
+    the discovery wire as a JSON string, so a ``UUID`` here would need
+    converting back at both the repository write and the serializer — two more
+    places to forget — for no additional strictness.
+    """
+    UUID(value)
+    return value
+
+
+#: ISO 3166-1 alpha-2, the ``countries`` item constraint from the pinned schema
+#: (:data:`src.routes.tmp_providers.PROVIDER_REGISTRATION_SCHEMA`,
+#: ``items.pattern: ^[A-Z]{2}$``).  Declared here rather than normalized by a
+#: form helper, so the *second* write surface inherits it too (#1197 review).
+CountryCode = Annotated[str, StringConstraints(pattern=r"^[A-Z]{2}$")]
+
+#: A property RID — ``properties`` items are ``format: uuid`` in the pinned schema.
+PropertyRid = Annotated[str, AfterValidator(_require_uuid)]
 
 
 class TMPProviderValidationError(ValueError):
@@ -112,6 +151,66 @@ class TMPProviderFields(TypedDict, total=False):
     auth_credentials: str | None
 
 
+class _TMPProviderAdminScalars(TypedDict):
+    """The scalar half shared by the two admin-side views (see below).
+
+    Split out only so the two views can type ``countries``/``uid_types``/
+    ``properties`` differently without restating the nine keys they agree on —
+    a TypedDict subclass may add keys but not retype inherited ones.
+    """
+
+    provider_id: str
+    name: str
+    endpoint: str
+    context_match: bool
+    identity_match: bool
+    timeout_ms: int
+    priority: int
+    status: str
+
+
+class TMPProviderAdminDict(_TMPProviderAdminScalars, total=False):
+    """What :meth:`TMPProvider.to_admin_dict` returns — the admin list view's row.
+
+    Typed rather than a bare ``dict`` for the same reason its machine-wire
+    sibling :class:`TMPProviderDiscoveryDict` is: both are closed key sets whose
+    consumers (here, ``templates/tmp_providers.html``) break on a renamed key,
+    and only one of the two was typed (#1197 review).
+
+    ``created_at`` is declared here because the list handler adds it to the
+    returned mapping: a key a caller writes is part of this shape whether or not
+    the serializer emits it, and declaring it is what makes that write a checked
+    one.  ``total=False`` covers exactly that — the serializer always emits the
+    other keys.
+
+    The three conditional arrays are ``list[str] | None`` (never omitted):
+    unlike the discovery wire, the list view distinguishes "no restriction" from
+    "not shown", and the edit template renders all three unconditionally.
+    """
+
+    countries: list[str] | None
+    uid_types: list[str] | None
+    properties: list[str] | None
+    created_at: datetime
+
+
+class TMPProviderFormDict(_TMPProviderAdminScalars, total=False):
+    """The edit form's view of a provider — ``templates/tmp_provider_form.html``.
+
+    Diverges from :class:`TMPProviderAdminDict` in exactly the ways an HTML form
+    does: the three arrays are the comma-separated strings a text input round-trips,
+    and the two auth keys the handler adds are present (``auth_credentials`` being
+    a mask, never the credential).  Form shape belongs to the blueprint, so the
+    conversion lives there (``_form_view``) rather than on the model.
+    """
+
+    countries: str
+    uid_types: str
+    properties: str
+    auth_type: str | None
+    auth_credentials: str
+
+
 class _TMPProviderDiscoveryRequired(TypedDict):
     """The always-emitted half of :class:`TMPProviderDiscoveryDict` (see there)."""
 
@@ -127,7 +226,8 @@ class _TMPProviderDiscoveryRequired(TypedDict):
 class TMPProviderDiscoveryDict(_TMPProviderDiscoveryRequired, total=False):
     """One provider entry on the discovery wire, typed against the closed schema.
 
-    ``dist/schemas/3.1.1/trusted-match/provider-registration.json`` is a closed
+    The pinned ``provider-registration.json``
+    (:data:`src.routes.tmp_providers.PROVIDER_REGISTRATION_SCHEMA`) is a closed
     object (``additionalProperties: false``), so this is the exact key set the
     discovery endpoint may emit — not a partial view.  The three keys declared
     here are ``total=False`` because the schema types each as ``array`` with
@@ -174,11 +274,19 @@ class TMPProviderRegistration(SalesAgentBaseModel):
     endpoint: str
     context_match: bool = False
     identity_match: bool = False
-    countries: list[str] | None = None
+    # Value constraints, not just presence: every one of these is a constraint
+    # the pinned provider-registration.json puts on the SAME value the discovery
+    # wire re-emits, so a row that violates one is a row the endpoint cannot
+    # serialize conformantly.  Declaring them here — on the record every write
+    # surface goes through — is what makes "no write surface can persist a row
+    # the wire will reject" true, rather than relying on each surface to check
+    # (#1197 review).  Graded against the schema itself by
+    # ``tests/unit/test_tmp_provider_registration.py``.
+    countries: list[CountryCode] | None = None
     uid_types: list[str] | None = None
-    properties: list[str] | None = None
-    timeout_ms: int = 50
-    priority: int = 0
+    properties: list[PropertyRid] | None = None
+    timeout_ms: int = Field(default=50, ge=5, le=5000)
+    priority: int = Field(default=0, ge=0)
     status: str = "active"
     auth_type: str | None = None
     auth_credentials: str | None = None

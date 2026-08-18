@@ -45,6 +45,18 @@ from src.services.targeting_capabilities import supports_property_list_filtering
 
 logger = logging.getLogger(__name__)
 
+#: The experimental feature id for the Trusted Match surfaces this agent implements.
+#:
+#: AdCP 3.1.1, ``docs/reference/experimental-status`` (restated in the pinned
+#: ``protocol/get-adcp-capabilities-response.json`` → ``experimental_features``):
+#: "Sellers that implement any experimental surface MUST list its feature id
+#: here… a seller that does not list a surface is asserting it does not implement
+#: it." Seller-side Package Sync (``src/services/tmp_provider_sync``) is a
+#: ``trusted_match.core`` surface and runs on every media-buy create/update, so
+#: this declaration is owed the moment a tenant has a provider registered — there
+#: is no "silently experimental" mode (#1197 review).
+TRUSTED_MATCH_FEATURE_ID = "trusted_match.core"
+
 
 # Mapping from adapter channel names to MediaChannel enum values
 CHANNEL_MAPPING: dict[str, MediaChannel] = {
@@ -70,6 +82,35 @@ CHANNEL_MAPPING: dict[str, MediaChannel] = {
     "affiliate": MediaChannel.affiliate,
     "product_placement": MediaChannel.product_placement,
 }
+
+
+def _experimental_features(tenant_id: str) -> list[str] | None:
+    """The experimental surfaces this tenant actually has wired, or ``None``.
+
+    Derived from the state that makes the surface real rather than from a
+    constant: a tenant with no TMP provider registered has nothing to sync, and a
+    tenant with one has the seller-side Package Sync surface live on all four
+    transports. Read through the same ``TMPProviderUoW`` the discovery route
+    uses, so "advertised" and "implemented" cannot drift apart by memory.
+
+    Returns ``None`` (the field omitted) rather than ``[]`` when there is nothing
+    to declare — the schema types this as an array and an empty one carries no
+    more information than absence.
+    """
+    from src.core.database.repositories.uow import TMPProviderUoW
+
+    try:
+        with TMPProviderUoW(tenant_id) as uow:
+            assert uow.tmp_providers is not None
+            has_providers = bool(uow.tmp_providers.list_all())
+    except Exception as e:
+        # Capability discovery must answer even if this read fails; under-claiming
+        # is the conservative direction (a buyer that does not see the surface
+        # simply does not use it), and the failure is logged rather than silent.
+        logger.warning("Could not determine experimental features for tenant %s: %s", tenant_id, e)
+        return None
+
+    return [TRUSTED_MATCH_FEATURE_ID] if has_providers else None
 
 
 def _get_adcp_capabilities_impl(
@@ -271,6 +312,10 @@ def _get_adcp_capabilities_impl(
         ),
         supported_protocols=[SupportedProtocol.media_buy],
         specialisms=[AdcpSpecialism.sales_non_guaranteed],
+        # NOT added to supported_protocols: a stable protocol claim also commits
+        # the agent to that protocol's baseline compliance storyboard. The
+        # experimental declaration is the obligation the diff creates.
+        experimental_features=_experimental_features(tenant_id),
         media_buy=media_buy,
         last_updated=datetime.now(UTC),
     )

@@ -26,7 +26,7 @@ Usage::
 
     # Health scheduler tests (drive the repository mock directly):
     mock_uow_cls = _make_tmp_repo_uow(mock_repo)
-    provider = _make_mock_provider(provider_id="uuid-a", tenant_id="tenant-1")
+    provider = _make_mock_provider(provider_id="prov_a", tenant_id="tenant-1")
 
     # Flask admin blueprint tests:
     mock_uow_cls, mock_uow = _make_blueprint_uow()
@@ -95,11 +95,12 @@ def _make_mock_provider(**overrides) -> MagicMock:
     divergent field sets; the superset here serves both.
 
     Use this when the test only needs attribute access.  Use :func:`_make_provider`
-    when the test exercises ``to_dict()`` — that needs the real ORM model so the
-    production serializer, not a mock reimplementation, is what runs.
+    when the test exercises ``to_discovery_dict()`` / ``to_admin_dict()`` — those
+    need the real ORM model so the production serializer, not a mock
+    reimplementation, is what runs.
     """
     fields: dict = {
-        "provider_id": "test-uuid-1234",
+        "provider_id": "prov_test_1234",
         "tenant_id": "default",
         "name": "Test Provider",
         "endpoint": "https://provider.example.com/tmp",
@@ -166,7 +167,7 @@ def make_super_admin_client():
 
 
 def _make_provider(
-    provider_id: str = "uuid-1",
+    provider_id: str = "prov_1",
     name: str = "Provider A",
     endpoint: str = "http://si-agent.localhost:3003",
     context_match: bool = True,
@@ -180,9 +181,14 @@ def _make_provider(
 ) -> TMPProvider:
     """Create a real TMPProvider ORM instance (no DB session required).
 
-    Uses the real model so that to_dict() is exercised against the production
-    implementation rather than a MagicMock reimplementation that can silently
-    diverge (e.g. the missing-properties regression that was caught in review).
+    Uses the real model so that ``to_discovery_dict()`` / ``to_admin_dict()`` are
+    exercised against the production implementation rather than a MagicMock
+    reimplementation that can silently diverge (e.g. the missing-properties
+    regression that was caught in review).
+
+    ``provider_id`` defaults to a hyphen-free value because that is what the
+    pinned schema's ``^[A-Za-z0-9_]+$`` allows — a hyphenated default would make
+    every entry these tests serialize schema-invalid.
     """
     p = TMPProvider()
     p.provider_id = provider_id

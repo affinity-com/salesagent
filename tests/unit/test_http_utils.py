@@ -1,8 +1,8 @@
 """Unit tests for src.core.http_utils.
 
 Covers:
-- parse_bearer_token: contract for all four Bearer-parsing call sites
-  (auth.py, auth_middleware.py, resolved_identity.py, routes/tmp_providers.py).
+- parse_bearer_token: contract for every Bearer-parsing call site
+  (auth.py, auth_middleware.py, resolved_identity.py).
 
 The function changed semantics relative to the three old inline parsers:
   - ``split(None, 1)`` accepts tab/multi-space separators the old parsers rejected.

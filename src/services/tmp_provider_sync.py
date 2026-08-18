@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 from adcp.types import AvailablePackage, SellerAgentReference
 
-from src.core.database.models import MediaPackage
+from src.core.database.models import MediaPackage, TMPProvider
 from src.core.database.repositories.uow import MediaBuyUoW, TenantConfigUoW, TMPProviderUoW
 from src.core.schemas._base import (
     CreateMediaBuyResult,
@@ -45,6 +45,7 @@ from src.core.schemas._base import (
     UpdateMediaBuySuccess,
 )
 from src.core.security.url_validator import is_local_host, sanitize_for_log
+from src.core.thread_registry import ThreadRegistry
 from src.services._provider_http import bearer_headers, provider_client_kwargs, provider_url
 
 if TYPE_CHECKING:
@@ -60,6 +61,24 @@ logger = logging.getLogger(__name__)
 # ever DB-resolved inside the process are logged raw; here that is ``tenant_id``
 # and ``media_buy_id``, which reach this module from ResolvedIdentity and the
 # media_buys table, never from a caller-controlled string.
+
+
+#: In-flight package syncs, keyed by ``media_buy_id``.
+#:
+#: The shared seam (``src/core/thread_registry.py``, #1264) rather than a bare
+#: ``threading.Thread(...).start()``: five services had hand-rolled the dict +
+#: lock + reaper before it existed, and this was the sixth site to do so
+#: (#1197 review).  What the registry buys here is ordering — see
+#: :func:`fire_tmp_sync` — plus a deterministic completion signal
+#: (``_active_syncs.get(media_buy_id).join()``) for callers and tests, which is
+#: what replaces patching ``threading.Thread``.
+_active_syncs = ThreadRegistry()
+
+#: How long a sync waits for the previous sync of the SAME media buy.
+#: A cap, not a correctness knob: exceeding it means the predecessor is wedged
+#: (a hung provider connection), and the newer package data is more valuable
+#: than strict ordering against a thread that may never finish.
+_PREDECESSOR_JOIN_TIMEOUT_SECONDS = 60
 
 
 def fire_tmp_sync(
@@ -90,6 +109,19 @@ def fire_tmp_sync(
     callers don't need to repeat ``identity.tenant_id if identity else None`` at
     every call site (four transport wrappers).
 
+    Two rapid operations on the SAME media buy are **serialized**, not raced:
+    each sync joins the one already in flight for that media_buy_id before
+    reading the database, so the last operation to fire is the last to POST and
+    "every provider holds current package data" is a property of the code rather
+    than of thread scheduling.  Superseding (dropping the second sync) would
+    publish the older package set; racing publishes whichever thread happens to
+    finish last.  ``_active_syncs`` holds the newest thread per media buy, which
+    is therefore also the last to finish — so ``get(media_buy_id).join()`` is a
+    complete completion signal (#1197 review).
+
+    Boundedness (a pool rather than a thread per fire) remains the separately
+    accepted follow-up; ordering is what the registry makes expressible.
+
     No-ops when ``media_buy_id`` or ``tenant_id`` is absent (e.g. on error or
     submitted responses, which carry no ID); every no-op is logged.
     """
@@ -105,13 +137,70 @@ def fire_tmp_sync(
             )
         return
 
+    # Read the predecessor BEFORE registering ourselves: `add` is
+    # last-writer-wins, so registering first would make us our own predecessor.
+    predecessor = _active_syncs.get(media_buy_id)
     t = threading.Thread(
-        target=sync_packages_for_media_buy,
-        args=(tenant_id, media_buy_id),
+        target=_run_sync,
+        args=(tenant_id, media_buy_id, predecessor),
         daemon=True,
         name=f"tmp-sync-{media_buy_id}",
     )
+    _active_syncs.add(media_buy_id, t)
     t.start()
+
+
+def _run_sync(tenant_id: str, media_buy_id: str, predecessor: threading.Thread | None) -> None:
+    """Registry-managed body of one sync: serialize behind *predecessor*, then sync.
+
+    Joining the predecessor here (rather than in :func:`fire_tmp_sync`) keeps the
+    caller non-blocking — the transport wrapper returns as soon as the thread is
+    spawned, exactly as before.
+    """
+    try:
+        if predecessor is not None and predecessor.is_alive():
+            predecessor.join(timeout=_PREDECESSOR_JOIN_TIMEOUT_SECONDS)
+            if predecessor.is_alive():
+                logger.warning(
+                    "[TMP sync] Previous sync for media_buy=%s still running after %ds — "
+                    "proceeding, provider ordering for this media buy is not guaranteed",
+                    media_buy_id,
+                    _PREDECESSOR_JOIN_TIMEOUT_SECONDS,
+                )
+        sync_packages_for_media_buy(tenant_id, media_buy_id)
+    finally:
+        # Only drop the entry if it is still ours: a newer fire may already have
+        # replaced it, and that thread is the one callers must be able to join.
+        if _active_syncs.get(media_buy_id) is threading.current_thread():
+            _active_syncs.remove(media_buy_id)
+
+
+def join_active_syncs(timeout: float = 30.0) -> list[str]:
+    """Wait for every in-flight package sync to finish; return the keys still running.
+
+    The feature's observation seam.  ``fire_tmp_sync`` is fire-and-forget by
+    design, so without this a caller (an operator draining a worker, a test
+    asserting on what a provider received) has nothing to wait on and has to
+    reach for ``patch("threading.Thread")`` — an in-process artifact no
+    transport observes, which is what every test tier ended up doing
+    independently (#1197 review).
+
+    Because ``_active_syncs`` holds the NEWEST thread per media buy and each
+    sync serializes behind its predecessor, joining the registered threads joins
+    the whole chain.
+
+    Returns the media_buy_ids whose sync was still running when *timeout*
+    expired — empty on a clean drain.
+    """
+    stragglers: list[str] = []
+    for key in _active_syncs.list_active():
+        thread = _active_syncs.get(key)
+        if thread is None:
+            continue
+        thread.join(timeout=timeout)
+        if thread.is_alive():
+            stragglers.append(key)
+    return stragglers
 
 
 def _extract_media_buy_id(
@@ -165,7 +254,7 @@ def _extract_media_buy_id(
 def _resolve_seller_agent_url(tenant_id: str) -> str | None:
     """Resolve the seller agent URL for the AvailablePackage.seller_agent field.
 
-    Per ``dist/schemas/3.1.1/core/seller-agent-ref.json``, ``agent_url``
+    Per ``adcp/_schemas/3.1/core/seller-agent-ref.json``, ``agent_url``
     MUST use the ``https://`` scheme.  Returns ``None`` when no valid https URL
     can be resolved so the caller can skip the sync rather than emit a
     spec-invalid binding.
@@ -193,7 +282,7 @@ def _resolve_seller_agent_url(tenant_id: str) -> str | None:
             return override
         logger.error(
             "[TMP sync] ADCP_AGENT_URL=%s does not use https:// — ignoring override "
-            "(dist/schemas/3.1.1/core/seller-agent-ref.json requires https for agent_url). "
+            "(adcp/_schemas/3.1/core/seller-agent-ref.json requires https for agent_url). "
             "Falling back to tenant virtual_host resolution.",
             sanitize_for_log(override),
         )
@@ -235,7 +324,7 @@ def _build_package_payload(
     """Build the POST /packages/sync payload from a MediaPackage DB row.
 
     The body is produced by the pinned SDK's ``AvailablePackage`` — the codegen
-    of ``dist/schemas/3.1.1/trusted-match/available-package.json`` — rather than
+    of ``adcp/_schemas/3.1/trusted-match/available-package.json`` — rather than
     a hand-written TypedDict copy.  The schema is closed
     (``additionalProperties: false``) and requires exactly ``package_id``,
     ``media_buy_id``, ``seller_agent``; ``format_ids`` and ``catalogs`` are the
@@ -244,7 +333,7 @@ def _build_package_payload(
     error instead of silently shipping the old body (#1197 review).
 
     ``seller_agent`` is ``SellerAgentReference``
-    (``dist/schemas/3.1.1/core/seller-agent-ref.json``): ``{"agent_url": ...}``,
+    (``adcp/_schemas/3.1/core/seller-agent-ref.json``): ``{"agent_url": ...}``,
     whose ``agent_url`` MUST use the ``https://`` scheme.  Callers must resolve a
     valid https URL before calling this (see ``_resolve_seller_agent_url``); an
     invalid one raises out of the model rather than reaching a provider.
@@ -294,6 +383,42 @@ def _post_packages_sync(endpoint: str, payloads: list[dict[str, Any]], auth_cred
     )
 
 
+def _readable_providers(provider_rows: list[TMPProvider], tenant_id: str) -> list[tuple[str, str, str]]:
+    """Materialise ``(name, endpoint, credential)`` per provider, skipping unreadable ones.
+
+    The unit of work is one provider, so the failure handling is per provider:
+    :attr:`TMPProvider.auth_credentials` decrypts on read and raises
+    ``AdCPConfigurationError`` on a ciphertext the current key cannot open — a
+    key-rotation state, not a corrupt database.  A list comprehension over the
+    whole set turned that single row into "no providers synced for this tenant",
+    logged as a repository failure, so one provider's rotated credential silently
+    stopped the sync for every other provider the tenant had registered
+    (#1197 review).
+
+    Runs inside the caller's UoW block: the attribute reads (and the decrypt)
+    need a live session.
+    """
+    providers: list[tuple[str, str, str]] = []
+    for p in provider_rows:
+        try:
+            credential = p.auth_credentials or ""
+        except Exception:
+            # Named per provider, and at WARNING like the fan-out failures — an
+            # operator reading this line must be able to tell WHICH registration
+            # to re-enter the credential for.
+            logger.warning(
+                "[TMP sync] Skipping provider '%s' (%s) for tenant=%s — its stored auth credential "
+                "could not be read (re-enter it in the admin UI); other providers are unaffected",
+                sanitize_for_log(p.name),
+                sanitize_for_log(p.endpoint),
+                tenant_id,
+                exc_info=True,
+            )
+            continue
+        providers.append((p.name, p.endpoint, credential))
+    return providers
+
+
 def sync_packages_for_media_buy(tenant_id: str, media_buy_id: str) -> None:
     """Background task: push all packages for a media buy to active TMP providers.
 
@@ -335,7 +460,7 @@ def sync_packages_for_media_buy(tenant_id: str, media_buy_id: str) -> None:
 
     # --- Step 2: load packages and build payloads (inside session scope) ---
     # Payloads are built while the session is still open so that ORM attribute
-    # access (pkg_row.package_config) does not hit a detached instance.
+    # access (pkg_row.package_id) does not hit a detached instance.
     # HTTP calls happen after this block — no open transaction during network I/O.
     try:
         with MediaBuyUoW(tenant_id) as uow:
@@ -380,8 +505,7 @@ def sync_packages_for_media_buy(tenant_id: str, media_buy_id: str) -> None:
     try:
         with TMPProviderUoW(tenant_id) as uow:
             assert uow.tmp_providers is not None
-            provider_rows = uow.tmp_providers.list_syncable()
-            providers = [(p.name, p.endpoint, p.auth_credentials or "") for p in provider_rows]
+            providers = _readable_providers(uow.tmp_providers.list_syncable(), tenant_id)
     except Exception:
         logger.exception(
             "[TMP sync] Failed to load TMP providers for tenant=%s",

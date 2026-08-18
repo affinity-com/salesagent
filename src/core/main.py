@@ -78,7 +78,8 @@ from contextlib import asynccontextmanager
 
 # ---------------------------------------------------------------------------
 # Scheduler registry — one entry per interval scheduler.
-# Each tuple is (name, start_fn_import_path, stop_fn_import_path).
+# Each tuple is (name, module_path, start_fn_name, stop_fn_name) — the module is
+# imported once and both functions are resolved off it by name.
 # Startup iterates forward; shutdown iterates in reverse (LIFO).
 # ---------------------------------------------------------------------------
 _SCHEDULER_REGISTRY = [

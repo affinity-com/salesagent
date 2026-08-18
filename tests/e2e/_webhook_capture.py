@@ -74,8 +74,11 @@ def run_webhook_capture_server(
     in-network (the runner's alias 'tests', left un-rewritten). Pass an explicit
     host (e.g. '127.0.0.1') when the receiver is only reachable on loopback.
 
-    Yields ``{"url", "server", "received"}``. ``received`` is cleared on entry
-    and exit so each test sees only its own captures.
+    Yields ``{"url", "port", "server", "received"}``. ``port`` is the bound
+    port, for callers that need a different path than ``/webhook`` (the TMP
+    package-sync collector registers ``http://<host>:<port>/tmp``) — parsing it
+    back out of ``url`` is the same value derived twice. ``received`` is cleared
+    on entry and exit so each test sees only its own captures.
     """
     received.clear()
 
@@ -95,6 +98,8 @@ def run_webhook_capture_server(
     try:
         yield {
             "url": f"http://{webhook_host}:{port}/webhook",
+            "host": webhook_host,
+            "port": port,
             "server": server,
             "received": received,
         }

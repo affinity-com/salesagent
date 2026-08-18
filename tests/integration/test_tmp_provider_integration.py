@@ -2,9 +2,14 @@
 
 End-to-end scenarios exercised against a real PostgreSQL database:
 
-1. test_discovery_returns_active_providers
-   Discovery endpoint (GET /tenant/{id}/tmp-providers/discovery) returns
-   active/draining providers and excludes inactive ones.
+1. test_discovery_returns_active_providers / TestDiscoveryAuth
+   The discovery contract (GET /tenant/{id}/tmp-providers/discovery) served by
+   the PRODUCTION app: returns active/draining providers and excludes inactive
+   ones, every entry validated against the pinned provider-registration schema,
+   and the credential gate graded for real — no credential, another tenant's
+   credential, this tenant's principal token, this tenant's admin token. The
+   401 envelope is produced by ``src.app.app``'s own handler, not a re-declared
+   copy (#1197 review).
 
 2. test_sync_packages_posts_to_providers
    sync_packages_for_media_buy fans out to all syncable providers; outbound
@@ -16,16 +21,15 @@ End-to-end scenarios exercised against a real PostgreSQL database:
    TMPHealthScheduler.tick() probes providers (HTTP stubbed) and persists the
    resulting health_status to the DB.
 
-4. TestFireTmpSyncDispatched / TestFireTmpSyncDispatchedOnUpdate
-   (both parametrized over MCP/A2A/REST)
-   Dispatch create_media_buy and update_media_buy through the REAL
-   per-transport pipeline (dispatch → wrapper → _impl → fire_tmp_sync), not a
-   hand-built MagicMock response, so a regression in the wiring on any
-   transport fails these tests. Only httpx.Client.post is stubbed; thread
-   spawn, URL construction, auth header, and body shape run against real
-   production code. The E2E_REST transport is graded in
-   tests/e2e/test_tmp_provider_sync_e2e.py, where the sync runs server-side
-   and in-process patching cannot reach it.
+The buyer-triggered half — "a create or update on any transport delivers the
+packages to every registered provider" — is NOT here. It is one BDD scenario
+(``tests/bdd/features/local-tmp-package-sync.feature``) fanned out by the
+harness over a2a/mcp/rest and e2e_rest through the env-owned seam
+(``tests.harness._mixins.TMPSyncMixin``). This file used to carry a hand-written
+``_DISPATCHED_TRANSPORTS`` list plus a process-wide ``threading.Thread.start`` /
+``httpx.Client`` patch, and ``tests/e2e/test_tmp_provider_sync_e2e.py`` carried a
+second, independent implementation of the same seed→dispatch→collect→assert for
+one transport; both are replaced by that scenario (#1197 review).
 
 beads: salesagent-tmp-sync
 """
@@ -33,18 +37,19 @@ beads: salesagent-tmp-sync
 from __future__ import annotations
 
 import os
-import threading
-from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from starlette.testclient import TestClient
 
-from tests.factories import MediaBuyFactory, MediaPackageFactory, TenantFactory, TMPProviderFactory
+from src.core.tools.capabilities import TRUSTED_MATCH_FEATURE_ID
+from src.routes.tmp_providers import PROVIDER_REGISTRATION_SCHEMA
+from tests.factories import MediaBuyFactory, MediaPackageFactory, PrincipalFactory, TenantFactory, TMPProviderFactory
 from tests.harness._base import IntegrationEnv
-from tests.harness.media_buy_create import MediaBuyCreateEnv
+from tests.harness.capabilities import CapabilitiesEnv
 from tests.harness.transport import Transport
-from tests.helpers.adcp_factories import create_test_package_request_dict
+from tests.helpers.envelope_assertions import assert_envelope_shape
+from tests.helpers.pinned_schema import validate_against_pinned_schema
 
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
 
@@ -83,17 +88,35 @@ def _make_mock_http_client(status_code: int = 200) -> MagicMock:
 # ---------------------------------------------------------------------------
 
 
+def _discovery_client() -> TestClient:
+    """A client over the production app — its router mount, middleware and handlers."""
+    from src.app import app
+
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def _get_discovery(tenant_id: str, token: str | None) -> object:
+    """GET the discovery contract as *token*'s owner (or unauthenticated)."""
+    headers = {"x-adcp-auth": token} if token else {}
+    return _discovery_client().get(f"/tenant/{tenant_id}/tmp-providers/discovery", headers=headers)
+
+
 class TestDiscoveryReturnsActiveProviders:
     """GET /tenant/{id}/tmp-providers/discovery returns active+draining, excludes inactive."""
 
     def test_discovery_returns_active_providers(self, integration_db):
-        """Active and draining providers appear in the discovery response; inactive do not."""
-        from starlette.testclient import TestClient
+        """Active and draining providers appear in the discovery response; inactive do not.
 
-        from src.app import app
-
+        Also grades every returned entry against the pinned
+        provider-registration schema. That per-entry assertion is what a
+        hand-maintained key list could not do: it failed on ``provider_id``
+        (a hyphenated UUID against ``^[A-Za-z0-9_]+$``) until the column became
+        charset-safe, so every entry this endpoint published was rejected by the
+        schema it declares conformance to (#1197 review).
+        """
         with _TMPEnv() as env:
             tenant = TenantFactory(tenant_id="tmp_int_disc_t1")
+            principal = PrincipalFactory(tenant=tenant)
             active = TMPProviderFactory(tenant=tenant, name="Active Provider", status="active")
             draining = TMPProviderFactory(tenant=tenant, name="Draining Provider", status="draining")
             inactive = TMPProviderFactory(tenant=tenant, name="Inactive Provider", status="inactive")
@@ -101,23 +124,128 @@ class TestDiscoveryReturnsActiveProviders:
             # Read the ids while the session is open — the wire identifies
             # providers by provider_id, not by the admin-only `name` (absent
             # from the closed provider-registration.json key set, #1197 review).
+            token = principal.access_token
             active_id, draining_id, inactive_id = (
                 active.provider_id,
                 draining.provider_id,
                 inactive.provider_id,
             )
 
-        with patch.dict(os.environ, {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
-            client = TestClient(app, raise_server_exceptions=False)
-            response = client.get("/tenant/tmp_int_disc_t1/tmp-providers/discovery")
+        response = _get_discovery("tmp_int_disc_t1", token)
 
-        assert response.status_code == 200
+        assert response.status_code == 200, response.text
         data = response.json()
         assert data["tenant_id"] == "tmp_int_disc_t1"
         returned_ids = {p["provider_id"] for p in data["providers"]}
         assert active_id in returned_ids
         assert draining_id in returned_ids
         assert inactive_id not in returned_ids
+
+        for entry in data["providers"]:
+            validate_against_pinned_schema(PROVIDER_REGISTRATION_SCHEMA, entry)
+
+
+class TestDiscoveryAuth:
+    """The contract authenticates a TENANT's credential, not a process.
+
+    ``require_tenant_credential`` resolves the caller's token *inside* the
+    tenant in the path, so a cross-tenant read is inexpressible rather than
+    rejected by a comparison. Every case here goes through ``src.app.app``, so
+    the 401 body is the one the deployed endpoint emits — the previous suite ran
+    its denial cases against a test-local ``FastAPI()`` with a copied error
+    handler and only ever hit the production app on the 200 path (#1197 review).
+    """
+
+    @staticmethod
+    def _two_tenants(env) -> tuple[str, str, str, str]:
+        """Seed two tenants, each with a principal. Returns both (tenant_id, token) pairs."""
+        own = TenantFactory(tenant_id="tmp_int_auth_own")
+        other = TenantFactory(tenant_id="tmp_int_auth_other")
+        own_principal = PrincipalFactory(tenant=own)
+        other_principal = PrincipalFactory(tenant=other)
+        TMPProviderFactory(tenant=own, name="Own Provider", status="active")
+        env._commit_factory_data()
+        return own.tenant_id, own_principal.access_token, other.tenant_id, other_principal.access_token
+
+    def test_no_credential_is_rejected(self, integration_db):
+        """An unauthenticated poll gets the production AUTH_REQUIRED envelope."""
+        with _TMPEnv() as env:
+            own_id, _own_token, _other_id, _other_token = self._two_tenants(env)
+
+        response = _get_discovery(own_id, None)
+
+        assert response.status_code == 401
+        assert_envelope_shape(response.json(), "AUTH_REQUIRED", recovery="correctable")
+
+    def test_another_tenants_credential_cannot_read_this_tenant(self, integration_db):
+        """The isolation case: a valid credential from tenant B is nothing on tenant A's path.
+
+        This is the finding the process-global API key made unexpressible — one
+        key authorized reads of every tenant's provider topology.
+        """
+        with _TMPEnv() as env:
+            own_id, _own_token, _other_id, other_token = self._two_tenants(env)
+
+        response = _get_discovery(own_id, other_token)
+
+        assert response.status_code == 401, response.text
+        assert_envelope_shape(response.json(), "AUTH_REQUIRED", recovery="correctable")
+
+    def test_unknown_token_is_rejected(self, integration_db):
+        """A token that belongs to nobody is rejected, not treated as anonymous access."""
+        with _TMPEnv() as env:
+            own_id, _own_token, _other_id, _other_token = self._two_tenants(env)
+
+        response = _get_discovery(own_id, "not-a-real-token")
+
+        assert response.status_code == 401
+        assert_envelope_shape(response.json(), "AUTH_REQUIRED", recovery="correctable")
+
+    def test_tenants_own_principal_token_is_accepted(self, integration_db):
+        """The credential the operator issues the router is the one that works."""
+        with _TMPEnv() as env:
+            own_id, own_token, _other_id, _other_token = self._two_tenants(env)
+
+        response = _get_discovery(own_id, own_token)
+
+        assert response.status_code == 200, response.text
+        assert len(response.json()["providers"]) == 1
+
+    def test_tenants_admin_token_is_accepted(self, integration_db):
+        """Bearer transport + the tenant's admin token — the other credential shape.
+
+        Covers both halves the route no longer implements itself: token
+        extraction is ``UnifiedAuthMiddleware``'s (``Authorization: Bearer``),
+        and the accepted credential set is ``get_principal_from_token``'s.
+        """
+        with _TMPEnv() as env:
+            tenant = TenantFactory(tenant_id="tmp_int_auth_admin", admin_token="tmp-admin-token-1")
+            TMPProviderFactory(tenant=tenant, name="Admin-visible Provider", status="active")
+            env._commit_factory_data()
+            tenant_id = tenant.tenant_id
+
+        response = _discovery_client().get(
+            f"/tenant/{tenant_id}/tmp-providers/discovery",
+            headers={"Authorization": "Bearer tmp-admin-token-1"},
+        )
+
+        assert response.status_code == 200, response.text
+        assert len(response.json()["providers"]) == 1
+
+    def test_unknown_tenant_is_not_found_for_an_authenticated_caller(self, integration_db):
+        """A credential cannot resolve in a tenant that does not exist → 401, never 404.
+
+        Pins the ordering: the gate runs before the route body, so a caller
+        cannot probe which tenant ids exist by reading the difference between
+        401 and 404.
+        """
+        with _TMPEnv() as env:
+            _own_id, own_token, _other_id, _other_token = self._two_tenants(env)
+
+        response = _get_discovery("tmp_int_auth_missing", own_token)
+
+        assert response.status_code == 401
+        assert_envelope_shape(response.json(), "AUTH_REQUIRED", recovery="correctable")
 
 
 # ---------------------------------------------------------------------------
@@ -261,182 +389,65 @@ class TestHealthSchedulerTickPersistsStatus:
 
 
 # ---------------------------------------------------------------------------
-# 4. fire_tmp_sync dispatched transport-parameterized test
+# 4. The agent declares the experimental surface it implements
 # ---------------------------------------------------------------------------
 
 
-def _future(days: int) -> str:
-    """Return an ISO 8601 datetime string N days in the future."""
-    return (datetime.now(UTC) + timedelta(days=days)).isoformat()
+def _wire_experimental_features(result: object) -> list[str]:
+    """The ``experimental_features`` array as it appears on the wire.
 
-
-# Transports that run the real wrapper chain in-process.  IMPL is excluded
-# deliberately: it bypasses the wrappers, which is where fire_tmp_sync lives.
-# E2E_REST is graded separately in tests/e2e/test_tmp_provider_sync_e2e.py —
-# in-process patching cannot reach the server process — and that file covers
-# BOTH halves: ``test_package_sync_reaches_provider_over_the_wire`` (create) and
-# ``test_package_sync_fires_again_on_update_over_the_wire`` (update).
-_DISPATCHED_TRANSPORTS = [Transport.MCP, Transport.A2A, Transport.REST]
-
-_SELLER_AGENT_URL = "https://salesagent.example.com/mcp"
-_PROVIDER_ENDPOINT = "https://fire.example.com/tmp"
-
-
-@contextmanager
-def _captured_tmp_sync():
-    """Stub outbound sync HTTP and join every ``fire_tmp_sync`` thread on exit.
-
-    ``fire_tmp_sync`` is fire-and-forget, so the daemon thread it spawns races
-    the assertions.  The join must happen INSIDE the patch context: the thread
-    body reads ``ADCP_AGENT_URL`` and calls ``httpx.Client()``, so joining after
-    the patches are torn down sends a real outbound connection instead of
-    hitting the mock (observed as a real DNS/connect failure on REST).
-
-    Yields the mock client so callers can assert on ``.post``.  Shared by the
-    create and update siblings — the capture mechanics are identical and only
-    the dispatched call differs (CLAUDE.md DRY invariant).
+    Read from ``result.wire_response`` (the real serialized body on all three
+    transports) rather than from the typed payload: the payload's items are
+    ``ExperimentalFeature`` RootModels whose values are already coerced, so a
+    serialization-side drop would be invisible there (tests/CLAUDE.md § wire_response).
     """
-    mock_client = _make_mock_http_client(200)
-    spawned_threads: list[threading.Thread] = []
-    original_start = threading.Thread.start
-
-    def _track_start(self_thread: threading.Thread) -> None:
-        spawned_threads.append(self_thread)
-        original_start(self_thread)
-
-    with (
-        patch("src.services.tmp_provider_sync.httpx.Client", return_value=mock_client),
-        patch.dict(os.environ, {"ADCP_AGENT_URL": _SELLER_AGENT_URL}),
-        patch.object(threading.Thread, "start", _track_start),
-    ):
-        try:
-            yield mock_client
-        finally:
-            for t in spawned_threads:
-                t.join(timeout=10)
+    wire = result.wire_response  # type: ignore[attr-defined]
+    assert wire is not None, "capabilities dispatch produced no wire body"
+    return list(wire.get("experimental_features") or [])
 
 
-def _assert_synced_once(mock_client: MagicMock, *, media_buy_id: str, transport: Transport) -> None:
-    """Assert exactly one ``POST /packages/sync`` carrying *media_buy_id*."""
-    assert mock_client.post.call_count == 1, (
-        f"Expected fire_tmp_sync to POST once via {transport.value}, got {mock_client.post.call_count} calls"
-    )
-    call = mock_client.post.call_args_list[0]
-    assert call.args[0] == f"{_PROVIDER_ENDPOINT}/packages/sync"
+class TestExperimentalFeatureDeclaration:
+    """A tenant with a TMP provider declares ``trusted_match.core`` on the wire.
 
-    body = call.kwargs.get("json", call.args[1] if len(call.args) > 1 else None)
-    assert isinstance(body, list)
-    assert len(body) == 1
-    assert body[0]["media_buy_id"] == media_buy_id
-    assert body[0]["seller_agent"]["agent_url"] == _SELLER_AGENT_URL
+    AdCP 3.1.1, ``docs/reference/experimental-status`` (restated in the pinned
+    ``get-adcp-capabilities-response.json``): a seller implementing any
+    experimental surface MUST list its feature id in ``experimental_features``,
+    and a seller that does not list one is asserting it does not implement it.
+    Seller-side Package Sync is a ``trusted_match.core`` surface that this PR
+    wires on all four transports, so the diff creates the obligation (#1197
+    review).
 
-
-def _seed_fire_provider(tenant) -> None:
-    """Register the active TMP provider both dispatch classes fan out to.
-
-    The create and update siblings seeded an identical provider row; extracted
-    so a new required column is a one-site edit (CLAUDE.md DRY invariant,
-    #1197 review). Shares ``_PROVIDER_ENDPOINT`` with ``_assert_synced_once``,
-    which asserts the POST landed on that endpoint.
-    """
-    TMPProviderFactory(
-        tenant=tenant,
-        name="Fire Provider",
-        endpoint=_PROVIDER_ENDPOINT,
-        status="active",
-    )
-
-
-class TestFireTmpSyncDispatched:
-    """create_media_buy on each real transport reaches fire_tmp_sync and POSTs.
-
-    Dispatches ``create_media_buy`` through the REAL per-transport pipeline
-    (dispatch → wrapper → ``_create_media_buy_impl`` → ``fire_tmp_sync``) via
-    ``MediaBuyCreateEnv.call_via``, not a hand-built ``MagicMock`` response —
-    the seam that changed (dispatch → wrapper → ``fire_tmp_sync``) is exactly
-    what a hand-built mock bypasses. Only ``httpx.Client.post`` is stubbed;
-    thread spawn, URL construction, auth header, and body shape are graded
-    against real production code, and the created ``media_buy_id`` is
-    asserted on the outbound wire body.
+    Graded on the real serialized response through the capabilities harness, on
+    every wire transport — not on a ``model_dump()`` of the typed model, which
+    cannot catch a serialization-side drop.
     """
 
-    @pytest.mark.parametrize("transport", _DISPATCHED_TRANSPORTS, ids=lambda t: t.value)
-    def test_fire_tmp_sync_dispatched_posts_to_providers(self, integration_db, transport):
-        """create_media_buy via *transport* fires a real POST to the TMP provider."""
-        with MediaBuyCreateEnv() as env:
-            tenant, _principal, product, _pricing_option = env.setup_media_buy_data()
-            _seed_fire_provider(tenant)
+    @pytest.mark.parametrize("transport", [Transport.MCP, Transport.A2A, Transport.REST], ids=lambda t: t.value)
+    def test_declared_when_the_tenant_has_a_provider(self, integration_db, transport):
+        with CapabilitiesEnv(tenant_id="tmp_caps_with", principal_id="caps_principal") as env:
+            tenant = TenantFactory(tenant_id="tmp_caps_with")
+            PrincipalFactory(tenant=tenant, principal_id="caps_principal")
+            TMPProviderFactory(tenant=tenant, name="Declared Provider", status="active")
             env._commit_factory_data()
 
-            with _captured_tmp_sync() as mock_client:
-                result = env.call_via(
-                    transport,
-                    brand={"domain": "tmp-fire-dispatch.example.com"},
-                    packages=[
-                        create_test_package_request_dict(
-                            product_id=product.product_id,
-                            pricing_option_id="cpm_usd_fixed",
-                            budget=5000.0,
-                        )
-                    ],
-                    start_time=_future(1),
-                    end_time=_future(30),
-                )
+            result = env.call_via(transport)
 
-        assert result.is_success, f"create_media_buy failed on {transport.value}: {result.error}"
-        media_buy_id = result.payload.response.media_buy_id
-        assert media_buy_id
-        _assert_synced_once(mock_client, media_buy_id=media_buy_id, transport=transport)
+        assert result.is_success, result.error
+        assert TRUSTED_MATCH_FEATURE_ID in _wire_experimental_features(result)
 
+    @pytest.mark.parametrize("transport", [Transport.MCP, Transport.A2A, Transport.REST], ids=lambda t: t.value)
+    def test_not_declared_when_the_tenant_has_no_provider(self, integration_db, transport):
+        """The falsifiable half: a hardcoded constant would fail here.
 
-class TestFireTmpSyncDispatchedOnUpdate:
-    """update_media_buy on each real transport reaches fire_tmp_sync and POSTs.
-
-    The update sibling of :class:`TestFireTmpSyncDispatched`.  Until this
-    existed, the update half of the sync was graded only by unit tests that
-    patched ``threading.Thread`` and asserted the thread was *constructed* — an
-    in-process object no transport observes.  Deleting the ``fire_tmp_sync``
-    call from an update wrapper failed nothing (#1197 review).
-
-    Dispatch goes through ``MediaBuyDualEnv``, which is the update harness with
-    real per-transport wrapper dispatch (A2A via the real ``on_message_send``,
-    MCP via the real FastMCP ``Client``, REST via the route).  Note this is NOT
-    ``MediaBuyUpdateEnv``: that is the *unit* env whose ``call_via`` routes every
-    transport through ``call_impl``, skipping the wrappers where
-    ``fire_tmp_sync`` lives.  Adding a second real-dispatch update path to it
-    would duplicate what ``MediaBuyDualEnv`` already owns.
-    """
-
-    @pytest.mark.parametrize("transport", _DISPATCHED_TRANSPORTS, ids=lambda t: t.value)
-    def test_fire_tmp_sync_dispatched_posts_on_update(self, integration_db, transport):
-        """update_media_buy via *transport* fires a real POST to the TMP provider."""
-        from src.core.schemas import UpdateMediaBuyRequest
-        from tests.harness.media_buy_dual import MediaBuyDualEnv
-
-        media_buy_id = f"mb_tmp_update_{transport.value}"
-
-        with MediaBuyDualEnv() as env:
-            tenant, principal, _product, _pricing_option = env.setup_media_buy_data()
-            media_buy = MediaBuyFactory(
-                tenant=tenant,
-                principal=principal,
-                media_buy_id=media_buy_id,
-                status="active",
-            )
-            # The sync only POSTs when the media buy has packages — without one
-            # sync_packages_for_media_buy short-circuits and the test would pass
-            # vacuously whether or not the wrapper fired.
-            MediaPackageFactory(
-                media_buy=media_buy,
-                package_config={"product_id": "prod-001", "name": "Update Package", "is_active": True},
-            )
-            _seed_fire_provider(tenant)
+        Without it, "declare trusted_match.core" could be satisfied by a literal
+        that no longer tracks whether the surface is actually wired.
+        """
+        with CapabilitiesEnv(tenant_id="tmp_caps_without", principal_id="caps_principal") as env:
+            tenant = TenantFactory(tenant_id="tmp_caps_without")
+            PrincipalFactory(tenant=tenant, principal_id="caps_principal")
             env._commit_factory_data()
 
-            with _captured_tmp_sync() as mock_client:
-                env.call_via(
-                    transport,
-                    req=UpdateMediaBuyRequest(media_buy_id=media_buy_id, budget=15000.0),
-                )
+            result = env.call_via(transport)
 
-        _assert_synced_once(mock_client, media_buy_id=media_buy_id, transport=transport)
+        assert result.is_success, result.error
+        assert TRUSTED_MATCH_FEATURE_ID not in _wire_experimental_features(result)

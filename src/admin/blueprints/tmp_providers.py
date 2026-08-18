@@ -6,9 +6,9 @@ and/or identity signals against their synced package set and returns scored
 offers. The TMP Router calls all active providers in parallel within the
 configured latency budget, then merges results for the publisher-side join.
 
-The Sales Agent exposes active registrations via the FastAPI discovery
-endpoint (``GET /tenant/{tenant_id}/tmp-providers/discovery``) so the
-router can poll for discovery — it never reads the DB directly.
+The Sales Agent exposes active registrations via the FastAPI discovery endpoint
+(``GET`` :data:`src.routes.tmp_providers.DISCOVERY_ROUTE`) so the router can poll
+for discovery — it never reads the DB directly.
 
 The Flask blueprint here handles the **admin CRUD UI** only.  The
 machine-to-machine discovery endpoint lives in ``src/routes/tmp_providers.py``.
@@ -28,8 +28,16 @@ from werkzeug.wrappers import Response
 
 from src.admin.utils import require_tenant_access
 from src.admin.utils.audit_decorator import log_admin_action
+from src.core.database.models import TMPProvider
 from src.core.database.repositories.uow import TMPProviderUoW
-from src.core.schemas.tmp_provider import TMPProviderFields, TMPProviderRegistration, TMPProviderValidationError
+from src.core.schemas.tmp_provider import (
+    VALID_STATUSES,
+    VALID_UID_TYPES,
+    TMPProviderFields,
+    TMPProviderFormDict,
+    TMPProviderRegistration,
+    TMPProviderValidationError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -142,16 +150,20 @@ def _parse_int_field(form: Mapping[str, str], field: str, default: str, label: s
         raise TMPProviderValidationError(f"{label} must be a numeric value") from exc
 
 
-def _split_csv(raw: str, *, upper: bool = False) -> list[str] | None:
+def _split_csv(raw: str) -> list[str] | None:
     """Split a comma-separated form field into a list, or ``None`` when empty.
 
     ``None`` (not ``[]``) is the "accepts all" sentinel used by the DB columns
     and the discovery contract, so an empty field must not become an empty
-    list.  *upper* uppercases each entry (ISO 3166-1 alpha-2 country codes).
+    list.
+
+    Pure form shape — no value normalization. It used to uppercase country codes
+    (``upper=True``), which made this helper the only thing anywhere moving a
+    value toward the schema's ``^[A-Z]{2}$``: a domain rule stranded in a form
+    helper, which the second write surface inherited nothing of. The rule now
+    lives on ``TMPProviderRegistration.countries`` (#1197 review).
     """
     items = [item.strip() for item in raw.split(",") if item.strip()]
-    if upper:
-        items = [item.upper() for item in items]
     return items or None
 
 
@@ -181,7 +193,7 @@ def _validate_provider_form(form: Mapping[str, str]) -> TMPProviderRegistration:
             endpoint=form.get("endpoint", "").strip(),
             context_match=form.get("context_match") == "on",
             identity_match=form.get("identity_match") == "on",
-            countries=_split_csv(form.get("countries", "").strip(), upper=True),
+            countries=_split_csv(form.get("countries", "").strip()),
             uid_types=_split_csv(form.get("uid_types", "").strip()),
             properties=_split_csv(form.get("properties", "").strip()),
             timeout_ms=_parse_int_field(form, "timeout_ms", "50", "Timeout (ms)"),
@@ -218,6 +230,52 @@ def _validated_registration_or_redirect(
     except TMPProviderValidationError as exc:
         flash(str(exc), "error")
         return on_error_redirect
+
+
+def _form_render_context() -> dict[str, list[str]]:
+    """The enum vocabularies the provider form renders.
+
+    Passed to the template rather than retyped in it: ``VALID_UID_TYPES`` /
+    ``VALID_STATUSES`` are SDK-derived and drift-guarded, so the guard covers the
+    UI too. The hand-written ``<code>`` list in the template had already gone
+    stale (missing ``rampid_derived`` and ``world_id_nullifier``), so the form
+    told an operator a value was invalid that the enum accepts and the form never
+    offered (#1197 review).
+    """
+    return {"valid_uid_types": sorted(VALID_UID_TYPES), "valid_statuses": sorted(VALID_STATUSES)}
+
+
+def _form_view(provider: TMPProvider) -> TMPProviderFormDict:
+    """Turn a provider into the edit form's shape.
+
+    Form shape belongs to this layer, so the list → comma-separated-string
+    conversion lives here rather than on the model, and the result is typed
+    (:class:`TMPProviderFormDict`) so a renamed key is a type error rather than a
+    silently blank input.
+
+    ``auth_credentials`` is a mask, never the value: the POST side preserves the
+    stored credential when the field comes back empty. ``has_auth_credentials``
+    is the model's presence accessor — it answers "is a credential set?" without
+    decrypting (the decrypting getter raises on a rotated ciphertext, turning a
+    form render into a 500) and without reaching past the property API into the
+    private column (#1197 review).
+    """
+    admin = provider.to_admin_dict()
+    return TMPProviderFormDict(
+        provider_id=admin["provider_id"],
+        name=admin["name"],
+        endpoint=admin["endpoint"],
+        context_match=admin["context_match"],
+        identity_match=admin["identity_match"],
+        timeout_ms=admin["timeout_ms"],
+        priority=admin["priority"],
+        status=admin["status"],
+        countries=",".join(provider.countries or []),
+        uid_types=",".join(provider.uid_types or []),
+        properties=",".join(provider.properties or []),
+        auth_type=provider.auth_type,
+        auth_credentials="••••••••" if provider.has_auth_credentials else "",
+    )
 
 
 @tmp_providers_bp.route("/")
@@ -279,6 +337,7 @@ def add_tmp_provider(tenant_id):
                 tenant_id=tenant_id,
                 tenant_name=tenant.name,
                 provider=None,
+                **_form_render_context(),
             )
 
     # POST — create new TMP provider
@@ -329,29 +388,13 @@ def edit_tmp_provider(tenant_id, provider_id):
             if not provider:
                 return _provider_not_found_redirect(tenant_id)
 
-            provider_dict = provider.to_admin_dict()
-            # Form fields need comma-separated strings, not lists
-            provider_dict["countries"] = ",".join(provider.countries or [])
-            provider_dict["uid_types"] = ",".join(provider.uid_types or [])
-            provider_dict["properties"] = ",".join(provider.properties or [])
-            # Auth fields are not in to_admin_dict() (sensitive / not part of the
-            # TMP Router contract). Render a placeholder instead of the plaintext
-            # credential so it is never echoed back to the browser — the POST side
-            # preserves the existing value when the field is left empty.
-            #
-            # has_auth_credentials is the model's presence accessor: it answers
-            # "is a credential set?" without decrypting (the decrypting getter
-            # raises on a rotated ciphertext) and without reading the private
-            # column the model forbids touching (#1197 review).
-            provider_dict["auth_type"] = provider.auth_type
-            provider_dict["auth_credentials"] = "••••••••" if provider.has_auth_credentials else ""
-
             return render_template(
                 "tmp_provider_form.html",
                 tenant=tenant,
                 tenant_id=tenant_id,
                 tenant_name=tenant.name,
-                provider=provider_dict,
+                provider=_form_view(provider),
+                **_form_render_context(),
             )
 
     # POST — update TMP provider

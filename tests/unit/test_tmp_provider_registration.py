@@ -10,6 +10,10 @@ Covers:
 - ``VALID_UID_TYPES`` / ``VALID_STATUSES`` track the pinned SDK enums *behaviourally*
   (every SDK value accepted, unknown values rejected) — not by re-asserting a literal
 - Each invariant rejects with the operator-facing message the admin UI flashes
+- Every *value* constraint the pinned schema puts on a persisted field is
+  enforced here, graded against the schema file itself rather than a restatement
+  of its numbers — a value this record accepts is a value the discovery wire must
+  be able to emit conformantly (#1197 review)
 - ``to_fields`` / ``to_update_fields`` produce the repository's write record
 - The shared rules agree with the SDK's own ``TmpProviderRegistration`` model
 """
@@ -30,6 +34,10 @@ from src.core.schemas.tmp_provider import (
     TMPProviderRegistration,
     TMPProviderValidationError,
 )
+from src.routes.tmp_providers import PROVIDER_REGISTRATION_SCHEMA
+from tests.helpers.pinned_schema import load as load_pinned_schema
+
+_RID = "0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6071"
 
 
 def _rejection_message(**overrides) -> str:
@@ -233,3 +241,86 @@ class TestAgreesWithTheSdkModel:
 
         registration = TMPProviderRegistration.parse(_fields(identity_match=True, countries=["US"], uid_types=["uid2"]))
         assert registration.uid_types == ["uid2"]
+
+
+class TestValueConstraintsComeFromTheSchema:
+    """Numeric and charset constraints are the pinned schema's, not this file's.
+
+    Each test reads the constraint out of
+    :data:`src.routes.tmp_providers.PROVIDER_REGISTRATION_SCHEMA` and drives the
+    record with a value one step outside it, so a spec bump that widens or
+    narrows a bound is graded automatically instead of being re-typed here.
+    These are the constraints that were absent until #1197 round 18: a
+    ``timeout_ms`` of 30000 and a ``priority`` of -1 were accepted and written,
+    and lowercase ``countries`` reached the machine wire verbatim.
+    """
+
+    @staticmethod
+    def _prop(name: str) -> dict:
+        return load_pinned_schema(PROVIDER_REGISTRATION_SCHEMA)["properties"][name]
+
+    def test_timeout_ms_bounds_match_the_schema(self):
+        schema = self._prop("timeout_ms")
+        low, high = schema["minimum"], schema["maximum"]
+
+        assert TMPProviderRegistration.parse(_fields(timeout_ms=low)).timeout_ms == low
+        assert TMPProviderRegistration.parse(_fields(timeout_ms=high)).timeout_ms == high
+        assert _rejection_message(timeout_ms=low - 1)
+        assert _rejection_message(timeout_ms=high + 1)
+
+    def test_priority_minimum_matches_the_schema(self):
+        minimum = self._prop("priority")["minimum"]
+
+        assert TMPProviderRegistration.parse(_fields(priority=minimum)).priority == minimum
+        assert _rejection_message(priority=minimum - 1)
+
+    def test_countries_must_match_the_schema_item_pattern(self):
+        """Uppercase ISO 3166-1 alpha-2 — the record's rule, not the form's.
+
+        ``upper=True`` on the blueprint's CSV splitter used to be the only thing
+        moving a country code toward this pattern, so the second write surface
+        inherited nothing.  The pattern lives here now and the splitter is back
+        to pure form shape.
+        """
+        assert self._prop("countries")["items"]["pattern"] == r"^[A-Z]{2}$"
+
+        accepted = TMPProviderRegistration.parse(_fields(identity_match=True, countries=["US"], uid_types=["uid2"]))
+        assert accepted.countries == ["US"]
+
+        for bad in (["usa"], ["us"], ["U"], ["USA"], ["U1"]):
+            assert _rejection_message(identity_match=True, countries=bad, uid_types=["uid2"]), bad
+
+    def test_properties_items_must_be_uuids(self):
+        assert self._prop("properties")["items"]["format"] == "uuid"
+
+        assert TMPProviderRegistration.parse(_fields(properties=[_RID])).properties == [_RID]
+        assert _rejection_message(properties=["rid-2"])
+
+    def test_accepted_values_are_emitted_conformantly(self):
+        """The boundary values this record accepts are values the wire can carry.
+
+        The point of the constraints: the record is the gate in front of every
+        write surface, so "accepted here" must imply "schema-valid there".  Built
+        through ``to_fields()`` → the discovery serializer's key set so the two
+        halves are graded as one path.
+        """
+        from tests.helpers.pinned_schema import validate_against_pinned_schema
+
+        schema = load_pinned_schema(PROVIDER_REGISTRATION_SCHEMA)["properties"]
+        registration = TMPProviderRegistration.parse(
+            _fields(
+                identity_match=True,
+                countries=["US", "DE"],
+                uid_types=["uid2"],
+                properties=[_RID],
+                timeout_ms=schema["timeout_ms"]["maximum"],
+                priority=schema["priority"]["minimum"],
+                status="draining",
+            )
+        )
+        fields = registration.to_fields()
+        entry = {
+            "provider_id": "prov_boundary",
+            **{k: v for k, v in fields.items() if k not in ("name", "auth_type", "auth_credentials")},
+        }
+        validate_against_pinned_schema(PROVIDER_REGISTRATION_SCHEMA, entry)

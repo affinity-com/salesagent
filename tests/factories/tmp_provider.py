@@ -18,8 +18,11 @@ class TMPProviderFactory(factory.alchemy.SQLAlchemyModelFactory):
     Creates active providers by default.  Override ``status``, ``priority``,
     ``tenant_id`` etc. as needed for specific test scenarios.
 
-    Note: ``provider_id`` uses a server-default (gen_random_uuid()) in
-    production, so we generate a UUID client-side here to avoid a round-trip.
+    Note: ``provider_id`` has both a server default and an ORM default in
+    production; generating it here avoids a round-trip.  It must be hyphen-free
+    (``uuid4().hex``) — the pinned provider-registration schema constrains
+    ``provider_id`` to ``^[A-Za-z0-9_]+$``, so a canonical UUID would seed rows
+    whose discovery entries the schema rejects (#1197 review).
     """
 
     class Meta:
@@ -30,7 +33,7 @@ class TMPProviderFactory(factory.alchemy.SQLAlchemyModelFactory):
 
     tenant = SubFactory(TenantFactory)
 
-    provider_id = factory.LazyFunction(lambda: str(uuid.uuid4()))
+    provider_id = factory.LazyFunction(lambda: uuid.uuid4().hex)
     tenant_id = LazyAttribute(lambda o: o.tenant.tenant_id)
     name = Sequence(lambda n: f"Provider {n:04d}")
     endpoint = LazyAttribute(lambda o: f"https://{o.name.lower().replace(' ', '-')}.example.com/tmp")
@@ -57,7 +60,8 @@ def replace_tmp_providers(env: Any, tenant_id: str, **fields: Any) -> TMPProvide
     through :class:`TMPProviderFactory` instead of hand-constructing the ORM row
     (CLAUDE.md Pattern #8 — no ``session.add()`` in test bodies).
 
-    Existing providers for the tenant are deleted first. That is the point of
+    Existing providers for the tenant are deleted first — by calling
+    :func:`delete_tmp_providers`, not by re-implementing it. That is the point of
     "replace": the sync fans out to *every* syncable provider, so a row left by
     an earlier run would add unrelated POSTs — and unresolvable-host errors — to
     this tenant's fan-out.
@@ -69,14 +73,9 @@ def replace_tmp_providers(env: Any, tenant_id: str, **fields: Any) -> TMPProvide
 
     Returns the created provider.
     """
-    from sqlalchemy import select
+    delete_tmp_providers(env, tenant_id)
 
-    session = env.get_session()
-    for stale in session.scalars(select(TMPProvider).filter_by(tenant_id=tenant_id)).all():
-        session.delete(stale)
-    session.commit()
-
-    TMPProviderFactory._meta.sqlalchemy_session = session
+    TMPProviderFactory._meta.sqlalchemy_session = env.get_session()
     try:
         return TMPProviderFactory(tenant_id=tenant_id, tenant=None, **fields)
     finally:
@@ -90,4 +89,26 @@ def delete_tmp_providers(env: Any, tenant_id: str) -> None:
     session = env.get_session()
     for row in session.scalars(select(TMPProvider).filter_by(tenant_id=tenant_id)).all():
         session.delete(row)
+    session.commit()
+
+
+def plant_seller_agent_host(env: Any, tenant_id: str, host: str) -> None:
+    """Give *tenant_id* a public ``virtual_host`` so TMP sync can resolve a seller agent.
+
+    ``_resolve_seller_agent_url`` needs an https URL for
+    ``AvailablePackage.seller_agent`` and correctly SKIPS the sync when it cannot
+    build one, so a test that registers a provider but leaves the tenant without
+    a public host observes no delivery — and would fail for a reason unrelated to
+    what it grades. Planting the host here (rather than in each caller) keeps that
+    precondition attached to the provider seeding it belongs to.
+    """
+    from sqlalchemy import select
+
+    from src.core.database.models import Tenant
+
+    session = env.get_session()
+    tenant = session.scalars(select(Tenant).filter_by(tenant_id=tenant_id)).first()
+    if tenant is None:
+        raise LookupError(f"Cannot plant a seller-agent host: no tenant {tenant_id!r}")
+    tenant.virtual_host = host
     session.commit()

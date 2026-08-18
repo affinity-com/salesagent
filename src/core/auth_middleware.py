@@ -47,8 +47,9 @@ class UnifiedAuthMiddleware:
         # Token extraction: x-adcp-auth takes priority (AdCP convention),
         # then Authorization: Bearer (case-insensitive per RFC 7235 §2.1).
         # parse_bearer_token() is the single canonical Bearer parser shared
-        # across auth.py, auth_middleware.py, resolved_identity.py, and
-        # routes/tmp_providers.py.
+        # across auth.py, auth_middleware.py, and resolved_identity.py.
+        # Routes never parse the header themselves — the TMP discovery route
+        # reads the token this middleware extracts (#1197 review).
         token: str | None = None
         x_adcp = headers.get("x-adcp-auth", "").strip()
         if x_adcp:

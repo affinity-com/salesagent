@@ -1,13 +1,19 @@
-"""Unit tests for TMP Provider admin blueprint.
+"""Unit tests for the TMP Provider admin blueprint — what this LAYER adds.
 
-Covers:
-- SSRF validation on add/edit endpoints (check_url_ssrf wiring)
-- Input validation (missing name, missing endpoint, invalid timeout_ms, invalid status)
-- Identity match validation (countries/uid_types required, uid_type enum)
-- CRUD route responses (list, add GET, deactivate, delete, health check)
-- TMPProviderUoW used instead of raw DB calls
-- @log_admin_action on destructive routes
-- TMPProvider.to_admin_dict() serialization (real model, not mock)
+Registration *validity* (which values are legal) belongs to
+``TMPProviderRegistration`` and is graded in
+``tests/unit/test_tmp_provider_registration.py``. This file grades only what the
+blueprint itself owns:
+
+- one proof that a rejected registration flashes, bounces, and does not write,
+  driven by ``@parametrize`` over the invalid payloads — this used to be eight
+  byte-identical bodies each re-enumerating an invariant the record's suite now
+  owns (#1197 review)
+- CSV/checkbox/int form shape reaching ``create_from_fields`` / ``update_fields``
+- the credential-preservation rule on edit, and the masked (never echoed) render
+- the render kwargs of the list and add-GET branches
+- the two error helpers' 500 / flash+redirect shapes
+- CRUD route responses (deactivate, delete, health check) and their JSON bodies
 
 Note: Discovery endpoint tests are in test_tmp_providers_discovery_route.py
 (the canonical discovery endpoint is the FastAPI route, not Flask).
@@ -16,7 +22,10 @@ Note: Discovery endpoint tests are in test_tmp_providers_discovery_route.py
 import os
 from unittest.mock import patch
 
+import pytest
+
 from src.core.database.models import TMPProvider
+from src.core.schemas.tmp_provider import VALID_STATUSES, VALID_UID_TYPES
 from tests.unit._tmp_helpers import _make_blueprint_uow, _make_mock_provider, make_super_admin_client
 
 
@@ -25,37 +34,68 @@ def _make_tmp_provider_client():
     return make_super_admin_client()
 
 
-class TestTMPProviderAddSSRF:
-    """SSRF validation is wired into the add endpoint."""
+_SAFE_ENDPOINT = "https://provider.example.com/tmp"
 
-    def test_add_rejects_docker_internal_url(self):
-        """POST /tmp-providers/add with host.docker.internal URL must redirect with error.
+# One valid add payload; each rejection case overrides exactly one thing, so a
+# failure names the rejected field rather than a setup mistake.
+_VALID_ADD_FORM: dict[str, str] = {
+    "name": "Test Provider",
+    "endpoint": _SAFE_ENDPOINT,
+    "context_match": "on",
+    "timeout_ms": "50",
+}
 
-        Uses context_match-only form data (no identity_match) so the SSRF check
-        is the sole rejection reason — the test is not accidentally relying on
-        identity_match validation firing first.
-        """
-        client = _make_tmp_provider_client()
+# WHICH values are invalid is the record's contract (graded in
+# test_tmp_provider_registration.py). This list exists only to drive the ONE
+# layer-level claim below across the rejection paths a form can produce —
+# including the two the record cannot see (non-numeric int, unsafe URL).
+_REJECTED_ADD_FORMS: list[tuple[str, dict[str, str]]] = [
+    ("ssrf_endpoint", {"endpoint": "http://host.docker.internal:9999"}),
+    ("missing_endpoint", {"endpoint": ""}),
+    ("missing_name", {"name": ""}),
+    ("non_numeric_timeout", {"timeout_ms": "not-a-number"}),
+    ("invalid_status", {"status": "bogus_status"}),
+    ("identity_match_without_countries", {"identity_match": "on", "countries": "", "uid_types": "uid2"}),
+    ("identity_match_without_uid_types", {"identity_match": "on", "countries": "US", "uid_types": ""}),
+    ("invalid_uid_type", {"identity_match": "on", "countries": "US", "uid_types": "bogus_type"}),
+    ("lowercase_country", {"identity_match": "on", "countries": "usa", "uid_types": "uid2"}),
+]
 
+
+def _post_add(form: dict[str, str], mock_uow_cls) -> object:
+    """POST the add form with DNS stubbed public, returning the response."""
+    client = _make_tmp_provider_client()
+    with (
+        patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls),
+        patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"),
+        patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}),
+    ):
+        return client.post("/tenant/default/tmp-providers/add", data=form, follow_redirects=False)
+
+
+class TestRejectedRegistrationIsFlashedAndNotWritten:
+    """The layer's rejection contract, proved once over every rejection path.
+
+    A rejected registration must (a) bounce back to the add form and (b) NOT
+    persist. The bounce alone is not enough: a regression that flashes,
+    redirects AND writes the row would pass on the redirect assertions, which is
+    why ``create_from_fields.assert_not_called()`` is here rather than in a
+    comment.
+    """
+
+    @pytest.mark.parametrize("form_overrides", [pytest.param(o, id=name) for name, o in _REJECTED_ADD_FORMS])
+    def test_rejected_add_flashes_bounces_and_does_not_write(self, form_overrides):
         mock_uow_cls, mock_uow = _make_blueprint_uow()
-        with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
-            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                response = client.post(
-                    "/tenant/default/tmp-providers/add",
-                    data={
-                        "name": "SSRF Test Provider",
-                        "endpoint": "http://host.docker.internal:9999",
-                        "context_match": "on",
-                        # identity_match intentionally omitted — context-only provider
-                        # so the SSRF check is the only validation that fires.
-                        "timeout_ms": "50",
-                    },
-                    follow_redirects=False,
-                )
+
+        response = _post_add({**_VALID_ADD_FORM, **form_overrides}, mock_uow_cls)
 
         assert response.status_code == 302
         assert "add" in response.headers.get("Location", "")
         mock_uow.tmp_providers.create_from_fields.assert_not_called()
+
+
+class TestTMPProviderAddSSRF:
+    """SSRF validation is wired into the add endpoint."""
 
     def test_add_accepts_safe_public_url(self):
         """POST /tmp-providers/add with a safe public URL must proceed past SSRF check."""
@@ -119,7 +159,7 @@ class TestTMPProviderEditSSRF:
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
             with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
                 response = client.post(
-                    "/tenant/default/tmp-providers/test-uuid-1234/edit",
+                    "/tenant/default/tmp-providers/prov_test_1234/edit",
                     data={
                         "name": "Existing Provider",
                         "endpoint": "http://host.docker.internal:9999",
@@ -155,7 +195,7 @@ class TestTMPProviderEditSSRF:
             with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
                 with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
                     response = client.post(
-                        "/tenant/default/tmp-providers/test-uuid-1234/edit",
+                        "/tenant/default/tmp-providers/prov_test_1234/edit",
                         data={
                             "name": "Existing Provider",
                             "endpoint": "https://provider.example.com/tmp",
@@ -172,7 +212,7 @@ class TestTMPProviderEditSSRF:
         assert response.status_code == 302
         assert "tmp-providers" in response.headers.get("Location", "")
         mock_uow.tmp_providers.update_fields.assert_called_once_with(
-            "test-uuid-1234",
+            "prov_test_1234",
             name="Existing Provider",
             endpoint="https://provider.example.com/tmp",
             context_match=True,
@@ -189,109 +229,6 @@ class TestTMPProviderEditSSRF:
 
 class TestTMPProviderInputValidation:
     """Input validation for required fields."""
-
-    def test_add_rejects_missing_endpoint(self):
-        """POST /tmp-providers/add without endpoint must redirect with error."""
-        client = _make_tmp_provider_client()
-
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
-        with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
-            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                response = client.post(
-                    "/tenant/default/tmp-providers/add",
-                    data={
-                        "name": "No Endpoint Provider",
-                        "endpoint": "",
-                        "context_match": "on",
-                        "timeout_ms": "50",
-                    },
-                    follow_redirects=False,
-                )
-
-        assert response.status_code == 302
-        assert "add" in response.headers.get("Location", "")
-        # The bounce alone doesn't prove the write was suppressed — a regression
-        # that flashes, redirects, AND persists the row would pass on the two
-        # assertions above. Matches the SSRF / identity-match rejection siblings.
-        mock_uow.tmp_providers.create_from_fields.assert_not_called()
-
-    def test_add_rejects_missing_name(self):
-        """POST /tmp-providers/add without name must redirect with error."""
-        client = _make_tmp_provider_client()
-
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
-        with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
-            with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
-                with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                    response = client.post(
-                        "/tenant/default/tmp-providers/add",
-                        data={
-                            "name": "",
-                            "endpoint": "https://provider.example.com/tmp",
-                            "context_match": "on",
-                            "timeout_ms": "50",
-                        },
-                        follow_redirects=False,
-                    )
-
-        assert response.status_code == 302
-        assert "add" in response.headers.get("Location", "")
-        # The bounce alone doesn't prove the write was suppressed — a regression
-        # that flashes, redirects, AND persists the row would pass on the two
-        # assertions above. Matches the SSRF / identity-match rejection siblings.
-        mock_uow.tmp_providers.create_from_fields.assert_not_called()
-
-    def test_add_rejects_non_numeric_timeout_ms(self):
-        """POST /tmp-providers/add with non-numeric timeout_ms must redirect with error."""
-        client = _make_tmp_provider_client()
-
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
-        with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
-            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                response = client.post(
-                    "/tenant/default/tmp-providers/add",
-                    data={
-                        "name": "Test Provider",
-                        "endpoint": "https://provider.example.com/tmp",
-                        "context_match": "on",
-                        "timeout_ms": "not-a-number",
-                    },
-                    follow_redirects=False,
-                )
-
-        assert response.status_code == 302
-        assert "add" in response.headers.get("Location", "")
-        # The bounce alone doesn't prove the write was suppressed — a regression
-        # that flashes, redirects, AND persists the row would pass on the two
-        # assertions above. Matches the SSRF / identity-match rejection siblings.
-        mock_uow.tmp_providers.create_from_fields.assert_not_called()
-
-    def test_add_rejects_invalid_status(self):
-        """POST /tmp-providers/add with invalid status must redirect with error."""
-        client = _make_tmp_provider_client()
-
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
-        with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
-            with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
-                with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                    response = client.post(
-                        "/tenant/default/tmp-providers/add",
-                        data={
-                            "name": "Test Provider",
-                            "endpoint": "https://provider.example.com/tmp",
-                            "context_match": "on",
-                            "timeout_ms": "50",
-                            "status": "bogus_status",
-                        },
-                        follow_redirects=False,
-                    )
-
-        assert response.status_code == 302
-        assert "add" in response.headers.get("Location", "")
-        # The bounce alone doesn't prove the write was suppressed — a regression
-        # that flashes, redirects, AND persists the row would pass on the two
-        # assertions above. Matches the SSRF / identity-match rejection siblings.
-        mock_uow.tmp_providers.create_from_fields.assert_not_called()
 
     def test_add_passes_status_to_create_from_fields(self):
         """POST /tmp-providers/add with explicit status passes it to create_from_fields."""
@@ -333,88 +270,6 @@ class TestTMPProviderInputValidation:
         )
 
 
-class TestTMPProviderIdentityMatchValidation:
-    """Identity match validation: countries/uid_types required, uid_type enum enforced."""
-
-    def test_add_rejects_identity_match_without_countries(self):
-        """POST /tmp-providers/add with identity_match=on but no countries must redirect with error."""
-        client = _make_tmp_provider_client()
-
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
-        with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
-            with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
-                with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                    response = client.post(
-                        "/tenant/default/tmp-providers/add",
-                        data={
-                            "name": "No Countries Provider",
-                            "endpoint": "https://provider.example.com/tmp",
-                            "identity_match": "on",
-                            "countries": "",
-                            "uid_types": "uid2",
-                            "timeout_ms": "50",
-                        },
-                        follow_redirects=False,
-                    )
-
-        assert response.status_code == 302
-        assert "add" in response.headers.get("Location", "")
-        # Production uses create_from_fields, not create — assert the right method.
-        mock_uow.tmp_providers.create_from_fields.assert_not_called()
-
-    def test_add_rejects_identity_match_without_uid_types(self):
-        """POST /tmp-providers/add with identity_match=on but no uid_types must redirect with error."""
-        client = _make_tmp_provider_client()
-
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
-        with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
-            with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
-                with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                    response = client.post(
-                        "/tenant/default/tmp-providers/add",
-                        data={
-                            "name": "No UID Types Provider",
-                            "endpoint": "https://provider.example.com/tmp",
-                            "identity_match": "on",
-                            "countries": "US",
-                            "uid_types": "",
-                            "timeout_ms": "50",
-                        },
-                        follow_redirects=False,
-                    )
-
-        assert response.status_code == 302
-        assert "add" in response.headers.get("Location", "")
-        # Production uses create_from_fields, not create — assert the right method.
-        mock_uow.tmp_providers.create_from_fields.assert_not_called()
-
-    def test_add_rejects_invalid_uid_type_value(self):
-        """POST /tmp-providers/add with invalid uid_type value must redirect with error."""
-        client = _make_tmp_provider_client()
-
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
-        with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
-            with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
-                with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                    response = client.post(
-                        "/tenant/default/tmp-providers/add",
-                        data={
-                            "name": "Bad UID Provider",
-                            "endpoint": "https://provider.example.com/tmp",
-                            "identity_match": "on",
-                            "countries": "US",
-                            "uid_types": "bogus_type",
-                            "timeout_ms": "50",
-                        },
-                        follow_redirects=False,
-                    )
-
-        assert response.status_code == 302
-        assert "add" in response.headers.get("Location", "")
-        # Production uses create_from_fields, not create — assert the right method.
-        mock_uow.tmp_providers.create_from_fields.assert_not_called()
-
-
 class TestTMPProviderDeactivate:
     """Deactivate endpoint sets status='inactive' via repository."""
 
@@ -429,13 +284,13 @@ class TestTMPProviderDeactivate:
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
             with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
                 response = client.post(
-                    "/tenant/default/tmp-providers/test-uuid-1234/deactivate",
+                    "/tenant/default/tmp-providers/prov_test_1234/deactivate",
                 )
 
         assert response.status_code == 200
         data = response.get_json()
         assert data["success"] is True
-        mock_uow.tmp_providers.deactivate.assert_called_once_with("test-uuid-1234")
+        mock_uow.tmp_providers.deactivate.assert_called_once_with("prov_test_1234")
 
     def test_deactivate_returns_404_for_missing_provider(self):
         """POST /tmp-providers/<id>/deactivate returns 404 when provider not found."""
@@ -469,13 +324,13 @@ class TestTMPProviderDelete:
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
             with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
                 response = client.delete(
-                    "/tenant/default/tmp-providers/test-uuid-1234/delete",
+                    "/tenant/default/tmp-providers/prov_test_1234/delete",
                 )
 
         assert response.status_code == 200
         data = response.get_json()
         assert data["success"] is True
-        mock_uow.tmp_providers.delete.assert_called_once_with("test-uuid-1234")
+        mock_uow.tmp_providers.delete.assert_called_once_with("prov_test_1234")
 
     def test_delete_returns_404_for_missing_provider(self):
         """DELETE /tmp-providers/<id>/delete returns 404 when provider not found."""
@@ -510,7 +365,7 @@ class TestTMPProviderHealthCheck:
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
             with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
                 response = client.get(
-                    "/tenant/default/tmp-providers/test-uuid-1234/health",
+                    "/tenant/default/tmp-providers/prov_test_1234/health",
                 )
 
         assert response.status_code == 200
@@ -534,7 +389,7 @@ class TestTMPProviderHealthCheck:
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
             with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
                 response = client.get(
-                    "/tenant/default/tmp-providers/test-uuid-1234/health",
+                    "/tenant/default/tmp-providers/prov_test_1234/health",
                 )
 
         assert response.status_code == 200
@@ -555,7 +410,7 @@ class TestTMPProviderHealthCheck:
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
             with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
                 response = client.get(
-                    "/tenant/default/tmp-providers/test-uuid-1234/health",
+                    "/tenant/default/tmp-providers/prov_test_1234/health",
                 )
 
         assert response.status_code == 200
@@ -623,7 +478,7 @@ class TestTMPProviderAuthFields:
 
         # Real TMPProvider instance — to_admin_dict() is the production implementation.
         existing_provider = TMPProvider(
-            provider_id="test-uuid-1234",
+            provider_id="prov_test_1234",
             tenant_id="default",
             name="Test Provider",
             endpoint="https://provider.example.com/tmp",
@@ -652,7 +507,7 @@ class TestTMPProviderAuthFields:
                     mock_render.return_value = "<html/>"
                     with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
                         response = client.get(
-                            "/tenant/default/tmp-providers/test-uuid-1234/edit",
+                            "/tenant/default/tmp-providers/prov_test_1234/edit",
                         )
 
         assert response.status_code == 200
@@ -665,7 +520,7 @@ class TestTMPProviderAuthFields:
             tenant_id="default",
             tenant_name="Default Tenant",
             provider={
-                "provider_id": "test-uuid-1234",
+                "provider_id": "prov_test_1234",
                 "name": "Test Provider",
                 "endpoint": "https://provider.example.com/tmp",
                 "context_match": True,
@@ -679,6 +534,8 @@ class TestTMPProviderAuthFields:
                 "auth_type": "bearer",
                 "auth_credentials": "••••••••",
             },
+            valid_uid_types=sorted(VALID_UID_TYPES),
+            valid_statuses=sorted(VALID_STATUSES),
         )
 
     def test_edit_post_preserves_existing_credentials_when_empty_submitted(self):
@@ -695,7 +552,7 @@ class TestTMPProviderAuthFields:
             with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
                 with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
                     response = client.post(
-                        "/tenant/default/tmp-providers/test-uuid-1234/edit",
+                        "/tenant/default/tmp-providers/prov_test_1234/edit",
                         data={
                             "name": "Existing Provider",
                             "endpoint": "https://provider.example.com/tmp",
@@ -715,7 +572,7 @@ class TestTMPProviderAuthFields:
         # Production uses update_fields() — verify auth_credentials was NOT
         # included in the kwargs (empty submission preserves existing value).
         mock_uow.tmp_providers.update_fields.assert_called_once_with(
-            "test-uuid-1234",
+            "prov_test_1234",
             name="Existing Provider",
             endpoint="https://provider.example.com/tmp",
             context_match=True,
@@ -744,7 +601,7 @@ class TestTMPProviderAuthFields:
             with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
                 with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
                     response = client.post(
-                        "/tenant/default/tmp-providers/test-uuid-1234/edit",
+                        "/tenant/default/tmp-providers/prov_test_1234/edit",
                         data={
                             "name": "Existing Provider",
                             "endpoint": "https://provider.example.com/tmp",
@@ -764,7 +621,7 @@ class TestTMPProviderAuthFields:
         # Production uses update_fields() — verify auth_credentials IS included
         # with the new value when a non-empty credential is submitted.
         mock_uow.tmp_providers.update_fields.assert_called_once_with(
-            "test-uuid-1234",
+            "prov_test_1234",
             name="Existing Provider",
             endpoint="https://provider.example.com/tmp",
             context_match=True,
@@ -784,3 +641,206 @@ class TestTMPProviderAuthFields:
 # canonical home for model contract tests — uses _tmp_helpers._make_provider).
 # Keeping a second copy here would require parallel edits on every serializer
 # change and one copy would inevitably drift (CLAUDE.md DRY invariant).
+
+
+class TestListRouteRenderKwargs:
+    """``list_tmp_providers`` builds the table rows the list template reads.
+
+    The list branch was reworked twice in this PR with nothing grading it —
+    deleting the ``created_at`` line failed no test, and neither did dropping a
+    provider from the list (#1197 review).
+    """
+
+    def test_rows_carry_the_admin_shape_plus_created_at(self):
+        from datetime import UTC, datetime
+
+        created = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
+        provider = TMPProvider(
+            provider_id="prov_list_1",
+            tenant_id="default",
+            name="Listed Provider",
+            endpoint=_SAFE_ENDPOINT,
+            context_match=True,
+            identity_match=False,
+            countries=None,
+            uid_types=None,
+            properties=None,
+            timeout_ms=50,
+            priority=0,
+            status="active",
+        )
+        provider.created_at = created
+
+        client = _make_tmp_provider_client()
+        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_tenant = mock_uow.tenant_config.get_tenant.return_value
+        mock_uow.tmp_providers.list_all.return_value = [provider]
+
+        with (
+            patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls),
+            patch("src.admin.blueprints.tmp_providers.render_template") as mock_render,
+            patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}),
+        ):
+            mock_render.return_value = "<html/>"
+            response = client.get("/tenant/default/tmp-providers/")
+
+        assert response.status_code == 200
+        mock_render.assert_called_once_with(
+            "tmp_providers.html",
+            tenant=mock_tenant,
+            tenant_id="default",
+            tenant_name="Default Tenant",
+            providers=[
+                {
+                    "provider_id": "prov_list_1",
+                    "name": "Listed Provider",
+                    "endpoint": _SAFE_ENDPOINT,
+                    "context_match": True,
+                    "identity_match": False,
+                    "timeout_ms": 50,
+                    "priority": 0,
+                    "status": "active",
+                    "countries": None,
+                    "uid_types": None,
+                    "properties": None,
+                    "created_at": created,
+                }
+            ],
+        )
+
+
+class TestAddGetRendersTheEmptyForm:
+    """The add-GET branch renders the form with no provider and both vocabularies.
+
+    The vocabularies are the point: passing them is what keeps the UI's uid-type
+    and status lists in step with the SDK-derived enums instead of the stale
+    hand-typed copies the template used to carry (#1197 review).
+    """
+
+    def test_renders_with_no_provider_and_the_enum_vocabularies(self):
+        client = _make_tmp_provider_client()
+        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_tenant = mock_uow.tenant_config.get_tenant.return_value
+
+        with (
+            patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls),
+            patch("src.admin.blueprints.tmp_providers.render_template") as mock_render,
+            patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}),
+        ):
+            mock_render.return_value = "<html/>"
+            response = client.get("/tenant/default/tmp-providers/add")
+
+        assert response.status_code == 200
+        mock_render.assert_called_once_with(
+            "tmp_provider_form.html",
+            tenant=mock_tenant,
+            tenant_id="default",
+            tenant_name="Default Tenant",
+            provider=None,
+            valid_uid_types=sorted(VALID_UID_TYPES),
+            valid_statuses=sorted(VALID_STATUSES),
+        )
+
+    def test_the_rendered_vocabularies_cover_the_whole_enum(self):
+        """Every SDK uid type and status reaches the template context.
+
+        Pins the fix for the specific drift found in review: the template's
+        hand-written list was missing ``rampid_derived`` and
+        ``world_id_nullifier``, so the form rejected values the enum accepts.
+        """
+        from src.admin.blueprints.tmp_providers import _form_render_context
+
+        context = _form_render_context()
+
+        assert set(context["valid_uid_types"]) == set(VALID_UID_TYPES)
+        assert set(context["valid_statuses"]) == set(VALID_STATUSES)
+
+
+class TestEditGetSurvivesAnUnreadableCredential:
+    """A rotated/corrupt ciphertext must render the form, not a 500.
+
+    ``has_auth_credentials`` exists precisely so the edit render never goes
+    through the decrypting getter. Swapping it back for ``auth_credentials``
+    turns this page into a 500 for every operator whose encryption key was
+    rotated — and until this test, that swap failed nothing (#1197 review).
+    """
+
+    def test_edit_get_renders_the_mask_for_a_corrupt_credential(self):
+        provider = TMPProvider(
+            provider_id="prov_corrupt_1",
+            tenant_id="default",
+            name="Rotated Provider",
+            endpoint=_SAFE_ENDPOINT,
+            context_match=True,
+            identity_match=False,
+            countries=None,
+            uid_types=None,
+            properties=None,
+            timeout_ms=50,
+            priority=0,
+            status="active",
+            auth_type="bearer",
+        )
+        # The raw column, deliberately not written through the encrypting setter:
+        # this is the on-disk state after a key rotation.
+        provider._auth_credentials = "not-a-valid-fernet-token"
+
+        client = _make_tmp_provider_client()
+        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow.tmp_providers.get_by_id.return_value = provider
+
+        with (
+            patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls),
+            patch("src.admin.blueprints.tmp_providers.render_template") as mock_render,
+            patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}),
+        ):
+            mock_render.return_value = "<html/>"
+            response = client.get("/tenant/default/tmp-providers/prov_corrupt_1/edit")
+
+        assert response.status_code == 200
+        rendered_provider = mock_render.call_args.kwargs["provider"]
+        assert rendered_provider["auth_credentials"] == "••••••••"
+        assert "not-a-valid-fernet-token" not in str(rendered_provider)
+
+
+class TestErrorHelpers:
+    """The two extracted error helpers' response shapes.
+
+    Six call sites route through them, and until now deleting an entire
+    ``except`` block failed nothing (#1197 review). Driven through a real route
+    (an exception raised inside the handler) rather than by calling the helper
+    directly, so the wiring is graded too.
+    """
+
+    def test_json_route_failure_returns_500_with_the_action_in_the_body(self):
+        """``_log_and_500``: JSON 500 naming the action, from the deactivate route."""
+        client = _make_tmp_provider_client()
+        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow.tmp_providers.deactivate.side_effect = RuntimeError("db exploded")
+
+        with (
+            patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls),
+            patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}),
+        ):
+            response = client.post("/tenant/default/tmp-providers/prov_1/deactivate")
+
+        assert response.status_code == 500
+        assert response.get_json() == {"error": "Error deactivating TMP provider"}
+
+    def test_flash_route_failure_redirects_to_tenant_settings(self):
+        """``_log_flash_and_redirect``: flash + redirect, from the list route."""
+        client = _make_tmp_provider_client()
+        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow.tmp_providers.list_all.side_effect = RuntimeError("db exploded")
+
+        with (
+            patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls),
+            patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}),
+        ):
+            response = client.get("/tenant/default/tmp-providers/", follow_redirects=False)
+            with client.session_transaction() as session:
+                flashes = session.get("_flashes", [])
+
+        assert response.status_code == 302
+        assert "/settings" in response.headers["Location"]
+        assert ("error", "Error loading TMP providers") in flashes

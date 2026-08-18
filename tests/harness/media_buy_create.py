@@ -23,6 +23,7 @@ from src.core.schemas._base import (
     CreateMediaBuySuccess,
 )
 from tests.harness._base import IntegrationEnv
+from tests.harness._mixins import TMPSyncMixin
 
 # Sentinel for missing-key tests: pass idempotency_key=OMIT_IDEMPOTENCY_KEY to send a
 # request with NO key (the schema rejects it as "Field required" — AdCP 3.0.1).
@@ -62,11 +63,18 @@ def _restore_creative_ids(req: CreateMediaBuyRequest, flat: dict[str, Any]) -> N
             flat_pkgs[i]["creative_ids"] = cids
 
 
-class MediaBuyCreateEnv(IntegrationEnv):
+class MediaBuyCreateEnv(TMPSyncMixin, IntegrationEnv):
     """Integration test environment for _create_media_buy_impl.
 
     Mocks external services (adapter, audit, slack, context manager).
     Everything else is real: DB, repositories, validation, schema processing.
+
+    :class:`~tests.harness._mixins.TMPSyncMixin` is mixed in because every
+    create/update dispatched here fires the TMP package sync at the transport
+    boundary. Scenarios that grade it call ``register_tmp_provider()`` /
+    ``await_tmp_sync()``; every other scenario gets the same seam as a no-op and,
+    crucially, gets its fire-and-forget threads drained at ``__exit__`` instead of
+    leaving them to open DB sessions after the test's scope (#1197 review).
     """
 
     EXTERNAL_PATCHES = {
@@ -406,6 +414,11 @@ class MediaBuyCreateEnv(IntegrationEnv):
             _restore_creative_ids(req, body)
             return body
         return _ensure_idempotency_key(kwargs)
+
+    def __exit__(self, *exc: object) -> bool:
+        """Drain/stop the TMP sync seam before the base env tears sessions down."""
+        self._teardown_tmp_sync()
+        return super().__exit__(*exc)
 
     def parse_rest_response(self, data: dict[str, Any]) -> CreateMediaBuyResult:
         """Parse a flattened create_media_buy wire body back into a CreateMediaBuyResult.

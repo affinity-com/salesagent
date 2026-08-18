@@ -13,21 +13,37 @@ Covers:
 - Response shape matches TMP Router contract
 - Providers ordered by priority ASC, name ASC
 - Handles legacy rows with null countries/uid_types
-- Fail-closed auth: unset/empty TMP_DISCOVERY_API_KEYS → 500 (CONFIGURATION_ERROR)
-- Explicit opt-out: TMP_DISCOVERY_API_KEYS=OPEN disables auth
 - uow.tenant_config is None → 500 (not an assert)
-- TMPProvider.to_discovery_dict() / to_admin_dict() serialize their own contracts
+- TMPProvider.to_discovery_dict() / to_admin_dict() serialize their own contracts,
+  the discovery half graded against the pinned schema itself
+
+Every request here goes through the PRODUCTION app (``src.app.app``) — its
+router mount, its middleware stack and its ``AdCPError`` handler — rather than a
+test-local ``FastAPI()`` with a re-declared handler.  A restated handler can only
+detect key-name drift in its own copy; the production one is the thing the
+contract is served by.  The credential gate is the one dependency overridden,
+because resolving a credential needs a real tenant + principal row: the auth
+matrix (missing / cross-tenant / principal / admin token) is graded for real
+against the same app in ``tests/integration/test_tmp_provider_integration.py``
+(#1197 review).
 """
 
 from unittest.mock import MagicMock, patch
 
 import pytest
+from adcp.types.generated_poc.trusted_match.provider_registration import TmpProviderRegistration
 from fastapi.testclient import TestClient
 from sqlalchemy.orm.exc import DetachedInstanceError
 
 from src.core.database.models import TMPProvider
+from src.routes.tmp_providers import PROVIDER_REGISTRATION_SCHEMA
 from tests.helpers.envelope_assertions import assert_envelope_shape
+from tests.helpers.pinned_schema import validate_against_pinned_schema
 from tests.unit._tmp_helpers import _make_provider, _make_tmp_uow, _mock_cm
+
+# A property RID is `format: uuid` in the pinned schema, so test fixtures must
+# use a real UUID rather than a readable placeholder.
+_RID = "0192f3c4-5d6e-7f80-9a1b-2c3d4e5f6071"
 
 
 def _make_tenant(tenant_id="si-host"):
@@ -37,33 +53,29 @@ def _make_tenant(tenant_id="si-host"):
     return t
 
 
+_STUB_PRINCIPAL = "tmp-router-principal"
+
+
 @pytest.fixture
 def client():
-    """Create a FastAPI TestClient with the tmp_providers router and AdCPError handler mounted.
+    """A TestClient over the PRODUCTION app with the credential gate stubbed.
 
-    The handler mirrors the production handler in src/app.py exactly:
-    ``build_two_layer_error_envelope(exc)`` is returned at the top level (no
-    ``"detail"`` wrapper).  Tests assert via ``assert_envelope_shape()`` so
-    that deleting this handler from the production app would break the tests.
+    ``src.app.app`` brings its own router mount, middleware stack and
+    ``AdCPError`` handler, so the envelopes these tests assert on are the ones
+    the deployed endpoint emits — deleting the production handler breaks them.
+    Only :func:`require_tenant_credential` is overridden: resolving a credential
+    reads tenant + principal rows, which is an integration concern, and the auth
+    matrix itself is graded against this same app with a real DB in
+    ``tests/integration/test_tmp_provider_integration.py`` (#1197 review).
     """
-    from fastapi import FastAPI, Request
-    from fastapi.responses import JSONResponse
+    from src.app import app
+    from src.routes.tmp_providers import require_tenant_credential
 
-    from src.core.exceptions import AdCPError, build_two_layer_error_envelope
-    from src.routes.tmp_providers import router
-
-    app = FastAPI()
-    app.include_router(router)
-
-    @app.exception_handler(AdCPError)
-    async def adcp_error_handler(request: Request, exc: AdCPError) -> JSONResponse:
-        # Matches src/app.py adcp_error_handler exactly — envelope at top level.
-        return JSONResponse(
-            status_code=exc.status_code,
-            content=build_two_layer_error_envelope(exc),
-        )
-
-    return TestClient(app, raise_server_exceptions=False)
+    app.dependency_overrides[require_tenant_credential] = lambda: _STUB_PRINCIPAL
+    try:
+        yield TestClient(app, raise_server_exceptions=False)
+    finally:
+        app.dependency_overrides.pop(require_tenant_credential, None)
 
 
 class TestDiscoveryReturnsActiveProviders:
@@ -73,23 +85,22 @@ class TestDiscoveryReturnsActiveProviders:
         """Two active providers are returned in the response via repository.list_syncable()."""
         tenant = _make_tenant()
         providers = [
-            _make_provider(provider_id="uuid-1", name="Provider A", priority=0, countries=["US"]),
-            _make_provider(provider_id="uuid-2", name="Provider B", priority=1, uid_types=["uid2"]),
+            _make_provider(provider_id="prov_1", name="Provider A", priority=0, countries=["US"]),
+            _make_provider(provider_id="prov_2", name="Provider B", priority=1, uid_types=["uid2"]),
         ]
 
         mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
-                response = client.get("/tenant/si-host/tmp-providers/discovery")
+            response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 200
         data = response.json()
         assert data["tenant_id"] == "si-host"
         assert len(data["providers"]) == 2
-        assert data["providers"][0]["provider_id"] == "uuid-1"
+        assert data["providers"][0]["provider_id"] == "prov_1"
         assert data["providers"][0]["countries"] == ["US"]
-        assert data["providers"][1]["provider_id"] == "uuid-2"
+        assert data["providers"][1]["provider_id"] == "prov_2"
         assert data["providers"][1]["uid_types"] == ["uid2"]
         mock_tmp_uow_cls.return_value.__enter__.return_value.tmp_providers.list_syncable.assert_called_once_with()
 
@@ -97,15 +108,14 @@ class TestDiscoveryReturnsActiveProviders:
         """Draining providers are included (router stops new requests but in-flight complete)."""
         tenant = _make_tenant()
         providers = [
-            _make_provider(provider_id="uuid-1", status="active"),
-            _make_provider(provider_id="uuid-2", status="draining"),
+            _make_provider(provider_id="prov_1", status="active"),
+            _make_provider(provider_id="prov_2", status="draining"),
         ]
 
         mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
-                response = client.get("/tenant/si-host/tmp-providers/discovery")
+            response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 200
         data = response.json()
@@ -122,8 +132,7 @@ class TestDiscoveryTenantNotFound:
         mock_tmp_uow_cls = _make_tmp_uow([], tenant=None)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
-                response = client.get("/tenant/nonexistent/tmp-providers/discovery")
+            response = client.get("/tenant/nonexistent/tmp-providers/discovery")
 
         assert response.status_code == 404
         envelope = response.json()
@@ -141,8 +150,7 @@ class TestDiscoveryEmptyProviders:
         mock_tmp_uow_cls = _make_tmp_uow([], tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
-                response = client.get("/tenant/si-host/tmp-providers/discovery")
+            response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 200
         data = response.json()
@@ -166,8 +174,7 @@ class TestDiscoveryResponseShape:
         mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
-                response = client.get("/tenant/si-host/tmp-providers/discovery")
+            response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 200
         entry = response.json()["providers"][0]
@@ -202,8 +209,7 @@ class TestDiscoveryResponseShape:
         mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
-                response = client.get("/tenant/si-host/tmp-providers/discovery")
+            response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 200
         assert "name" not in response.json()["providers"][0]
@@ -224,8 +230,7 @@ class TestDiscoveryResponseShape:
         mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
-                response = client.get("/tenant/si-host/tmp-providers/discovery")
+            response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 200
         entry = response.json()["providers"][0]
@@ -248,222 +253,19 @@ class TestDiscoveryOrdering:
         tenant = _make_tenant()
         # Simulate DB returning in correct order (priority 0 before 1, alpha within same priority)
         providers = [
-            _make_provider(provider_id="uuid-a", name="Alpha", priority=0),
-            _make_provider(provider_id="uuid-b", name="Beta", priority=0),
-            _make_provider(provider_id="uuid-c", name="Gamma", priority=1),
+            _make_provider(provider_id="prov_a", name="Alpha", priority=0),
+            _make_provider(provider_id="prov_b", name="Beta", priority=0),
+            _make_provider(provider_id="prov_c", name="Gamma", priority=1),
         ]
 
         mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
-                response = client.get("/tenant/si-host/tmp-providers/discovery")
+            response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 200
         provider_ids = [p["provider_id"] for p in response.json()["providers"]]
-        assert provider_ids == ["uuid-a", "uuid-b", "uuid-c"]
-
-
-# ---------------------------------------------------------------------------
-# TMP_DISCOVERY_API_KEYS gating tests
-# ---------------------------------------------------------------------------
-
-
-class TestDiscoveryApiKeyAuth:
-    """GET /tenant/{tenant_id}/tmp-providers/discovery enforces TMP_DISCOVERY_API_KEYS."""
-
-    def test_returns_500_when_tmp_discovery_api_keys_not_set(self, client):
-        """When TMP_DISCOVERY_API_KEYS is unset the endpoint returns 500 (fail-closed, operator must act).
-
-        AdCPConfigurationError is the right error here: the operator has to configure
-        the env var; the buyer cannot recover this themselves.  On the wire this maps
-        to code=CONFIGURATION_ERROR with recovery="terminal", which is self-consistent
-        against the pinned ``enums/error-code.json``: 3.1.1 classifies
-        CONFIGURATION_ERROR as terminal (SERVICE_UNAVAILABLE is the transient code).
-
-        This pairing was previously SERVICE_UNAVAILABLE + terminal — flagged in review
-        as self-inconsistent and deferred as a follow-up. Moving to the adcp 6.6.0 /
-        spec 3.1.1 pin resolved it: the SDK now emits CONFIGURATION_ERROR for this
-        exception, so code and recovery agree with the enum and no follow-up remains.
-        """
-        import os
-
-        with patch.dict("os.environ", {}, clear=False):
-            os.environ.pop("TMP_DISCOVERY_API_KEYS", None)
-            response = client.get("/tenant/si-host/tmp-providers/discovery")
-
-        assert response.status_code == 500
-        # AdCPConfigurationError maps to CONFIGURATION_ERROR + terminal under the
-        # adcp 6.6.0 / spec 3.1.1 pin — code and recovery agree with
-        # enums/error-code.json (see docstring for the pre-3.1.1 history).
-        envelope = response.json()
-        assert_envelope_shape(envelope, "CONFIGURATION_ERROR", recovery="terminal")
-        # Every raise on this route carries an actionable suggestion; the operator
-        # is the actor here, so the hint names the env var they must set.
-        assert "TMP_DISCOVERY_API_KEYS" in envelope["errors"][0]["suggestion"]
-
-    def test_returns_500_when_tmp_discovery_api_keys_is_empty_string(self, client):
-        """When TMP_DISCOVERY_API_KEYS is set to empty string the endpoint returns 500 (fail-closed).
-
-        Same as unset: AdCPConfigurationError (500, terminal) — operator must act.
-        """
-        with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": ""}):
-            response = client.get("/tenant/si-host/tmp-providers/discovery")
-
-        assert response.status_code == 500
-        # Same wire shape as the unset case: CONFIGURATION_ERROR + terminal under the
-        # 3.1.1 pin — see test_returns_500_when_tmp_discovery_api_keys_not_set.
-        assert_envelope_shape(response.json(), "CONFIGURATION_ERROR", recovery="terminal")
-
-    def test_open_when_tmp_discovery_api_keys_is_open(self, client):
-        """When TMP_DISCOVERY_API_KEYS=OPEN the endpoint is accessible without a key."""
-        tenant = _make_tenant()
-        mock_tmp_uow_cls = _make_tmp_uow([], tenant=tenant)
-
-        with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
-                response = client.get("/tenant/si-host/tmp-providers/discovery")
-
-        assert response.status_code == 200
-
-    def test_open_mode_is_case_insensitive(self, client):
-        """TMP_DISCOVERY_API_KEYS=open (lowercase) also disables auth."""
-        tenant = _make_tenant()
-        mock_tmp_uow_cls = _make_tmp_uow([], tenant=tenant)
-
-        with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "open"}):
-                response = client.get("/tenant/si-host/tmp-providers/discovery")
-
-        assert response.status_code == 200
-
-    def test_returns_401_when_no_key_provided_and_keys_configured(self, client):
-        """When TMP_DISCOVERY_API_KEYS is set and no key is sent, returns 401 with suggestion."""
-        with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "secret-key-1,secret-key-2"}):
-            response = client.get("/tenant/si-host/tmp-providers/discovery")
-
-        assert response.status_code == 401
-        envelope = response.json()
-        # AUTH_REQUIRED + correctable is the spec-grounded pairing under the
-        # adcp 6.6.0 / spec 3.1.1 pin: enums/error-code.json enumMetadata gives
-        # AUTH_REQUIRED {"recovery": "correctable"} ("provide credentials when
-        # missing"). The previous assertion pinned AUTH_TOKEN_INVALID + terminal
-        # and was deferred in review as an agreed follow-up; 3.1.1 removed
-        # AUTH_TOKEN_INVALID from the vocabulary entirely, so the bump closed it.
-        assert_envelope_shape(envelope, "AUTH_REQUIRED", recovery="correctable")
-        assert (
-            envelope["errors"][0]["suggestion"]
-            == "Provide a valid API key via x-adcp-auth, X-API-Key, or Authorization: Bearer <key>."
-        )
-
-    def test_returns_401_when_wrong_key_provided(self, client):
-        """When TMP_DISCOVERY_API_KEYS is set and a wrong key is sent, returns 401 with suggestion."""
-        with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "correct-key"}):
-            response = client.get(
-                "/tenant/si-host/tmp-providers/discovery",
-                headers={"x-adcp-auth": "wrong-key"},
-            )
-
-        assert response.status_code == 401
-        envelope = response.json()
-        # Same pairing as the missing-key case — see
-        # test_returns_401_when_no_key_provided_and_keys_configured.
-        #
-        # Worth noting for the follow-up: 3.1.1 also added AUTH_MISSING
-        # (correctable) and AUTH_INVALID (terminal, "credentials were rejected,
-        # do NOT auto-retry"), which distinguish this case from the one above.
-        # Both 401 paths currently emit AUTH_REQUIRED because they share
-        # AdCPAuthenticationError with every other auth boundary in the app;
-        # splitting them is an app-wide error-code change, not a TMP one.
-        assert_envelope_shape(envelope, "AUTH_REQUIRED", recovery="correctable")
-        assert (
-            envelope["errors"][0]["suggestion"]
-            == "Provide a valid API key via x-adcp-auth, X-API-Key, or Authorization: Bearer <key>."
-        )
-
-    def test_accepts_valid_key_via_x_adcp_auth_header(self, client):
-        """Valid key in x-adcp-auth header is accepted."""
-        tenant = _make_tenant()
-        mock_tmp_uow_cls = _make_tmp_uow([], tenant=tenant)
-
-        with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "valid-key"}):
-                response = client.get(
-                    "/tenant/si-host/tmp-providers/discovery",
-                    headers={"x-adcp-auth": "valid-key"},
-                )
-
-        assert response.status_code == 200
-
-    def test_accepts_valid_key_via_x_api_key_header(self, client):
-        """Valid key in X-API-Key header is accepted."""
-        tenant = _make_tenant()
-        mock_tmp_uow_cls = _make_tmp_uow([], tenant=tenant)
-
-        with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "valid-key"}):
-                response = client.get(
-                    "/tenant/si-host/tmp-providers/discovery",
-                    headers={"X-API-Key": "valid-key"},
-                )
-
-        assert response.status_code == 200
-
-    def test_accepts_valid_key_via_authorization_bearer_header(self, client):
-        """Valid key in Authorization: Bearer header is accepted."""
-        tenant = _make_tenant()
-        mock_tmp_uow_cls = _make_tmp_uow([], tenant=tenant)
-
-        with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "valid-key"}):
-                response = client.get(
-                    "/tenant/si-host/tmp-providers/discovery",
-                    headers={"Authorization": "Bearer valid-key"},
-                )
-
-        assert response.status_code == 200
-
-    def test_accepts_one_of_multiple_configured_keys(self, client):
-        """Any key from the comma-separated TMP_DISCOVERY_API_KEYS list is accepted."""
-        tenant = _make_tenant()
-        mock_tmp_uow_cls = _make_tmp_uow([], tenant=tenant)
-
-        with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "key-a,key-b,key-c"}):
-                response = client.get(
-                    "/tenant/si-host/tmp-providers/discovery",
-                    headers={"x-adcp-auth": "key-b"},
-                )
-
-        assert response.status_code == 200
-
-    def test_returns_401_for_non_ascii_key(self):
-        """A header value with non-ASCII bytes returns 401, not 500.
-
-        Starlette decodes header bytes as latin-1, so any byte > 0x7F yields a
-        non-ASCII str.  secrets.compare_digest raises TypeError for non-ASCII
-        strings — the endpoint must catch this and return a clean 401 instead
-        of a 500 that mislabels an auth failure as a server error.
-
-        The httpx2 test client rejects non-ASCII header values before they
-        reach the server, so we call require_api_key() directly with a mock
-        Request that carries the non-ASCII header — this exercises the exact
-        production code path that Starlette would trigger in production.
-        """
-        import asyncio
-
-        import pytest
-
-        from src.core.exceptions import AdCPAuthRequiredError
-        from src.routes.tmp_providers import require_api_key
-
-        # Starlette decodes header bytes as latin-1; byte 0xFF → '\xff' in str
-        mock_request = MagicMock()
-        mock_request.headers.get = lambda key, default="": "caf\xff" if key == "x-adcp-auth" else default
-
-        with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "valid-key"}):
-            with pytest.raises(AdCPAuthRequiredError):
-                asyncio.run(require_api_key(mock_request))
+        assert provider_ids == ["prov_a", "prov_b", "prov_c"]
 
 
 # ---------------------------------------------------------------------------
@@ -503,8 +305,7 @@ class TestDiscoveryRepositoryUnavailable:
         mock_uow_cls = self._uow_cls_with(tenant_config=None, tmp_providers=MagicMock())
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_uow_cls):
-            with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
-                response = client.get("/tenant/si-host/tmp-providers/discovery")
+            response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 503
         # AdCPServiceUnavailableError: recovery=transient (buyer should retry)
@@ -530,8 +331,7 @@ class TestDiscoveryRepositoryUnavailable:
         mock_uow_cls = self._uow_cls_with(tenant_config=tenant_config, tmp_providers=None)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_uow_cls):
-            with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
-                response = client.get("/tenant/si-host/tmp-providers/discovery")
+            response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 503
         envelope = response.json()
@@ -588,8 +388,7 @@ class TestDiscoverySingleTransactionAndNoDetachedInstance:
         mock_tmp_uow_cls = _make_tmp_uow([], tenant=_make_tenant())
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
-                response = client.get("/tenant/si-host/tmp-providers/discovery")
+            response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 200
         # The class must have been called (constructed) exactly once.
@@ -619,9 +418,8 @@ class TestDiscoverySingleTransactionAndNoDetachedInstance:
         mock_uow_cls = _mock_cm(mock_uow, on_exit=_mark_closed)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_uow_cls):
-            with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
-                # Would raise DetachedInstanceError (→ 500) if to_dict() ran after __exit__.
-                response = client.get("/tenant/si-host/tmp-providers/discovery")
+            # Would raise DetachedInstanceError (→ 500) if to_dict() ran after __exit__.
+            response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 200
         data = response.json()
@@ -657,47 +455,82 @@ class TestTMPProviderSerializers:
 
     def test_discovery_dict_includes_populated_conditionals(self):
         """Populated countries/uid_types/properties are carried through verbatim."""
-        p = _make_provider(countries=["US", "GB"], uid_types=["uid2"], properties=["rid-1"])
+        p = _make_provider(countries=["US", "GB"], uid_types=["uid2"], properties=[_RID])
         result = p.to_discovery_dict()
         assert result["countries"] == ["US", "GB"]
         assert result["uid_types"] == ["uid2"]
-        assert result["properties"] == ["rid-1"]
+        assert result["properties"] == [_RID]
 
-    def test_discovery_dict_key_set_is_closed(self):
-        """The emitted key set stays inside the closed schema — and excludes `name`."""
+    def test_discovery_dict_validates_against_the_pinned_schema(self):
+        """A fully-populated entry validates against ``provider-registration.json`` itself.
+
+        The grader is the pinned schema, not a hand-written restatement of it:
+        the previous ``set(result) == {...}`` key list could only detect
+        key-name drift, which is why a hyphenated ``provider_id`` violating
+        ``^[A-Za-z0-9_]+$`` shipped on this wire past eighteen review rounds
+        (#1197 review).  ``validate_against_pinned_schema`` reads the file named
+        by the route module's own citation, so a citation pointing at a
+        non-existent path fails here too.
+        """
         p = _make_provider(
-            provider_id="test-uuid",
+            provider_id="prov_test",
             name="Test Provider",
-            endpoint="http://example.com",
+            endpoint="https://example.com",
             context_match=False,
             identity_match=True,
             countries=["DE"],
             uid_types=["id5"],
-            properties=["rid-2"],
+            properties=[_RID],
             timeout_ms=300,
             priority=2,
             status="draining",
         )
         result = p.to_discovery_dict()
-        assert set(result) == {
-            "provider_id",
-            "endpoint",
-            "context_match",
-            "identity_match",
-            "countries",
-            "uid_types",
-            "properties",
-            "timeout_ms",
-            "priority",
-            "status",
-        }
-        assert result["provider_id"] == "test-uuid"
-        assert result["endpoint"] == "http://example.com"
-        assert result["context_match"] is False
-        assert result["identity_match"] is True
-        assert result["timeout_ms"] == 300
-        assert result["priority"] == 2
-        assert result["status"] == "draining"
+
+        validate_against_pinned_schema(PROVIDER_REGISTRATION_SCHEMA, result)
+        # Cross-check against the SDK codegen of the same schema: it is the type
+        # a router built on the pinned SDK deserializes this entry into.
+        TmpProviderRegistration.model_validate(result)
+
+        # `name` is the one admin-side key that must never reach this wire; the
+        # closed schema (additionalProperties: false) makes it an error, and
+        # asserting it here names the specific regression.
+        assert "name" not in result
+
+    def test_discovery_dict_omitting_conditionals_still_validates(self):
+        """A context-only provider — no countries/uid_types/properties — is schema-valid.
+
+        The omit-don't-null rule and the schema's ``anyOf`` are graded together
+        on the same instrument as the populated case.
+        """
+        p = _make_provider(
+            endpoint="https://ctx.example.com/tmp",
+            context_match=True,
+            identity_match=False,
+            countries=None,
+            uid_types=None,
+            properties=None,
+        )
+        result = p.to_discovery_dict()
+        validate_against_pinned_schema(PROVIDER_REGISTRATION_SCHEMA, result)
+        # https, unlike the module-level default: the SDK codegen adds an
+        # https-only validator on top of the schema's `format: uri`, and this
+        # record deliberately allows http://*.localhost for local development
+        # (see src/core/schemas/tmp_provider.py). The schema is the authority;
+        # the codegen is the cross-check, so the cross-check gets an https URL.
+        TmpProviderRegistration.model_validate(result)
+
+    def test_hyphenated_provider_id_is_rejected_by_the_schema(self):
+        """The canonical-UUID form this column used to emit fails the schema.
+
+        Pins the reason ``provider_id`` is ``uuid4().hex`` rather than a Postgres
+        ``uuid``: reverting the column type puts a ``-`` back in the value, and
+        ``^[A-Za-z0-9_]+$`` rejects it.  Without this, the migration looks like
+        cosmetics.
+        """
+        p = _make_provider(provider_id="5f1c0e3a-9b7d-4e8f-a1c2-b3d4e5f60718")
+        with pytest.raises(AssertionError):
+            validate_against_pinned_schema(PROVIDER_REGISTRATION_SCHEMA, p.to_discovery_dict())
 
     def test_admin_dict_keeps_name_and_null_conditionals(self):
         """The admin shape carries `name` and all three conditional keys, `None` included.
@@ -720,8 +553,7 @@ class TestTMPProviderSerializers:
         mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            with patch.dict("os.environ", {"TMP_DISCOVERY_API_KEYS": "OPEN"}):
-                response = client.get("/tenant/si-host/tmp-providers/discovery")
+            response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 200
         entry = response.json()["providers"][0]

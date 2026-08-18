@@ -28,14 +28,13 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
 from src.core.database.json_type import JSONType
 from src.core.exceptions import AdCPConfigurationError
 from src.core.json_validators import JSONValidatorMixin
-from src.core.schemas.tmp_provider import TMPProviderDiscoveryDict
+from src.core.schemas.tmp_provider import TMPProviderAdminDict, TMPProviderDiscoveryDict
 
 logger = logging.getLogger(__name__)
 
@@ -1411,18 +1410,29 @@ class TMPProvider(Base):
 
     Each tenant can register one or more TMP providers (buyer-side agents that
     implement the Trusted Match Protocol). The Sales Agent exposes these
-    registrations via a REST endpoint (``GET /tmp/providers``). The router polls
+    registrations over the versioned REST contract
+    ``GET`` :data:`src.routes.tmp_providers.DISCOVERY_ROUTE`. The router polls
     that endpoint — it never reads from this table directly.
 
-    Schema alignment: ``provider-registration.json`` (AdCP spec PR #2210).
+    Schema alignment: :data:`src.routes.tmp_providers.PROVIDER_REGISTRATION_SCHEMA`
+    (the pinned file, referenced rather than re-typed as prose — #1197 review).
     """
 
     __tablename__ = "tmp_providers"
 
+    # A hyphen-free UUID (``uuid4().hex``), not a canonical UUID: the pinned
+    # provider-registration.json constrains provider_id to
+    # ``^[A-Za-z0-9_]+$`` (charset kept safe for logs, metrics and cache keys),
+    # which the hyphenated form violates — every entry the discovery endpoint
+    # emitted was rejected by the schema it claims to conform to (#1197 review).
+    # Hence a String column: a Postgres ``uuid`` column re-renders any input in
+    # canonical hyphenated form, so the constraint cannot be met while the
+    # database owns the formatting.
     provider_id: Mapped[str] = mapped_column(
-        PG_UUID(as_uuid=False),
+        String(64),
         primary_key=True,
-        server_default=text("gen_random_uuid()"),
+        default=lambda: uuid4().hex,
+        server_default=text("replace(gen_random_uuid()::text, '-', '')"),
     )
     tenant_id: Mapped[str] = mapped_column(
         String(50),
@@ -1504,7 +1514,7 @@ class TMPProvider(Base):
     def to_discovery_dict(self) -> TMPProviderDiscoveryDict:
         """Serialize for the machine wire: ``GET /tenant/{id}/tmp-providers/discovery``.
 
-        Conforms to ``dist/schemas/3.1.1/trusted-match/provider-registration.json``,
+        Conforms to :data:`src.routes.tmp_providers.PROVIDER_REGISTRATION_SCHEMA`,
         a closed object (``additionalProperties: false``).  Two consequences that
         this method — unlike the admin serialization — must respect:
 
@@ -1556,7 +1566,7 @@ class TMPProvider(Base):
             result["properties"] = self.properties
         return result
 
-    def to_admin_dict(self) -> dict:
+    def to_admin_dict(self) -> TMPProviderAdminDict:
         """Serialize for the admin UI (list + edit views).
 
         Not the machine wire — see :meth:`to_discovery_dict` for that.  This
@@ -1568,21 +1578,24 @@ class TMPProvider(Base):
 
         Auth fields are deliberately absent — the edit handler adds
         ``auth_type`` plus a masked ``auth_credentials`` placeholder itself, so
-        a credential is never serialized here by accident.
+        a credential is never serialized here by accident.  Its return type is
+        :class:`TMPProviderAdminDict` rather than a bare ``dict`` so the keys the
+        two handlers add (``created_at``; the form view's CSV strings) are
+        checked additions rather than free-form ones (#1197 review).
         """
-        return {
-            "provider_id": self.provider_id,
-            "name": self.name,
-            "endpoint": self.endpoint,
-            "context_match": self.context_match,
-            "identity_match": self.identity_match,
-            "timeout_ms": self.timeout_ms,
-            "priority": self.priority,
-            "status": self.status,
-            "countries": self.countries,
-            "uid_types": self.uid_types,
-            "properties": self.properties,
-        }
+        return TMPProviderAdminDict(
+            provider_id=self.provider_id,
+            name=self.name,
+            endpoint=self.endpoint,
+            context_match=self.context_match,
+            identity_match=self.identity_match,
+            timeout_ms=self.timeout_ms,
+            priority=self.priority,
+            status=self.status,
+            countries=self.countries,
+            uid_types=self.uid_types,
+            properties=self.properties,
+        )
 
 
 class GAMInventory(Base):

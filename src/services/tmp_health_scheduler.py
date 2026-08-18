@@ -16,7 +16,8 @@ Design principles (matching tmp_provider_sync.py):
 - Provider metadata is read into memory, the session is closed, probes run
   concurrently via ``httpx.AsyncClient``, then a short session writes the results.
 - ``asyncio.gather(..., return_exceptions=True)`` ensures one bad endpoint
-  cannot cancel the remaining probes.
+  cannot cancel the remaining probes, and the write phase is isolated per tenant
+  for the same reason — both phases fail per item, never per batch.
 
 Singleton pattern (same as delivery_webhook_scheduler and media_buy_status_scheduler):
 the module-level ``get_*()`` / ``start_*()`` / ``stop_*()`` trio is bound from
@@ -122,16 +123,33 @@ class TMPHealthScheduler(IntervalScheduler):
         for (provider_id, tenant_id, _endpoint), status in zip(provider_info, statuses, strict=True):
             by_tenant[tenant_id].append((provider_id, status))
 
+        # Isolated per tenant, for the same reason the probe phase passes
+        # return_exceptions=True: the unit of work is one tenant, so one
+        # tenant's UoW failure (a lock timeout, a row deleted mid-cycle) must not
+        # skip every tenant later in the iteration order — which is what an
+        # unguarded loop did, silently, on the write half only (#1197 review).
+        written = 0
         for tenant_id, updates in by_tenant.items():
-            with TMPProviderUoW(tenant_id) as uow:
-                assert uow.tmp_providers is not None
-                for provider_id, status in updates:
-                    uow.tmp_providers.update_health_status(provider_id, status)
+            try:
+                with TMPProviderUoW(tenant_id) as uow:
+                    assert uow.tmp_providers is not None
+                    for provider_id, status in updates:
+                        uow.tmp_providers.update_health_status(provider_id, status)
+            except Exception:
+                logger.exception(
+                    "[TMP health] Failed to persist %d health result(s) for tenant=%s — "
+                    "continuing with the remaining tenants",
+                    len(updates),
+                    tenant_id,
+                )
+                continue
+            written += 1
 
         logger.debug(
-            "[TMP health] Check complete: %d provider(s) checked across %d tenant(s)",
+            "[TMP health] Check complete: %d provider(s) checked across %d tenant(s) (%d persisted)",
             len(provider_info),
             len(by_tenant),
+            written,
         )
 
 

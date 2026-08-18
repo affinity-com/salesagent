@@ -10,6 +10,8 @@ Mixins may call ``self._commit_factory_data()`` which is a no-op in unit mode.
 
 from __future__ import annotations
 
+import logging
+import os
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import MagicMock
@@ -652,3 +654,185 @@ class ProductMixin:
             **extra,
         )
         return await _get_products_impl(req, identity)
+
+
+class TMPSyncMixin:
+    """The TMP package-sync observable, owned by the env instead of by each test.
+
+    Package sync is transport-blind buyer-triggered behavior: *a buyer creates or
+    updates a media buy, and every registered active/draining provider holds
+    current package data*. Before this mixin, that observable had no seam, so
+    each tier invented one — a process-wide ``httpx.Client`` patch plus a
+    ``threading.Thread.start`` patch in the integration file, a second
+    independent seed→dispatch→collect→assert implementation over a socket in the
+    e2e file, and a third file asserting the thread was *constructed*. Three
+    incompatible observables, two grading implementations that disagreed on which
+    transports were covered (#1197 review).
+
+    One implementation serves every transport because nothing here depends on
+    which process the sync thread runs in:
+
+    * **The collector is a real HTTP receiver.** No client stubbing, so the URL
+      construction, the auth header and the JSON body are production's, and the
+      arrival IS the observable whether the thread ran in this process
+      (a2a/mcp/rest) or in the server container (e2e_rest).
+    * **Completion is the production registry**, via
+      :func:`src.services.tmp_provider_sync.join_active_syncs` in-process and by
+      polling the collector out-of-process — never by patching a stdlib
+      constructor.
+
+    Envs mixing this in get the seam whether or not a scenario uses it: with no
+    provider registered the sync short-circuits, and ``__exit__`` still drains
+    the threads, so no unrelated media-buy scenario leaves an unjoined daemon
+    opening DB sessions after its own teardown.
+    """
+
+    # Set on first register_tmp_provider(); None means "this scenario never
+    # registered a provider", which is the no-op case.
+    _tmp_collector: dict[str, Any] | None = None
+    _tmp_collector_ctx: Any = None
+
+    #: The public host planted on the tenant so ``_resolve_seller_agent_url``
+    #: yields a spec-valid https ``seller_agent.agent_url``. A constant so the
+    #: Then-step can assert the exact URL production emitted.
+    TMP_SELLER_AGENT_HOST = "tmp-sync-seller.publisher.example.com"
+
+    @property
+    def tmp_seller_agent_url(self) -> str:
+        """The ``seller_agent.agent_url`` production must put on every package."""
+        return f"https://{self.TMP_SELLER_AGENT_HOST}/mcp"
+
+    def register_tmp_provider(self, **fields: Any) -> str:
+        """Register one active TMP provider pointed at this env's collector.
+
+        Starts the collector on first call and replaces any provider rows the
+        tenant already had, so the fan-out reaches exactly this endpoint.
+        Returns the registered endpoint.
+        """
+        from tests.factories import plant_seller_agent_host, replace_tmp_providers
+
+        collector = self._ensure_tmp_collector()
+        tenant_id = self._tenant_id  # type: ignore[attr-defined]
+
+        plant_seller_agent_host(self, tenant_id, self.TMP_SELLER_AGENT_HOST)
+        fields.setdefault("name", "Package Sync Collector")
+        fields.setdefault("endpoint", collector["endpoint"])
+        fields.setdefault("timeout_ms", 2000)
+        replace_tmp_providers(self, tenant_id, **fields)
+        return str(fields["endpoint"])
+
+    def tmp_sync_deliveries(self) -> list[dict[str, Any]]:
+        """Every ``POST /packages/sync`` the collector has received, in order.
+
+        Entries are ``{"path", "body"}``. The path is carried because "the server
+        POSTed *something*" and "the server POSTed to /packages/sync" are
+        different claims, and only the second one grades ``provider_url()``.
+        """
+        if self._tmp_collector is None:
+            return []
+        return [e for e in self._tmp_collector["received"] if str(e["path"]).endswith("/packages/sync")]
+
+    def await_tmp_sync(self, count: int = 1, timeout: float = 30.0) -> dict[str, Any]:
+        """Block until *count* package-sync deliveries have arrived; return the last one.
+
+        In-process, the production registry gives an exact completion signal, so
+        the poll below normally returns on its first iteration. Out-of-process the
+        thread is in the server container and polling is the only observation —
+        hence one method with both, rather than a per-tier waiter.
+        """
+        import time
+
+        if self._tmp_collector is None:
+            raise AssertionError(
+                "await_tmp_sync() called before register_tmp_provider() — there is no collector to wait on."
+            )
+
+        if not self.is_e2e:  # type: ignore[attr-defined]
+            self.join_tmp_syncs(timeout=timeout)
+
+        deadline = time.monotonic() + timeout
+        while True:
+            deliveries = self.tmp_sync_deliveries()
+            if len(deliveries) >= count:
+                return deliveries[count - 1]
+            if time.monotonic() >= deadline:
+                paths = [e["path"] for e in self._tmp_collector["received"]]
+                raise AssertionError(
+                    f"Expected {count} POST /packages/sync delivery(ies) within {timeout}s, "
+                    f"got {len(deliveries)}. Captured paths: {paths}"
+                )
+            time.sleep(0.1)
+
+    def join_tmp_syncs(self, timeout: float = 30.0) -> None:
+        """Drain in-flight in-process syncs. No-op out-of-process (nothing local to join).
+
+        Best-effort by design: this is the cleanup half of the seam, so a wedged
+        thread is reported, not raised. The assertion belongs to
+        :meth:`await_tmp_sync`, where a missing delivery is the actual failure —
+        raising here would turn an unrelated media-buy scenario's slow teardown
+        into that scenario's failure.
+        """
+        if self.is_e2e:  # type: ignore[attr-defined]
+            return
+        from src.services.tmp_provider_sync import join_active_syncs
+
+        stragglers = join_active_syncs(timeout=timeout)
+        if stragglers:
+            logging.getLogger(__name__).warning(
+                "TMP sync threads still running after %.0fs at env teardown: %s", timeout, stragglers
+            )
+
+    def _ensure_tmp_collector(self) -> dict[str, Any]:
+        """Start the stub-provider HTTP receiver once per env."""
+        if self._tmp_collector is not None:
+            return self._tmp_collector
+
+        from tests.e2e._webhook_capture import WebhookCaptureHandler, run_webhook_capture_server
+
+        class _PackageSyncCollector(WebhookCaptureHandler):
+            """Stub TMP provider recording the path and body of each POST."""
+
+            received_webhooks: list[Any] = []
+
+            def record(self, payload: Any) -> dict[str, Any]:
+                return {"path": self.path, "body": payload}
+
+        # Loopback is enough in-process; the e2e server runs in a container and
+        # reaches the host via ADCP_WEBHOOK_HOST (in-network) or
+        # host.docker.internal (host path). The TMP sync does not rewrite
+        # "localhost" the way the webhook service does, so the registered URL has
+        # to be container-reachable as written.
+        host = None if self.is_e2e else "127.0.0.1"  # type: ignore[attr-defined]
+        if self.is_e2e and not os.getenv("ADCP_WEBHOOK_HOST"):  # type: ignore[attr-defined]
+            host = "host.docker.internal"
+
+        ctx = run_webhook_capture_server(_PackageSyncCollector, _PackageSyncCollector.received_webhooks, host=host)
+        info = ctx.__enter__()
+        self._tmp_collector_ctx = ctx
+        self._tmp_collector = {
+            "endpoint": f"http://{info['host']}:{info['port']}/tmp",
+            "received": info["received"],
+        }
+        return self._tmp_collector
+
+    def _teardown_tmp_sync(self) -> None:
+        """Join in-flight syncs, then stop the collector and drop the provider rows.
+
+        Ordering matters: joining first means no thread is still POSTing when the
+        receiver socket closes (which surfaces as a connection error in the sync's
+        fan-out log), and dropping the rows last stops a later scenario sharing the
+        e2e database from fanning out to a port that no longer listens.
+        """
+        try:
+            self.join_tmp_syncs(timeout=30.0)
+        finally:
+            if self._tmp_collector is not None:
+                from tests.factories import delete_tmp_providers
+
+                try:
+                    delete_tmp_providers(self, self._tenant_id)  # type: ignore[attr-defined]
+                finally:
+                    ctx, self._tmp_collector_ctx = self._tmp_collector_ctx, None
+                    self._tmp_collector = None
+                    if ctx is not None:
+                        ctx.__exit__(None, None, None)

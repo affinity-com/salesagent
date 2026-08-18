@@ -16096,3 +16096,20 @@ mappings:
       upstream_refs: ["BR-UC-032-main"]
       business_rules: []
       status: new
+  TMP-SYNC:
+    # Locally-added, not compiled from adcp-req: the storyboards have no scenario
+    # for seller-side TMP Package Sync (an experimental trusted_match.core
+    # surface). Retire these entries together with
+    # features/local-tmp-package-sync.feature once the upstream scenario exists.
+    - adcp_scenario_id: "T-TMP-SYNC-create"
+      adcp_feature: "local-tmp-package-sync.feature"
+      obligation_id: null
+      upstream_refs: []
+      business_rules: []
+      status: new
+    - adcp_scenario_id: "T-TMP-SYNC-update"
+      adcp_feature: "local-tmp-package-sync.feature"
+      obligation_id: null
+      upstream_refs: []
+      business_rules: []
+      status: new

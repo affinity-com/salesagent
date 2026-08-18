@@ -69,6 +69,7 @@ pytest_plugins = [
     "tests.bdd.steps.domain.uc_get_products_inventory",
     "tests.bdd.steps.domain.uc_brand_shorthand",
     "tests.bdd.steps.domain.compat_normalization",
+    "tests.bdd.steps.domain.tmp_package_sync",
 ]
 
 # ---------------------------------------------------------------------------
@@ -3101,6 +3102,8 @@ def _detect_uc(request: pytest.FixtureRequest) -> str | None:
         return "UC-002"
     if any(t.startswith("T-COMPAT") for t in marker_names):
         return "COMPAT"
+    if any(t.startswith("T-TMP-SYNC") for t in marker_names):
+        return "TMP-SYNC"
     return None
 
 
@@ -3291,6 +3294,23 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
             # until each is explicitly wired into a run branch above. Dropping this
             # line is what flipped ~800 dormant scenarios from xfail to fail.
             pytest.xfail("UC-002 harness not yet wired for non-extension scenarios")
+
+    elif uc == "TMP-SYNC":
+        # Locally-added TMP package-sync feature (features/local-tmp-package-sync.feature).
+        # MediaBuyDualEnv, not MediaBuyCreateEnv: the update scenario needs the real
+        # per-transport update wrappers, and the create scenario runs on the same env
+        # so both halves of the obligation are graded through one seam. The TMP
+        # observable itself lives on TMPSyncMixin (inherited from MediaBuyCreateEnv).
+        from tests.harness.media_buy_dual import MediaBuyDualEnv
+
+        with _db_scope_for(request, e2e_config), MediaBuyDualEnv(e2e_config=e2e_config) as env:
+            tenant, principal, product, pricing_option = env.setup_media_buy_data()
+            ctx["env"] = env
+            ctx["tenant"] = tenant
+            ctx["principal"] = principal
+            ctx["default_product"] = product
+            ctx["default_pricing_option"] = pricing_option
+            yield
 
     elif uc == "UC-003":
         marker_names = {m.name for m in request.node.iter_markers()}

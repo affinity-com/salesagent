@@ -6,7 +6,8 @@ to health_status / last_health_checked_at columns.
 
 Covers:
 - _check_provider_health: healthy on 200, unhealthy on non-200, error on exception
-- _check_all_providers (tick): multi-provider fan-out, skip when no providers, error isolation
+- tick(): multi-provider fan-out, skip when no providers, per-provider probe isolation
+  and per-TENANT write isolation
 - Scheduler lifecycle: start/stop, singleton pattern, CancelledError handling
 """
 
@@ -23,23 +24,10 @@ from src.services.tmp_health_scheduler import (
     _check_provider_health,
     get_tmp_health_scheduler,
 )
+from tests.helpers.tmp_provider_http import make_mock_async_http_client as _make_async_http_client
 from tests.unit._tmp_helpers import _make_db_context, _make_mock_provider, _make_tmp_repo_uow
 
 # ── Shared helpers ──────────────────────────────────────────────────
-
-
-def _make_async_http_client(
-    *, get_return: MagicMock | None = None, get_side_effect: Exception | None = None
-) -> AsyncMock:
-    """Build a mock ``httpx.AsyncClient`` usable as an async context manager.
-
-    Exactly one of *get_return* or *get_side_effect* must be provided.
-    """
-    mock_client = AsyncMock()
-    mock_client.get = AsyncMock(return_value=get_return, side_effect=get_side_effect)
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
-    return mock_client
 
 
 class TestCheckProviderHealth:
@@ -144,8 +132,8 @@ class TestCheckAllProviders:
     @pytest.mark.asyncio
     async def test_updates_health_status_for_each_provider(self):
         """Each provider gets its health_status updated via UoW with correct values."""
-        provider_a = _make_mock_provider(provider_id="uuid-a", tenant_id="tenant-1", endpoint="https://a.example.com")
-        provider_b = _make_mock_provider(provider_id="uuid-b", tenant_id="tenant-2", endpoint="https://b.example.com")
+        provider_a = _make_mock_provider(provider_id="prov_a", tenant_id="tenant-1", endpoint="https://a.example.com")
+        provider_b = _make_mock_provider(provider_id="prov_b", tenant_id="tenant-2", endpoint="https://b.example.com")
 
         mock_session_read = MagicMock()
         mock_repo = MagicMock()
@@ -178,8 +166,8 @@ class TestCheckAllProviders:
         # Verify health status was written with correct provider_id and status values
         mock_repo.update_health_status.assert_has_calls(
             [
-                call("uuid-a", "unhealthy"),
-                call("uuid-b", "error"),
+                call("prov_a", "unhealthy"),
+                call("prov_b", "error"),
             ],
             any_order=True,
         )
@@ -189,7 +177,7 @@ class TestCheckAllProviders:
     async def test_healthy_status_written_on_200(self):
         """A provider returning 200 gets health_status='healthy' written."""
         provider = _make_mock_provider(
-            provider_id="uuid-healthy", tenant_id="tenant-1", endpoint="https://healthy.example.com"
+            provider_id="prov_healthy", tenant_id="tenant-1", endpoint="https://healthy.example.com"
         )
 
         mock_session_read = MagicMock()
@@ -213,7 +201,7 @@ class TestCheckAllProviders:
             scheduler = TMPHealthScheduler()
             await scheduler.tick()
 
-        mock_repo.update_health_status.assert_called_once_with("uuid-healthy", "healthy")
+        mock_repo.update_health_status.assert_called_once_with("prov_healthy", "healthy")
 
     @pytest.mark.asyncio
     async def test_skips_when_no_providers(self):
@@ -245,7 +233,7 @@ class TestCheckAllProviders:
     @pytest.mark.asyncio
     async def test_session_closed_before_probes(self):
         """DB session from the read phase is closed before HTTP probes run."""
-        provider = _make_mock_provider(provider_id="uuid-x", tenant_id="tenant-1", endpoint="https://x.example.com")
+        provider = _make_mock_provider(provider_id="prov_x", tenant_id="tenant-1", endpoint="https://x.example.com")
 
         call_order: list[str] = []
 
@@ -284,9 +272,9 @@ class TestCheckAllProviders:
     @pytest.mark.asyncio
     async def test_bad_endpoint_does_not_cancel_other_probes(self):
         """return_exceptions=True: one probe raising does not cancel the rest."""
-        provider_a = _make_mock_provider(provider_id="uuid-a", tenant_id="tenant-1", endpoint="https://bad.invalid")
+        provider_a = _make_mock_provider(provider_id="prov_a", tenant_id="tenant-1", endpoint="https://bad.invalid")
         provider_b = _make_mock_provider(
-            provider_id="uuid-b", tenant_id="tenant-1", endpoint="https://good.example.com"
+            provider_id="prov_b", tenant_id="tenant-1", endpoint="https://good.example.com"
         )
 
         mock_session_read = MagicMock()
@@ -318,15 +306,15 @@ class TestCheckAllProviders:
         # Both providers must have a status written
         assert mock_repo.update_health_status.call_count == 2
         calls = {c.args for c in mock_repo.update_health_status.call_args_list}
-        assert ("uuid-a", "error") in calls
-        assert ("uuid-b", "healthy") in calls
+        assert ("prov_a", "error") in calls
+        assert ("prov_b", "healthy") in calls
 
     @pytest.mark.asyncio
     async def test_providers_grouped_by_tenant_one_uow_per_tenant(self):
         """Providers from different tenants each get their own UoW (one commit per tenant)."""
-        provider_a = _make_mock_provider(provider_id="uuid-a", tenant_id="tenant-1", endpoint="https://a.example.com")
-        provider_b = _make_mock_provider(provider_id="uuid-b", tenant_id="tenant-2", endpoint="https://b.example.com")
-        provider_c = _make_mock_provider(provider_id="uuid-c", tenant_id="tenant-1", endpoint="https://c.example.com")
+        provider_a = _make_mock_provider(provider_id="prov_a", tenant_id="tenant-1", endpoint="https://a.example.com")
+        provider_b = _make_mock_provider(provider_id="prov_b", tenant_id="tenant-2", endpoint="https://b.example.com")
+        provider_c = _make_mock_provider(provider_id="prov_c", tenant_id="tenant-1", endpoint="https://c.example.com")
 
         mock_session_read = MagicMock()
         mock_repo = MagicMock()
@@ -363,6 +351,58 @@ class TestCheckAllProviders:
         assert sorted(uow_tenant_ids) == ["tenant-1", "tenant-2"]
         # All 3 providers got a status written
         assert mock_repo.update_health_status.call_count == 3
+
+
+class TestWritePhaseIsIsolatedPerTenant:
+    """One tenant's failed write does not skip the tenants after it.
+
+    The probe phase already isolated per provider (``return_exceptions=True``);
+    the write phase did not, so one tenant's UoW failure — a lock timeout, a row
+    deleted mid-cycle — silently skipped every tenant later in the iteration
+    order. Both phases now fail per item (#1197 review).
+    """
+
+    @pytest.mark.asyncio
+    async def test_later_tenants_are_still_written(self):
+        provider_a = _make_mock_provider(provider_id="prov_a", tenant_id="tenant-1", endpoint="https://a.example.com")
+        provider_b = _make_mock_provider(provider_id="prov_b", tenant_id="tenant-2", endpoint="https://b.example.com")
+
+        mock_repo = MagicMock()
+        # One UoW class whose __enter__ raises for tenant-1 and yields a working
+        # UoW for tenant-2 — the scheduler opens one UoW per tenant, so the
+        # constructor argument is what distinguishes them.
+        working_uow = MagicMock()
+        working_uow.tmp_providers = mock_repo
+
+        def _enter_for(tenant_id, *_args, **_kwargs):
+            cm = MagicMock()
+            if tenant_id == "tenant-1":
+                cm.__enter__ = MagicMock(side_effect=RuntimeError("lock timeout"))
+            else:
+                cm.__enter__ = MagicMock(return_value=working_uow)
+            cm.__exit__ = MagicMock(return_value=False)
+            return cm
+
+        mock_uow_cls = MagicMock(side_effect=_enter_for)
+
+        with (
+            patch(
+                "src.services.tmp_health_scheduler.get_db_session",
+                return_value=_make_db_context(MagicMock()),
+            ),
+            patch("src.services.tmp_health_scheduler.TMPProviderRepository") as mock_repo_cls,
+            patch("src.services.tmp_health_scheduler.TMPProviderUoW", mock_uow_cls),
+            patch(
+                "src.services.tmp_health_scheduler._check_provider_health",
+                new=AsyncMock(side_effect=["healthy", "healthy"]),
+            ),
+        ):
+            mock_repo_cls.get_all_syncable.return_value = [provider_a, provider_b]
+
+            await TMPHealthScheduler().tick()
+
+        # tenant-2's write happened even though tenant-1's UoW blew up first.
+        mock_repo.update_health_status.assert_called_once_with("prov_b", "healthy")
 
 
 class TestSchedulerLifecycle:

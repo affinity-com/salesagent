@@ -24,7 +24,16 @@ from src.services.tmp_provider_sync import (
     _resolve_seller_agent_url,
     sync_packages_for_media_buy,
 )
+from tests.helpers.tmp_provider_http import make_mock_http_client
 from tests.unit._tmp_helpers import _make_sync_uow, _make_tenant_config_uow
+
+# The only shape ``_resolve_seller_agent_url`` can return besides ``None``: it
+# rejects a non-https override and builds the virtual_host branch as
+# ``https://{host}/mcp``, so a stub returning ``http://`` drove
+# ``_build_package_payload`` with a URL production cannot emit — while the same
+# file spent a docstring, an error branch and a SellerAgentReference on the
+# https rule (#1197 review).
+_SELLER_AGENT_URL = "https://agent.example.com/mcp"
 
 # ---------------------------------------------------------------------------
 # _build_package_payload tests
@@ -34,7 +43,7 @@ from tests.unit._tmp_helpers import _make_sync_uow, _make_tenant_config_uow
 class TestBuildPackagePayload:
     """_build_package_payload emits a spec-compliant AvailablePackage payload.
 
-    Authority: dist/schemas/3.1.1/trusted-match/available-package.json (AdCP 3.1.1).
+    Authority: adcp/_schemas/3.1/trusted-match/available-package.json (AdCP 3.1.1).
     The schema has ``additionalProperties: false`` and requires exactly:
     ``package_id``, ``media_buy_id``, ``seller_agent``.
     Optional allowed fields: ``format_ids``, ``catalogs``.
@@ -55,7 +64,7 @@ class TestBuildPackagePayload:
     def test_seller_agent_is_structured_object(self):
         """seller_agent is a dict with agent_url, not a flat string.
 
-        Per dist/schemas/3.1.1/core/seller-agent-ref.json, seller_agent MUST be
+        Per adcp/_schemas/3.1/core/seller-agent-ref.json, seller_agent MUST be
         an object with agent_url — not the legacy flat si_agent_endpoint string.
         """
         pkg = MagicMock()
@@ -109,7 +118,7 @@ class TestBuildPackagePayload:
 class TestSyncSkipsWhenNoSellerAgentUrl:
     """sync_packages_for_media_buy skips sync when _resolve_seller_agent_url returns None.
 
-    Per dist/schemas/3.1.1/core/seller-agent-ref.json, agent_url MUST use
+    Per adcp/_schemas/3.1/core/seller-agent-ref.json, agent_url MUST use
     https://. When no valid https URL is available (no ADCP_AGENT_URL, no
     public virtual_host), the function must skip rather than emit a
     spec-invalid binding.
@@ -132,10 +141,16 @@ class TestSyncSkipsWhenNoSellerAgentUrl:
         with patch.object(logging.getLogger("src.services.tmp_provider_sync"), "warning") as mock_warn:
             sync_packages_for_media_buy("tenant-1", "mb-1")
 
-        assert mock_warn.called
-        # The warning message must mention the media_buy_id and tenant
-        warning_args = " ".join(str(a) for a in mock_warn.call_args[0])
-        assert "mb-1" in warning_args or "tenant-1" in warning_args
+        # Pinned atomically with the real format string and BOTH args: the
+        # previous `"mb-1" in args or "tenant-1" in args` passed on a warning
+        # that had dropped the media_buy_id, which is the field an operator
+        # needs to find the affected buy (#1197 review).
+        mock_warn.assert_called_once_with(
+            "[TMP sync] Skipping sync for media_buy=%s tenant=%s — no valid https seller_agent URL. "
+            "Set ADCP_AGENT_URL to enable TMP sync.",
+            "mb-1",
+            "tenant-1",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -153,14 +168,12 @@ class TestSellerAgentUrlResolvedBeforeMediaBuyUoW:
     """
 
     @patch("src.services.tmp_provider_sync._post_packages_sync")
-    @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value="http://agent/mcp")
+    @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
     def test_resolve_seller_agent_url_called_before_media_buy_uow_opens(self, mock_resolve, mock_post):
         """_resolve_seller_agent_url() is called before MediaBuyUoW.__enter__()."""
         call_order: list[str] = []
 
-        mock_resolve.side_effect = lambda *_a, **_kw: (
-            call_order.append("resolve_seller_agent_url") or "http://agent/mcp"
-        )
+        mock_resolve.side_effect = lambda *_a, **_kw: call_order.append("resolve_seller_agent_url") or _SELLER_AGENT_URL
 
         mock_mb_cls, _mock_mb_uow, mock_tp_cls, _mock_tp_uow = _make_sync_uow(packages=[])
         mock_mb_cls.return_value.__enter__ = MagicMock(
@@ -183,7 +196,7 @@ class TestSyncSessionClosedBeforeHTTP:
     """sync_packages_for_media_buy closes the DB session before making HTTP calls."""
 
     @patch("src.services.tmp_provider_sync._post_packages_sync")
-    @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value="http://agent/mcp")
+    @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
     def test_session_closed_before_http_calls(self, mock_resolve, mock_post):
         """The TMPProviderUoW session is closed before _post_packages_sync is called."""
         call_order: list[str] = []
@@ -259,7 +272,7 @@ class TestProviderMaterializedBeforeSessionCloses:
             return self._auth_credentials
 
     @patch("src.services.tmp_provider_sync._post_packages_sync")
-    @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value="http://agent/mcp")
+    @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
     def test_provider_attributes_read_before_uow_exits(self, mock_resolve, mock_post):
         """Provider fields are captured inside the `with` block, not after."""
         pkg = MagicMock()
@@ -301,7 +314,7 @@ class TestSyncPackagesFanOut:
     """sync_packages_for_media_buy loads packages and fans out to providers."""
 
     @patch("src.services.tmp_provider_sync._post_packages_sync")
-    @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value="http://agent/mcp")
+    @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
     def test_fans_out_to_all_providers(self, mock_resolve, mock_post):
         """Packages are POSTed to every syncable provider."""
         pkg = MagicMock()
@@ -336,7 +349,7 @@ class TestSyncPackagesFanOut:
         assert called_auths == {""}  # both providers have no auth_credentials
 
     @patch("src.services.tmp_provider_sync._post_packages_sync")
-    @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value="http://agent/mcp")
+    @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
     def test_skips_when_no_packages(self, mock_resolve, mock_post):
         """No HTTP calls when media buy has no packages."""
         mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = _make_sync_uow(packages=[])
@@ -349,7 +362,7 @@ class TestSyncPackagesFanOut:
         mock_post.assert_not_called()
 
     @patch("src.services.tmp_provider_sync._post_packages_sync")
-    @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value="http://agent/mcp")
+    @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
     def test_skips_when_no_providers(self, mock_resolve, mock_post):
         """No HTTP calls when tenant has no syncable providers."""
         pkg = MagicMock()
@@ -366,7 +379,7 @@ class TestSyncPackagesFanOut:
         mock_post.assert_not_called()
 
     @patch("src.services.tmp_provider_sync._post_packages_sync")
-    @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value="http://agent/mcp")
+    @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
     def test_one_provider_failure_does_not_block_others(self, mock_resolve, mock_post):
         """If one provider fails, the others still get called."""
         pkg = MagicMock()
@@ -394,7 +407,7 @@ class TestSyncPackagesFanOut:
         assert mock_post.call_count == 2
 
     @patch("src.services.tmp_provider_sync._post_packages_sync")
-    @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value="http://agent/mcp")
+    @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
     def test_package_load_failure_returns_early(self, mock_resolve, mock_post):
         """If loading packages fails, no HTTP calls are made."""
         mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = _make_sync_uow()
@@ -414,6 +427,131 @@ class TestSyncPackagesFanOut:
 # ---------------------------------------------------------------------------
 
 
+class TestOneUnreadableCredentialDoesNotSkipTheRest:
+    """A provider whose stored credential cannot be decrypted is skipped alone.
+
+    ``TMPProvider.auth_credentials`` decrypts on read and raises
+    ``AdCPConfigurationError`` when the current key cannot open the ciphertext —
+    a key-rotation state, not a corrupt database. The materialisation used to be
+    a list comprehension over the whole provider set, so that single row aborted
+    it, was swallowed by the surrounding ``except Exception``, and every OTHER
+    provider for the tenant was skipped and logged as a repository failure
+    (#1197 review).
+    """
+
+    @staticmethod
+    def _provider(name: str, endpoint: str, *, credential: object) -> MagicMock:
+        """A provider mock whose ``auth_credentials`` returns or RAISES *credential*."""
+        provider = MagicMock()
+        provider.name = name
+        provider.endpoint = endpoint
+        if isinstance(credential, Exception):
+            type(provider).auth_credentials = mock.PropertyMock(side_effect=credential)
+        else:
+            provider.auth_credentials = credential
+        return provider
+
+    @patch("src.services.tmp_provider_sync._post_packages_sync")
+    @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
+    def test_healthy_providers_still_receive_packages(self, mock_resolve, mock_post):
+        from src.core.exceptions import AdCPConfigurationError
+
+        pkg = MagicMock()
+        pkg.package_id = "pkg-1"
+
+        rotated = self._provider(
+            "Rotated Provider",
+            "http://rotated:3000",
+            credential=AdCPConfigurationError("Failed to decrypt auth credentials for TMP provider p1"),
+        )
+        healthy = self._provider("Healthy Provider", "http://healthy:3000", credential="tok")
+
+        mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = _make_sync_uow(packages=[pkg], providers=[rotated, healthy])
+        with (
+            patch("src.services.tmp_provider_sync.MediaBuyUoW", mock_mb_cls),
+            patch("src.services.tmp_provider_sync.TMPProviderUoW", mock_tp_cls),
+        ):
+            sync_packages_for_media_buy("tenant-1", "mb-1")
+
+        assert mock_post.call_count == 1, "the readable provider must still be synced"
+        assert mock_post.call_args_list[0].args[0] == "http://healthy:3000"
+        assert mock_post.call_args_list[0].args[2] == "tok"
+
+    @patch("src.services.tmp_provider_sync._post_packages_sync")
+    @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
+    def test_the_skipped_provider_is_named_in_the_log(self, mock_resolve, mock_post, caplog):
+        """The operator must be able to tell WHICH registration to re-enter."""
+        import logging
+
+        from src.core.exceptions import AdCPConfigurationError
+
+        pkg = MagicMock()
+        pkg.package_id = "pkg-1"
+        rotated = self._provider(
+            "Rotated Provider",
+            "http://rotated:3000",
+            credential=AdCPConfigurationError("boom"),
+        )
+
+        mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = _make_sync_uow(packages=[pkg], providers=[rotated])
+        with (
+            patch("src.services.tmp_provider_sync.MediaBuyUoW", mock_mb_cls),
+            patch("src.services.tmp_provider_sync.TMPProviderUoW", mock_tp_cls),
+            caplog.at_level(logging.WARNING, logger="src.services.tmp_provider_sync"),
+        ):
+            sync_packages_for_media_buy("tenant-1", "mb-1")
+
+        mock_post.assert_not_called()
+        assert "Rotated Provider" in caplog.text
+        # NOT the repository-failure line: blaming the load for one provider's
+        # credential is exactly the misdiagnosis this fix removes.
+        assert "Failed to load TMP providers" not in caplog.text
+
+
+class TestSyncsForOneMediaBuyAreSerialized:
+    """Two fires for the same media buy run in order, not as a race.
+
+    "Every provider holds current package data" is only true if the LAST
+    operation is the last to POST. ``fire_tmp_sync`` registers each sync in
+    ``_active_syncs`` and each one joins its predecessor, so the ordering is a
+    property of the code rather than of thread scheduling (#1197 review).
+    """
+
+    def test_second_fire_waits_for_the_first(self):
+        import threading
+
+        from src.core.schemas._base import CreateMediaBuyResult, CreateMediaBuySuccess
+        from src.services.tmp_provider_sync import fire_tmp_sync, join_active_syncs
+        from tests.harness import make_identity
+
+        order: list[str] = []
+        first_may_finish = threading.Event()
+
+        def _fake_sync(tenant_id: str, media_buy_id: str) -> None:
+            order.append(f"start-{len(order)}")
+            if len(order) == 1:
+                # Hold the first sync open; if the second did not serialize
+                # behind it, its "start" lands while this one is still blocked.
+                first_may_finish.wait(timeout=10)
+            order.append("end")
+
+        def _result() -> CreateMediaBuyResult:
+            return CreateMediaBuyResult(
+                status="completed",
+                response=CreateMediaBuySuccess(media_buy_id="mb_serialize", packages=[]),
+            )
+
+        identity = make_identity(tenant_id="tenant_1")
+        with patch("src.services.tmp_provider_sync.sync_packages_for_media_buy", _fake_sync):
+            fire_tmp_sync(_result(), identity)
+            fire_tmp_sync(_result(), identity)
+            first_may_finish.set()
+            assert join_active_syncs(timeout=10) == []
+
+        # start, end, start, end — never start, start.
+        assert order == ["start-0", "end", "start-2", "end"], order
+
+
 class TestResolveSellAgentUrl:
     """_resolve_seller_agent_url resolves the seller agent URL for package payloads."""
 
@@ -427,7 +565,7 @@ class TestResolveSellAgentUrl:
     def test_non_https_env_override_is_rejected(self):
         """A non-https ADCP_AGENT_URL override is rejected, not emitted verbatim.
 
-        Per dist/schemas/3.1.1/core/seller-agent-ref.json, agent_url MUST
+        Per adcp/_schemas/3.1/core/seller-agent-ref.json, agent_url MUST
         use https://. An operator misconfiguring ADCP_AGENT_URL=http://... must
         not produce a spec-invalid binding — the override is ignored and
         resolution falls through to the tenant virtual_host path (which itself
@@ -513,7 +651,7 @@ class TestResolveSellAgentUrl:
     def test_returns_none_for_localhost_virtual_host(self):
         """A localhost virtual_host returns None — cannot produce a valid https URL.
 
-        Per dist/schemas/3.1.1/core/seller-agent-ref.json, agent_url MUST use
+        Per adcp/_schemas/3.1/core/seller-agent-ref.json, agent_url MUST use
         https://. Local dev hosts cannot satisfy this requirement, so None is
         returned and the caller skips the sync.
         """
@@ -572,24 +710,9 @@ class TestPostPackagesSyncAuth:
     """_post_packages_sync sends Bearer auth when credentials are provided."""
 
     def _make_mock_client(self, status_code: int = 200) -> tuple[MagicMock, MagicMock]:
-        """Return (mock_client_cls, mock_client) with a response of the given status."""
-        mock_response = MagicMock()
-        mock_response.status_code = status_code
-        mock_response.raise_for_status = MagicMock(
-            side_effect=httpx.HTTPStatusError(
-                f"Server error {status_code}",
-                request=MagicMock(),
-                response=MagicMock(status_code=status_code),
-            )
-            if status_code >= 400
-            else None
-        )
-
-        mock_client = MagicMock()
-        mock_client.__enter__ = MagicMock(return_value=mock_client)
-        mock_client.__exit__ = MagicMock(return_value=False)
-        mock_client.post.return_value = mock_response
-        return mock_client, mock_response
+        """Return (mock_client, mock_response) from the shared builder."""
+        mock_client = make_mock_http_client(status_code)
+        return mock_client, mock_client.post.return_value
 
     def test_sends_bearer_token_when_auth_credentials_set(self):
         """When auth_credentials is non-empty, Authorization: Bearer header is sent."""
@@ -661,7 +784,7 @@ class TestPostPackagesSyncAuth:
         mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = _make_sync_uow(packages=[pkg], providers=[provider])
         with (
             patch("src.services.tmp_provider_sync._post_packages_sync") as mock_post,
-            patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value="http://agent/mcp"),
+            patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL),
             patch("src.services.tmp_provider_sync.MediaBuyUoW", mock_mb_cls),
             patch("src.services.tmp_provider_sync.TMPProviderUoW", mock_tp_cls),
         ):

@@ -6,26 +6,34 @@ Exposes:
 This endpoint is polled by the TMP Router every 30 s to discover which
 provider endpoints to fan out context and identity match requests to.
 
-Authentication is **fail-closed**: the endpoint is locked by default.
+Authentication reuses the codebase's one credential gate, resolved **inside the
+path's tenant**: :func:`src.core.auth_utils.get_principal_from_token` is called
+with the ``{tenant_id}`` from the URL, and its docstring is the guarantee this
+route needs — "If tenant_id specified, ONLY look in that tenant."  A credential
+issued to tenant A therefore resolves to nothing on tenant B's path, so a
+cross-tenant read is *inexpressible* rather than merely rejected: there is no
+``resolved_tenant == tenant_id`` comparison to get wrong, and no second
+authentication scheme (no ``TMP_DISCOVERY_API_KEYS``, no "OPEN" mode, no
+per-route header list) to keep in step with the first (#1197 review).
 
-Set ``TMP_DISCOVERY_API_KEYS`` to a comma-separated list of accepted keys to
-grant access.  To explicitly disable authentication for internal-network-only
-deployments, set ``TMP_DISCOVERY_API_KEYS=OPEN``.  Leaving the variable unset
-or empty returns HTTP 500 so that misconfigured deployments fail loudly rather
-than silently exposing tenant topology.
+That also satisfies the pinned spec's authentication MUST for this surface —
+AdCP 3.1.1 ``trusted-match/specification.mdx`` §"Router Requirements": routers
+exposing dynamic registration MUST authenticate callers, and static API keys
+are conformant only alongside IP allow-listing.  A per-tenant Sales Agent
+credential is not a static process-global key.
 
-Accepted auth headers (any one is sufficient):
-  - ``x-adcp-auth: <key>``
-  - ``X-API-Key: <key>``
-  - ``Authorization: Bearer <key>``
+Token extraction is ``UnifiedAuthMiddleware``'s job (``x-adcp-auth``, else
+``Authorization: Bearer``), the same for this route as for every other REST
+endpoint.
 
 Response schema — ``TMPDiscoveryResponse``.  Each provider entry is the closed
-key set of ``dist/schemas/3.1.1/trusted-match/provider-registration.json``:
+key set of the pinned ``provider-registration.json``
+(:data:`PROVIDER_REGISTRATION_SCHEMA`):
 {
   "tenant_id": "si-host",
   "providers": [
     {
-      "provider_id": "<uuid>",
+      "provider_id": "5f1c0e3a9b7d4e8fa1c2b3d4e5f60718",
       "endpoint": "http://si-agent.localhost:3003",
       "context_match": true,
       "identity_match": true,
@@ -51,19 +59,17 @@ Providers with status 'inactive' are excluded entirely.
 from __future__ import annotations
 
 import logging
-import os
-import secrets
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends
 
+from src.core.auth_context import AuthContext, get_auth_context
+from src.core.auth_utils import get_principal_from_token
 from src.core.database.repositories.uow import TMPProviderUoW
 from src.core.exceptions import (
     AdCPAccountNotFoundError,
     AdCPAuthRequiredError,
-    AdCPConfigurationError,
     AdCPServiceUnavailableError,
 )
-from src.core.http_utils import parse_bearer_token as _parse_bearer_token
 from src.core.schemas.tmp_provider import TMPDiscoveryResponse
 from src.core.security.url_validator import sanitize_for_log
 
@@ -71,80 +77,68 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["tmp-providers"])
 
+#: The discovery wire's authority, as a path that resolves in this tree.
+#:
+#: The single declaration of the pinned schema this endpoint's provider entries
+#: conform to.  Every other site that needs to name it — the ORM model, the
+#: migration, the sync service's operator log line, the tests — references this
+#: constant instead of re-typing a path, so the citation cannot drift out of
+#: step with the file it points at (#1197 review).  ``tests/helpers/pinned_schema``
+#: reads exactly this relative path out of the installed SDK, and
+#: ``test_tmp_providers_discovery_route.py`` loads it, so a citation pointing at
+#: a non-existent file fails a test rather than misleading a router operator.
+#:
+#: Upstream: https://github.com/adcontextprotocol/adcp/blob/main/static/schemas/v1/trusted-match/provider-registration.json
+PROVIDER_REGISTRATION_SCHEMA = "trusted-match/provider-registration.json"
 
-async def require_api_key(request: Request) -> None:
-    """Require API key for the TMP discovery endpoint.
+#: The one cross-service path this feature publishes, declared once.
+#: The model, the admin blueprint and the migration reference this rather than
+#: restating a path in prose (#1197 review).
+DISCOVERY_ROUTE = "/tenant/{tenant_id}/tmp-providers/discovery"
 
-    Fail-closed: the endpoint is locked unless ``TMP_DISCOVERY_API_KEYS`` is
-    explicitly configured.
 
-    - ``TMP_DISCOVERY_API_KEYS=key1,key2`` — accept those keys only.
-    - ``TMP_DISCOVERY_API_KEYS=OPEN`` — disable auth (internal-network-only
-      deployments where the operator has made a deliberate choice).
-    - Unset or empty — raise ``AdCPConfigurationError`` (500, terminal) so
-      misconfigured deployments fail loudly instead of silently exposing tenant
-      topology.  The operator must act; the buyer cannot recover this.
+async def require_tenant_credential(tenant_id: str, auth_ctx: AuthContext = get_auth_context) -> str:
+    """Resolve the caller's credential **within** *tenant_id*, or raise 401.
 
-    Accepted headers (first non-empty value wins):
-      - ``x-adcp-auth``
-      - ``X-API-Key``
-      - ``Authorization: Bearer <key>``
+    Tenant isolation is a property of the resolution, not a check layered on top
+    of it: ``get_principal_from_token(token, tenant_id)`` only ever searches the
+    named tenant (its own docstring: "If tenant_id specified, ONLY look in that
+    tenant"), so there is no state in which a credential from another tenant
+    yields a principal here.  Accepted credentials are a tenant's principal
+    access tokens and its admin token — the same set every other Sales Agent
+    surface accepts, which is why this route no longer owns an authentication
+    scheme of its own (#1197 review).
 
-    Bearer parsing uses the shared ``parse_bearer_token()`` helper
-    (``src.core.http_utils``) — the single canonical implementation across
-    all four Bearer-parsing sites in the codebase.
+    Returns the resolved principal id so the route can log *who* polled;
+    unauthenticated callers never reach the route body.
     """
-    raw = os.environ.get("TMP_DISCOVERY_API_KEYS", "").strip()
-
-    if raw.upper() == "OPEN":
-        logger.warning("[TMP discovery] API key auth disabled — TMP_DISCOVERY_API_KEYS=OPEN")
-        return
-
-    allowed = [k.strip() for k in raw.split(",") if k.strip()]
-    if not allowed:
-        raise AdCPConfigurationError(
-            "TMP_DISCOVERY_API_KEYS is not configured.",
-            suggestion=(
-                "Ask the sales agent operator to set TMP_DISCOVERY_API_KEYS to a "
-                "comma-separated list of API keys, or to 'OPEN' to disable authentication."
-            ),
-        )
-
-    api_key = (
-        request.headers.get("x-adcp-auth", "")
-        or request.headers.get("X-API-Key", "")
-        or _parse_bearer_token(request.headers.get("authorization", ""))
-        or ""
-    )
-    # Compare on bytes: Starlette decodes header bytes as latin-1, so any byte
-    # > 0x7F yields a non-ASCII str.  secrets.compare_digest raises TypeError
-    # for non-ASCII strings — encode both sides to bytes so a malformed header
-    # returns a clean 401 instead of a 500.
-    try:
-        api_key_bytes = api_key.encode("utf-8", "surrogatepass")
-        if not any(secrets.compare_digest(api_key_bytes, k.encode("utf-8", "surrogatepass")) for k in allowed):
-            raise AdCPAuthRequiredError(
-                "Authentication required.",
-                suggestion="Provide a valid API key via x-adcp-auth, X-API-Key, or Authorization: Bearer <key>.",
-            )
-    except (UnicodeEncodeError, TypeError):
+    token = (auth_ctx.auth_token or "").strip()
+    principal_id = get_principal_from_token(token, tenant_id)[0] if token else None
+    if not principal_id:
         raise AdCPAuthRequiredError(
             "Authentication required.",
-            suggestion="Provide a valid API key via x-adcp-auth, X-API-Key, or Authorization: Bearer <key>.",
+            suggestion=(
+                f"Provide a valid access token for tenant '{tenant_id}' via x-adcp-auth "
+                "or Authorization: Bearer <token>."
+            ),
         )
+    return principal_id
 
 
 @router.get("/tenant/{tenant_id}/tmp-providers/discovery", response_model=TMPDiscoveryResponse)
-async def tmp_providers_discovery(tenant_id: str, _: None = Depends(require_api_key)) -> TMPDiscoveryResponse:
+async def tmp_providers_discovery(
+    tenant_id: str, principal_id: str = Depends(require_tenant_credential)
+) -> TMPDiscoveryResponse:
     """Return the active TMP provider set for a tenant.
 
-    Polled by the TMP Router every 30 s.  Requires API key authentication
-    via ``TMP_DISCOVERY_API_KEYS`` (fail-closed: returns 500 when unset).
+    Polled by the TMP Router every 30 s.  Requires a credential issued by the
+    tenant in the path — see :func:`require_tenant_credential`, where the
+    tenant scoping lives.
 
     Returns the typed :class:`TMPDiscoveryResponse` rather than a hand-built
     ``JSONResponse``: FastAPI then publishes an OpenAPI schema for this
     versioned contract and validates the outgoing keys against
-    ``provider-registration.json``'s closed key set, which an unvalidated
+    :data:`PROVIDER_REGISTRATION_SCHEMA`'s closed key set, which an unvalidated
     ``JSONResponse`` did not (#1197 review).
 
     Lifecycle filtering:
@@ -156,9 +150,9 @@ async def tmp_providers_discovery(tenant_id: str, _: None = Depends(require_api_
     # tenant_config repositories, so the tenant-existence check and the
     # provider read run as ONE transaction rather than two separate ones.
     #
-    # provider.to_dict(...) is also called INSIDE this block — TMPProvider
-    # attributes expire on commit (default expire_on_commit=True), so calling
-    # to_dict() after the `with` block closes hits a detached session and
+    # to_discovery_dict() is also called INSIDE this block — TMPProvider
+    # attributes expire on commit (default expire_on_commit=True), so
+    # serializing after the `with` block closes hits a detached session and
     # raises DetachedInstanceError.
     with TMPProviderUoW(tenant_id) as uow:
         # Both repository guards raise the same typed error, never `assert`:
@@ -190,8 +184,9 @@ async def tmp_providers_discovery(tenant_id: str, _: None = Depends(require_api_
         provider_list = [p.to_discovery_dict() for p in providers]
 
     logger.debug(
-        "[TMP discovery] tenant=%s returned %d provider(s)",
+        "[TMP discovery] tenant=%s principal=%s returned %d provider(s)",
         sanitize_for_log(tenant_id),
+        sanitize_for_log(principal_id),
         len(provider_list),
     )
 

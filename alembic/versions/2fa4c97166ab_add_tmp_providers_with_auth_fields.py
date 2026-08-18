@@ -1,10 +1,12 @@
 """Add tmp_providers table with auth fields for Trusted Match Protocol provider registrations
 
 Revision ID: 2fa4c97166ab
-Revises: a164b85bab9e
+Revises: 823974a5553e
 Create Date: 2026-05-21 09:31:00.000000
 
-Schema aligned with provider-registration.json (AdCP spec PR #2210):
+Schema aligned with the pinned provider-registration schema — see
+``src.routes.tmp_providers.PROVIDER_REGISTRATION_SCHEMA``, the one declaration
+of that file's path (#1197 review):
   - status string (active/inactive/draining) instead of is_active boolean
   - countries (JSONB, conditional on identity_match)
   - uid_types (JSONB, conditional on identity_match)

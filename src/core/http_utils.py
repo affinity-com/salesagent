@@ -34,10 +34,9 @@ def parse_bearer_token(authorization_header: str) -> str | None:
     scheme-less values.  ``removeprefix("Bearer ")`` is a substring strip,
     not a scheme parse: it silently accepts a scheme-less value and rejects
     the RFC-legal lowercase ``bearer <key>`` form.  This helper closes both
-    gaps and is the single canonical implementation used by all four
-    ``Authorization: Bearer`` parsers in the codebase
-    (``auth.py``, ``auth_middleware.py``, ``resolved_identity.py``,
-    ``routes/tmp_providers.py``).
+    gaps and is the single canonical implementation used by every
+    ``Authorization: Bearer`` parser in the codebase
+    (``auth.py``, ``auth_middleware.py``, ``resolved_identity.py``).
 
     Args:
         authorization_header: Raw ``Authorization`` header value (may be empty).
