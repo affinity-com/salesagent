@@ -17,9 +17,9 @@ authentication scheme (no ``TMP_DISCOVERY_API_KEYS``, no "OPEN" mode, no
 per-route header list) to keep in step with the first (#1197 review).
 
 That also satisfies the pinned spec's authentication MUST for this surface —
-AdCP 3.1.1 ``trusted-match/specification.mdx`` §"Router Requirements": routers
-exposing dynamic registration MUST authenticate callers, and static API keys
-are conformant only alongside IP allow-listing.  A per-tenant Sales Agent
+AdCP 3.1.1 ``trusted-match/specification.mdx`` §"Provider registration
+security": routers exposing dynamic registration MUST authenticate callers, and
+static API keys are conformant only alongside IP allow-listing.  A per-tenant Sales Agent
 credential is not a static process-global key.
 
 Token extraction is ``UnifiedAuthMiddleware``'s job (``x-adcp-auth``, else
@@ -59,6 +59,7 @@ Providers with status 'inactive' are excluded entirely.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from fastapi import APIRouter, Depends
 
@@ -70,8 +71,8 @@ from src.core.exceptions import (
     AdCPAuthRequiredError,
     AdCPServiceUnavailableError,
 )
+from src.core.logging_config import log_safe
 from src.core.schemas.tmp_provider import TMPDiscoveryResponse
-from src.core.security.url_validator import sanitize_for_log
 
 logger = logging.getLogger(__name__)
 
@@ -92,13 +93,18 @@ router = APIRouter(tags=["tmp-providers"])
 PROVIDER_REGISTRATION_SCHEMA = "trusted-match/provider-registration.json"
 
 #: The one cross-service path this feature publishes, declared once.
-#: The model, the admin blueprint and the migration reference this rather than
-#: restating a path in prose (#1197 review).
+#: The route decorator below is registered *from* this constant, and the model
+#: and the admin blueprint reference it rather than restating a path in prose,
+#: so there is no second copy for an edit to leave behind (#1197 review).
 DISCOVERY_ROUTE = "/tenant/{tenant_id}/tmp-providers/discovery"
 
 
-async def require_tenant_credential(tenant_id: str, auth_ctx: AuthContext = get_auth_context) -> str:
+def _require_tenant_credential(tenant_id: str, auth_ctx: AuthContext = get_auth_context) -> str:
     """Resolve the caller's credential **within** *tenant_id*, or raise 401.
+
+    Declared ``def``, not ``async def``, for the same reason ``_require_auth_dep``
+    is: the credential lookup is blocking DB I/O, and FastAPI runs a sync
+    dependency in its threadpool instead of on the event loop.
 
     Tenant isolation is a property of the resolution, not a check layered on top
     of it: ``get_principal_from_token(token, tenant_id)`` only ever searches the
@@ -125,14 +131,20 @@ async def require_tenant_credential(tenant_id: str, auth_ctx: AuthContext = get_
     return principal_id
 
 
-@router.get("/tenant/{tenant_id}/tmp-providers/discovery", response_model=TMPDiscoveryResponse)
+# Module-level singleton, matching require_auth/raw_json_body (ruff B008 forbids
+# Depends() in a parameter default), and the object `app.dependency_overrides`
+# keys on is the private function above.
+require_tenant_credential: Any = Depends(_require_tenant_credential)
+
+
+@router.get(DISCOVERY_ROUTE, response_model=TMPDiscoveryResponse)
 async def tmp_providers_discovery(
-    tenant_id: str, principal_id: str = Depends(require_tenant_credential)
+    tenant_id: str, principal_id: str = require_tenant_credential
 ) -> TMPDiscoveryResponse:
     """Return the active TMP provider set for a tenant.
 
     Polled by the TMP Router every 30 s.  Requires a credential issued by the
-    tenant in the path — see :func:`require_tenant_credential`, where the
+    tenant in the path — see :func:`_require_tenant_credential`, where the
     tenant scoping lives.
 
     Returns the typed :class:`TMPDiscoveryResponse` rather than a hand-built
@@ -185,8 +197,8 @@ async def tmp_providers_discovery(
 
     logger.debug(
         "[TMP discovery] tenant=%s principal=%s returned %d provider(s)",
-        sanitize_for_log(tenant_id),
-        sanitize_for_log(principal_id),
+        log_safe(tenant_id),
+        log_safe(principal_id),
         len(provider_list),
     )
 

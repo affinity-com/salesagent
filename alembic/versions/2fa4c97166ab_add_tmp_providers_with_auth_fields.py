@@ -17,6 +17,16 @@ of that file's path (#1197 review):
   - health_status (string, written by background scheduler) — nullable
   - last_health_checked_at (datetime, written by background scheduler) — nullable
 
+``provider_id`` is ``varchar(64)``, not ``uuid``: the pinned
+provider-registration schema constrains it to ``^[A-Za-z0-9_]+$`` with
+``maxLength: 64`` — a charset deliberately safe for logs, metrics, dashboards
+and cache keys. A Postgres ``uuid`` column cannot satisfy that, because whatever
+is written is rendered back in canonical hyphenated form and ``-`` is outside
+the character class, so every entry the discovery endpoint returned would be
+rejected by the schema it declares conformance to (#1197 review). The server
+default is the hyphen-free rendering of ``gen_random_uuid()``; the ORM assigns
+``uuid4().hex`` client-side.
+
 TMP Provider sync always uses the standard Authorization: Bearer header,
 so auth_header is intentionally omitted (unlike CreativeAgent/SignalsAgent).
 Both auth columns are nullable — existing rows have no auth configured.
@@ -42,8 +52,8 @@ def upgrade() -> None:
         "tmp_providers",
         sa.Column(
             "provider_id",
-            postgresql.UUID(as_uuid=False),
-            server_default=sa.text("gen_random_uuid()"),
+            sa.String(length=64),
+            server_default=sa.text("replace(gen_random_uuid()::text, '-', '')"),
             nullable=False,
         ),
         sa.Column("tenant_id", sa.String(length=50), nullable=False),

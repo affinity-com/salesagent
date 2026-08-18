@@ -8,18 +8,6 @@ import ipaddress
 import socket
 from urllib.parse import ParseResult, urlparse
 
-
-def sanitize_for_log(value: object) -> str:
-    """Return a log-safe string representation of *value*.
-
-    Strips newline and carriage-return characters so that a user-supplied
-    string cannot inject fake log lines (CWE-117 / CodeQL Log Injection).
-    The result is always a plain ``str`` — no repr quoting — so it reads
-    naturally in log output.
-    """
-    return str(value).replace("\r", " ").replace("\n", " ")
-
-
 # Blocked IP ranges (RFC 1918 private networks, loopback, link-local,
 # CGNAT shared space, and multicast).
 BLOCKED_NETWORKS = [
@@ -50,36 +38,6 @@ BLOCKED_HOSTNAMES = {
     "gateway.docker.internal",
     "docker.host.internal",
 }
-
-
-def is_local_host(host: str) -> bool:
-    """True if *host* (a hostname, optionally with ``:port``) is a local dev host.
-
-    The single local-host predicate in the codebase.  Two call sites need it and
-    they must not disagree:
-
-    - ``src/app.py`` (``_create_dynamic_agent_card``) — picks ``http`` vs
-      ``https`` for the advertised A2A agent-card URL when no
-      ``X-Forwarded-Proto`` is present.
-    - ``src/services/tmp_provider_sync.py`` (``_resolve_seller_agent_url``) —
-      skips a tenant ``virtual_host`` that cannot produce a valid https
-      ``seller_agent.agent_url``.
-
-    Both answer the same question ("can this host serve https?"), so they share
-    one implementation; before this existed they forked on ``*.localhost``
-    (``tenant.localhost`` was public to one and local to the other, #1197 review).
-
-    Uses exact equality / suffix checks rather than substring tests: a substring
-    test (``"localhost" in host``) misclassifies ``my-localhost-mirror.example.com``
-    as local, and ``host.startswith("127.0.0.1")`` misclassifies
-    ``127.0.0.1.evil.com`` as loopback.
-
-    Note this is a *deployment-shape* predicate, not a security boundary — SSRF
-    checks live in :func:`check_url_ssrf`, which resolves DNS and rejects the
-    whole loopback/private range rather than these three literal forms.
-    """
-    hostname = host.split(":", 1)[0].lower()
-    return hostname == "localhost" or hostname.endswith(".localhost") or hostname == "127.0.0.1"
 
 
 def _scheme_error(parsed: ParseResult, *, require_https: bool) -> str | None:

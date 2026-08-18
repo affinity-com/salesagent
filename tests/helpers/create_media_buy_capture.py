@@ -29,8 +29,15 @@ def _make_impl_result() -> Any:
     check and then raises on the field access.
 
     The inner response is the error variant, so ``fire_tmp_sync`` finds no
-    ``media_buy_id`` and spawns no sync thread — these helpers capture what the
-    wrapper forwarded to ``_impl`` and must not start background work.
+    ``media_buy_id`` and spawns no sync thread. That is a scope choice, not a
+    workaround for a missing seam: the seam exists
+    (``tests.harness._mixins.TMPSyncMixin`` for the observable,
+    ``src.services.tmp_provider_sync.join_active_syncs`` for completion), but the
+    sync body opens real UoW sessions, and these helpers run in the UNIT suite
+    where there is no database. Returning a success variant here would make a
+    push-notification-forwarding test depend on Postgres to grade a serialization
+    contract. What the sync actually delivers is graded where it belongs — one BDD
+    scenario over every transport (#1197 review).
     """
     from src.core.schemas import CreateMediaBuyResult, Error
     from src.core.schemas._base import CreateMediaBuyError

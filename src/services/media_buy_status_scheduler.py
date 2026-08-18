@@ -19,12 +19,12 @@ from src.core.database.database_session import get_db_session
 from src.core.database.models import Creative, CreativeAssignment, MediaBuy
 from src.core.database.repositories import MediaBuyRepository
 from src.core.utils import utc_flight_end, utc_flight_start
-from src.services._scheduler_base import IntervalScheduler, _parse_interval_env, make_singleton
+from src.services._scheduler_base import IntervalScheduler, make_singleton, parse_interval_env
 
 logger = logging.getLogger(__name__)
 
 # Configurable via env var - default 60 seconds
-STATUS_CHECK_INTERVAL_SECONDS: int = _parse_interval_env("MEDIA_BUY_STATUS_CHECK_INTERVAL", 60)
+STATUS_CHECK_INTERVAL_SECONDS: int = parse_interval_env("MEDIA_BUY_STATUS_CHECK_INTERVAL", 60)
 
 
 class MediaBuyStatusScheduler(IntervalScheduler):
@@ -157,12 +157,12 @@ class MediaBuyStatusScheduler(IntervalScheduler):
 
 # ---------------------------------------------------------------------------
 # Global singleton — derived from the shared factory, not hand-rolled.
-# main.py's _run_scheduler_fn reaches start_/stop_ by getattr off
-# _SCHEDULER_REGISTRY, so these exist only to be found by name.
+# make_singleton also registers the start/stop pair under the display name
+# below, which is what the app entry point iterates (#1197 review).
 # ---------------------------------------------------------------------------
 
 (
     get_media_buy_status_scheduler,
     start_media_buy_status_scheduler,
     stop_media_buy_status_scheduler,
-) = make_singleton(MediaBuyStatusScheduler)
+) = make_singleton(MediaBuyStatusScheduler, name="media buy status")

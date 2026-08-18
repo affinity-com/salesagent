@@ -1,5 +1,5 @@
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from fastmcp import FastMCP
 from fastmcp.server.context import Context
@@ -77,65 +77,65 @@ except (RuntimeError, Exception) as e:
 from contextlib import asynccontextmanager
 
 # ---------------------------------------------------------------------------
-# Scheduler registry — one entry per interval scheduler.
-# Each tuple is (name, module_path, start_fn_name, stop_fn_name) — the module is
-# imported once and both functions are resolved off it by name.
-# Startup iterates forward; shutdown iterates in reverse (LIFO).
+# Scheduler registry — the three interval schedulers, in startup order.
+#
+# These are module *imports*, not dotted strings resolved at runtime: a
+# scheduler module that is renamed, moved or stops registering its lifecycle
+# pair fails here, at import, instead of being silently absent behind the
+# startup `except Exception` below.  Each module registers its own start/stop
+# callables and display name via `make_singleton` (#1197 review).
+#
+# Order is explicit rather than inherited from whichever import ran first:
+# startup iterates forward, shutdown in reverse (LIFO).
 # ---------------------------------------------------------------------------
-_SCHEDULER_REGISTRY = [
-    (
-        "delivery webhook",
-        "src.services.delivery_webhook_scheduler",
-        "start_delivery_webhook_scheduler",
-        "stop_delivery_webhook_scheduler",
-    ),
-    (
-        "media buy status",
-        "src.services.media_buy_status_scheduler",
-        "start_media_buy_status_scheduler",
-        "stop_media_buy_status_scheduler",
-    ),
-    (
-        "TMP health",
-        "src.services.tmp_health_scheduler",
-        "start_tmp_health_scheduler",
-        "stop_tmp_health_scheduler",
-    ),
-]
+from src.services import (
+    delivery_webhook_scheduler,
+    media_buy_status_scheduler,
+    tmp_health_scheduler,
+)
+from src.services._scheduler_base import RegisteredScheduler, registered_scheduler
+
+_SCHEDULER_MODULES = (
+    delivery_webhook_scheduler,
+    media_buy_status_scheduler,
+    tmp_health_scheduler,
+)
 
 
-# Explicit verb forms for _run_scheduler_fn log messages.
-# Using string templates like "%sing" / "%sed" produces "Stoping"/"stoped" for
-# verb="stop" — anyone grepping deploy logs for "Stopping"/"stopped" misses all
-# three schedulers. Pass the full forms instead.
-_SCHEDULER_VERB_FORMS: dict[str, tuple[str, str]] = {
+def _registered_schedulers() -> list[RegisteredScheduler]:
+    """The registered lifecycle pairs, in declared startup order."""
+    return [registered_scheduler(module) for module in _SCHEDULER_MODULES]
+
+
+# Explicit verb forms for _run_scheduler log messages.
+# Using string templates like "%sing" / "%sed" produces "Stoping"/"stoped" —
+# anyone grepping deploy logs for "Stopping"/"stopped" misses all three
+# schedulers. The verb is typed, and this table is indexed directly rather than
+# via .get(<derivation>), so there is no wrong-form fallback to retain.
+_SCHEDULER_VERB_FORMS: dict[Literal["start", "stop"], tuple[str, str]] = {
     "start": ("Starting", "started"),
     "stop": ("Stopping", "stopped"),
 }
 
 
-async def _run_scheduler_fn(verb: str, name: str, module_path: str, fn_name: str) -> None:
-    """Import and call a scheduler lifecycle function, logging success/failure.
+async def _run_scheduler(verb: Literal["start", "stop"], scheduler: RegisteredScheduler) -> None:
+    """Call one scheduler lifecycle function, logging success/failure.
 
     Extracted from the identical ``_start_scheduler`` / ``_stop_scheduler``
     pair — they differed only in the verb string used in log messages.
 
     Args:
-        verb:        Lifecycle verb — one of ``"start"`` or ``"stop"``.
-        name:        Scheduler name (e.g. ``"TMP health"``).
-        module_path: Dotted import path of the scheduler module.
-        fn_name:     Name of the function to call on the module.
+        verb:      Lifecycle verb — ``"start"`` or ``"stop"``.
+        scheduler: The registered scheduler to act on.
     """
-    import importlib
-
-    present, past = _SCHEDULER_VERB_FORMS.get(verb, (verb.capitalize() + "ing", verb + "ed"))
-    logger.info("%s %s scheduler...", present, name)
+    present, past = _SCHEDULER_VERB_FORMS[verb]
+    fn = scheduler.start if verb == "start" else scheduler.stop
+    logger.info("%s %s scheduler...", present, scheduler.name)
     try:
-        mod = importlib.import_module(module_path)
-        await getattr(mod, fn_name)()
-        logger.info("✅ %s scheduler %s", name, past)
+        await fn()
+        logger.info("✅ %s scheduler %s", scheduler.name, past)
     except Exception as e:
-        logger.error("Failed to %s %s scheduler: %s", verb, name, e, exc_info=True)
+        logger.error("Failed to %s %s scheduler: %s", verb, scheduler.name, e, exc_info=True)
 
 
 def _background_schedulers_enabled() -> bool:
@@ -178,13 +178,15 @@ async def lifespan_context(app):
         yield
         return
 
-    for name, module_path, start_fn, _stop_fn in _SCHEDULER_REGISTRY:
-        await _run_scheduler_fn("start", name, module_path, start_fn)
+    schedulers = _registered_schedulers()
+
+    for scheduler in schedulers:
+        await _run_scheduler("start", scheduler)
 
     yield
 
-    for name, module_path, _start_fn, stop_fn in reversed(_SCHEDULER_REGISTRY):
-        await _run_scheduler_fn("stop", name, module_path, stop_fn)
+    for scheduler in reversed(schedulers):
+        await _run_scheduler("stop", scheduler)
 
 
 mcp = FastMCP(

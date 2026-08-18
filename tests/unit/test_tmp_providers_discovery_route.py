@@ -63,19 +63,19 @@ def client():
     ``src.app.app`` brings its own router mount, middleware stack and
     ``AdCPError`` handler, so the envelopes these tests assert on are the ones
     the deployed endpoint emits — deleting the production handler breaks them.
-    Only :func:`require_tenant_credential` is overridden: resolving a credential
+    Only :func:`_require_tenant_credential` is overridden: resolving a credential
     reads tenant + principal rows, which is an integration concern, and the auth
     matrix itself is graded against this same app with a real DB in
     ``tests/integration/test_tmp_provider_integration.py`` (#1197 review).
     """
     from src.app import app
-    from src.routes.tmp_providers import require_tenant_credential
+    from src.routes.tmp_providers import _require_tenant_credential
 
-    app.dependency_overrides[require_tenant_credential] = lambda: _STUB_PRINCIPAL
+    app.dependency_overrides[_require_tenant_credential] = lambda: _STUB_PRINCIPAL
     try:
         yield TestClient(app, raise_server_exceptions=False)
     finally:
-        app.dependency_overrides.pop(require_tenant_credential, None)
+        app.dependency_overrides.pop(_require_tenant_credential, None)
 
 
 class TestDiscoveryReturnsActiveProviders:

@@ -23,14 +23,14 @@ from src.core.database.repositories import MediaBuyRepository
 from src.core.schemas import GetMediaBuyDeliveryRequest, GetMediaBuyDeliveryResponse
 from src.core.tools.media_buy_delivery import _get_media_buy_delivery_impl
 from src.core.utils import utc_flight_start
-from src.services._scheduler_base import IntervalScheduler, _parse_interval_env, make_singleton
+from src.services._scheduler_base import IntervalScheduler, make_singleton, parse_interval_env
 from src.services.protocol_webhook_service import get_protocol_webhook_service
 
 logger = logging.getLogger(__name__)
 
 # 1 hour because AdCP protocol has frequency options hourly, daily and monthly
 # Configurable via env var for testing
-SLEEP_INTERVAL_SECONDS: int = _parse_interval_env("DELIVERY_WEBHOOK_INTERVAL", 3600)
+SLEEP_INTERVAL_SECONDS: int = parse_interval_env("DELIVERY_WEBHOOK_INTERVAL", 3600)
 
 
 class DeliveryWebhookScheduler(IntervalScheduler):
@@ -309,12 +309,12 @@ class DeliveryWebhookScheduler(IntervalScheduler):
 
 # ---------------------------------------------------------------------------
 # Global singleton — derived from the shared factory, not hand-rolled.
-# main.py's _run_scheduler_fn reaches start_/stop_ by getattr off
-# _SCHEDULER_REGISTRY, so these exist only to be found by name.
+# make_singleton also registers the start/stop pair under the display name
+# below, which is what the app entry point iterates (#1197 review).
 # ---------------------------------------------------------------------------
 
 (
     get_delivery_webhook_scheduler,
     start_delivery_webhook_scheduler,
     stop_delivery_webhook_scheduler,
-) = make_singleton(DeliveryWebhookScheduler)
+) = make_singleton(DeliveryWebhookScheduler, name="delivery webhook")

@@ -694,7 +694,7 @@ class TestResolveSellAgentUrl:
 # Local-host predicate
 # ---------------------------------------------------------------------------
 #
-# The predicate itself now lives in src.core.security.url_validator.is_local_host
+# The predicate itself now lives in src.core.domain_config.is_local_host
 # — shared with src/app.py's agent-card scheme choice, which forked from it on
 # *.localhost (#1197 review). Its own cases are in
 # tests/unit/test_ssrf_url_validator.py::TestIsLocalHost; the seller-URL

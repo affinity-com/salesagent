@@ -60,8 +60,9 @@ from adcp.types.generated_poc.enums.uid_type import UidType
 from adcp.types.generated_poc.trusted_match.provider_registration import Status as ProviderStatus
 from pydantic import AfterValidator, Field, StringConstraints, ValidationError, model_validator
 
+from src.core.logging_config import log_safe
 from src.core.schemas._base import SalesAgentBaseModel
-from src.core.security.url_validator import check_url_ssrf, sanitize_for_log
+from src.core.security.url_validator import check_url_ssrf
 
 logger = logging.getLogger(__name__)
 
@@ -313,8 +314,8 @@ class TMPProviderRegistration(SalesAgentBaseModel):
             # admin form the check used to live behind.
             logger.warning(
                 "[TMP registration][SECURITY] Provider rejected unsafe URL %s: %s",
-                sanitize_for_log(self.endpoint),
-                sanitize_for_log(ssrf_error),
+                log_safe(self.endpoint),
+                log_safe(ssrf_error),
             )
             raise ValueError(f"Endpoint URL is not allowed: {ssrf_error}")
 

@@ -231,9 +231,17 @@ def setup_oauth_logging() -> None:
 def log_safe(value: object) -> str:
     """Neutralize CR/LF in request-provided values before logging.
 
-    Buyer-supplied ids (creative_id, package_id) flow into log lines; a
-    newline embedded in one would forge log entries (CodeQL py/log-injection).
-    Response payloads and exception messages are NOT sanitized — buyers
-    correlate on exact ids.
+    The one CWE-117 / CodeQL ``py/log-injection`` neutralizer in the codebase.
+    Buyer-supplied ids (creative_id, package_id), tenant ids, provider names and
+    endpoints all flow into log lines; a newline embedded in one would forge log
+    entries.  Response payloads and exception messages are NOT sanitized —
+    buyers correlate on exact ids.
+
+    CR/LF become a *space*, not the empty string: dropping them outright welds
+    the tokens on either side together, so ``id=abc\ndef`` would be logged as
+    the different-but-plausible ``id=abcdef``.  A space neutralizes the line
+    break while keeping the value's shape visible.  (This module is the neutral
+    home for the helper; a second copy in ``src/core/security/url_validator``
+    had already diverged on exactly this character — #1197 review.)
     """
-    return str(value).replace("\r", "").replace("\n", "")
+    return str(value).replace("\r", " ").replace("\n", " ")

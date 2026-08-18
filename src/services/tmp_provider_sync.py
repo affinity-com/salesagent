@@ -37,6 +37,8 @@ from adcp.types import AvailablePackage, SellerAgentReference
 
 from src.core.database.models import MediaPackage, TMPProvider
 from src.core.database.repositories.uow import MediaBuyUoW, TenantConfigUoW, TMPProviderUoW
+from src.core.domain_config import is_local_host
+from src.core.logging_config import log_safe
 from src.core.schemas._base import (
     CreateMediaBuyResult,
     CreateMediaBuySuccess,
@@ -44,7 +46,6 @@ from src.core.schemas._base import (
     UpdateMediaBuySubmitted,
     UpdateMediaBuySuccess,
 )
-from src.core.security.url_validator import is_local_host, sanitize_for_log
 from src.core.thread_registry import ThreadRegistry
 from src.services._provider_http import bearer_headers, provider_client_kwargs, provider_url
 
@@ -55,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 # Log-sanitization rule across the TMP surfaces (this module,
 # tmp_health_scheduler, the admin blueprint, the discovery route): a value goes
-# through ``sanitize_for_log`` (CWE-117) when it enters the process from outside
+# through ``log_safe`` (CWE-117) when it enters the process from outside
 # — operator form input (provider ``endpoint``/``name``), env (``ADCP_AGENT_URL``),
 # or a request path (the discovery route's ``tenant_id``). Values that are only
 # ever DB-resolved inside the process are logged raw; here that is ``tenant_id``
@@ -284,7 +285,7 @@ def _resolve_seller_agent_url(tenant_id: str) -> str | None:
             "[TMP sync] ADCP_AGENT_URL=%s does not use https:// — ignoring override "
             "(adcp/_schemas/3.1/core/seller-agent-ref.json requires https for agent_url). "
             "Falling back to tenant virtual_host resolution.",
-            sanitize_for_log(override),
+            log_safe(override),
         )
 
     # Load tenant to resolve virtual_host.
@@ -376,7 +377,7 @@ def _post_packages_sync(endpoint: str, payloads: list[dict[str, Any]], auth_cred
     # at WARNING in sync_packages_for_media_buy's fan-out loop below).
     logger.debug(
         "[TMP sync] POST %s → %d (%d package(s), auth=%s)",
-        sanitize_for_log(url),
+        log_safe(url),
         resp.status_code,
         len(payloads),
         "bearer" if auth_credentials else "none",
@@ -409,8 +410,8 @@ def _readable_providers(provider_rows: list[TMPProvider], tenant_id: str) -> lis
             logger.warning(
                 "[TMP sync] Skipping provider '%s' (%s) for tenant=%s — its stored auth credential "
                 "could not be read (re-enter it in the admin UI); other providers are unaffected",
-                sanitize_for_log(p.name),
-                sanitize_for_log(p.endpoint),
+                log_safe(p.name),
+                log_safe(p.endpoint),
                 tenant_id,
                 exc_info=True,
             )
@@ -489,7 +490,7 @@ def sync_packages_for_media_buy(tenant_id: str, media_buy_id: str) -> None:
         "[TMP sync] Built %d package payload(s) for media_buy=%s seller_agent=%s",
         len(payloads),
         media_buy_id,
-        sanitize_for_log(seller_agent_url),
+        log_safe(seller_agent_url),
     )
 
     # --- Step 3: load active + draining TMP provider endpoints ---
@@ -530,8 +531,8 @@ def sync_packages_for_media_buy(tenant_id: str, media_buy_id: str) -> None:
             logger.warning(
                 "[TMP sync] Failed to sync %d package(s) to provider '%s' (%s) for tenant=%s media_buy=%s",
                 len(payloads),
-                sanitize_for_log(provider_name),
-                sanitize_for_log(provider_endpoint),
+                log_safe(provider_name),
+                log_safe(provider_endpoint),
                 tenant_id,
                 media_buy_id,
                 exc_info=True,

@@ -38,14 +38,14 @@ import httpx
 from src.core.database.database_session import get_db_session
 from src.core.database.repositories.tmp_provider import TMPProviderRepository
 from src.core.database.repositories.uow import TMPProviderUoW
-from src.core.security.url_validator import sanitize_for_log
+from src.core.logging_config import log_safe
 from src.services._provider_http import provider_client_kwargs, provider_url
-from src.services._scheduler_base import IntervalScheduler, _parse_interval_env, make_singleton
+from src.services._scheduler_base import IntervalScheduler, make_singleton, parse_interval_env
 
 logger = logging.getLogger(__name__)
 
 # Configurable via env var — default 60 seconds.
-HEALTH_CHECK_INTERVAL_SECONDS: int = _parse_interval_env("TMP_HEALTH_CHECK_INTERVAL", 60)
+HEALTH_CHECK_INTERVAL_SECONDS: int = parse_interval_env("TMP_HEALTH_CHECK_INTERVAL", 60)
 
 # Per-provider HTTP timeout.  The scheduler can afford to mark a slow
 # provider as unhealthy and retry on the next cycle, so this stays short.
@@ -73,7 +73,7 @@ async def _check_provider_health(endpoint: str) -> str:
             resp = await client.get(health_url)
         return "healthy" if resp.status_code == 200 else "unhealthy"
     except Exception:
-        logger.exception("[TMP health] Health probe failed for %s", sanitize_for_log(endpoint))
+        logger.exception("[TMP health] Health probe failed for %s", log_safe(endpoint))
         return "error"
 
 
@@ -155,12 +155,12 @@ class TMPHealthScheduler(IntervalScheduler):
 
 # ---------------------------------------------------------------------------
 # Global singleton — derived from the shared factory, not hand-rolled.
-# main.py's _run_scheduler_fn reaches start_/stop_ by getattr off
-# _SCHEDULER_REGISTRY, so these exist only to be found by name.
+# make_singleton also registers the start/stop pair under the display name
+# below, which is what the app entry point iterates (#1197 review).
 # ---------------------------------------------------------------------------
 
 (
     get_tmp_health_scheduler,
     start_tmp_health_scheduler,
     stop_tmp_health_scheduler,
-) = make_singleton(TMPHealthScheduler)
+) = make_singleton(TMPHealthScheduler, name="TMP health")

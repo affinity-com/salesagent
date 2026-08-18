@@ -4,7 +4,8 @@ Covers:
 - check_url_ssrf: core validator used across signals agents, webhooks, property lists
 - validate_agent_url: media_buy_create wrapper
 - BLOCKED_HOSTNAMES: Docker-internal and cloud metadata hostname coverage
-- is_local_host: the shared local-dev-host predicate (agent card + TMP seller URL)
+- is_local_host: the shared local-dev-host predicate, now homed in
+  src.core.domain_config (agent card + landing page + TMP seller URL)
 - Flask endpoint-level wiring for signals agents add/edit handlers
 """
 
@@ -13,7 +14,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.core.security.url_validator import BLOCKED_HOSTNAMES, check_url_ssrf, is_local_host
+from src.core.domain_config import is_local_host
+from src.core.security.url_validator import BLOCKED_HOSTNAMES, check_url_ssrf
 from tests.unit._tmp_helpers import make_super_admin_client
 
 

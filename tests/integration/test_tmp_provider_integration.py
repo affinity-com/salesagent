@@ -148,7 +148,7 @@ class TestDiscoveryReturnsActiveProviders:
 class TestDiscoveryAuth:
     """The contract authenticates a TENANT's credential, not a process.
 
-    ``require_tenant_credential`` resolves the caller's token *inside* the
+    ``_require_tenant_credential`` resolves the caller's token *inside* the
     tenant in the path, so a cross-tenant read is inexpressible rather than
     rejected by a comparison. Every case here goes through ``src.app.app``, so
     the 401 body is the one the deployed endpoint emits — the previous suite ran

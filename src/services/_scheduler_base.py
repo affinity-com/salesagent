@@ -8,13 +8,19 @@ TMPHealthScheduler) share an identical scaffold:
 This base extracts *both* halves, so each concrete scheduler only overrides
 ``tick()`` and binds the three module-level functions from the factory.
 
+``make_singleton`` also *registers* the start/stop pair here, so the app entry
+point iterates real callables it imported rather than resolving names off a
+table of strings — see :func:`registered_scheduler` (#1197 review).
+
 Usage::
 
     class MyScheduler(IntervalScheduler):
         async def tick(self) -> None:
             await do_work()
 
-    get_my_scheduler, start_my_scheduler, stop_my_scheduler = make_singleton(MyScheduler)
+    get_my_scheduler, start_my_scheduler, stop_my_scheduler = make_singleton(
+        MyScheduler, name="my thing"
+    )
 """
 
 from __future__ import annotations
@@ -24,11 +30,13 @@ import asyncio
 import logging
 import os
 from collections.abc import Awaitable, Callable
+from types import ModuleType
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 
 
-def _parse_interval_env(env_var: str, default: int) -> int:
+def parse_interval_env(env_var: str, default: int) -> int:
     """Parse an integer interval from an environment variable.
 
     Wraps the conversion in try/except so a bad value (e.g. ``"sixty"``) does
@@ -136,10 +144,48 @@ class IntervalScheduler(abc.ABC):
         """Override in subclasses to perform one unit of work."""
 
 
+class RegisteredScheduler(NamedTuple):
+    """One scheduler's lifecycle pair, as registered by :func:`make_singleton`.
+
+    Holds the bound callables themselves, not their names: the app entry point
+    imports the scheduler module and iterates these, so a renamed or moved
+    lifecycle function is an import-time failure instead of a ``getattr`` miss
+    swallowed by a startup ``except Exception`` (#1197 review).
+    """
+
+    name: str
+    start: Callable[[], Awaitable[None]]
+    stop: Callable[[], Awaitable[None]]
+
+
+#: Registered schedulers, keyed by the ``__module__`` of the scheduler class.
+#: Populated at import time by :func:`make_singleton`; read via
+#: :func:`registered_scheduler`, which keys off the imported module object so
+#: the caller controls start/stop ORDER explicitly rather than inheriting
+#: whatever import happened to run first.
+_REGISTRY: dict[str, RegisteredScheduler] = {}
+
+
+def registered_scheduler(module: ModuleType) -> RegisteredScheduler:
+    """Return the scheduler *module* registered when it was imported.
+
+    Raises ``KeyError`` if the module defines no scheduler — a module that
+    stopped registering one is then a loud startup failure, which is the
+    property the string-keyed table could not offer.
+    """
+    return _REGISTRY[module.__name__]
+
+
 def make_singleton[SchedulerT: IntervalScheduler](
     cls: Callable[[], SchedulerT],
+    *,
+    name: str,
 ) -> tuple[Callable[[], SchedulerT], Callable[[], Awaitable[None]], Callable[[], Awaitable[None]]]:
-    """Build the ``(get_x, start_x, stop_x)`` module-level singleton trio for *cls*.
+    """Build the ``(get_x, start_x, stop_x)`` singleton trio for *cls* and register it.
+
+    *name* is the operator-facing display name used in startup/shutdown log
+    lines ("TMP health"). It lives here, beside the scheduler it names, rather
+    than in a table in the app entry point.
 
     *cls* is typed ``Callable[[], SchedulerT]`` rather than ``type[SchedulerT]``
     because the requirement is a **zero-argument** constructor: each concrete
@@ -148,12 +194,12 @@ def make_singleton[SchedulerT: IntervalScheduler](
     and make the ``cls()`` call below a type error.
 
     Every scheduler module used to hand-roll a byte-identical ``_scheduler``
-    global plus ``get_``/``start_``/``stop_`` wrappers.  ``main.py`` reaches the
-    start/stop pair by ``getattr`` off ``_SCHEDULER_REGISTRY``, so those
-    functions exist only to be found by name — nothing about them is
-    scheduler-specific.  Bind them from here instead::
+    global plus ``get_``/``start_``/``stop_`` wrappers.  Bind them from here
+    instead::
 
-        get_my_scheduler, start_my_scheduler, stop_my_scheduler = make_singleton(MyScheduler)
+        get_my_scheduler, start_my_scheduler, stop_my_scheduler = make_singleton(
+            MyScheduler, name="my thing"
+        )
 
     The instance is created lazily on first ``get_`` call and cached in this
     factory's closure (one cell per call, so each scheduler module keeps its own
@@ -177,4 +223,5 @@ def make_singleton[SchedulerT: IntervalScheduler](
         """Stop the global scheduler (called at application shutdown)."""
         await get_scheduler().stop()
 
+    _REGISTRY[cls.__module__] = RegisteredScheduler(name, start_scheduler, stop_scheduler)
     return get_scheduler, start_scheduler, stop_scheduler

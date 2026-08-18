@@ -32,7 +32,7 @@ from src.a2a_server.adcp_a2a_server import (
 from src.a2a_server.context_builder import AdCPCallContextBuilder
 from src.admin.app import create_app
 from src.core.auth_middleware import UnifiedAuthMiddleware
-from src.core.domain_config import get_a2a_server_url, get_sales_agent_domain
+from src.core.domain_config import get_a2a_server_url, get_sales_agent_domain, is_local_host
 from src.core.domain_routing import route_landing_page
 from src.core.exceptions import (
     INVALID_REQUEST_SUGGESTION,
@@ -48,7 +48,6 @@ from src.core.http_utils import get_header_case_insensitive as _get_header_case_
 from src.core.lifecycle import run_all_shutdown_callbacks
 from src.core.main import mcp
 from src.core.resolved_identity import resolve_identity
-from src.core.security.url_validator import is_local_host
 from src.core.tool_error_logging import handle_tool_error, record_boundary_error
 from src.landing import generate_tenant_landing_page
 from src.landing.landing_page import generate_fallback_landing_page
@@ -361,7 +360,7 @@ def _create_dynamic_agent_card(request: Request):
             proto = forwarded_proto.split(",")[0].strip().lower()
             if proto in ("http", "https"):
                 return proto
-        # Shared predicate (src.core.security.url_validator.is_local_host): exact
+        # Shared predicate (src.core.domain_config.is_local_host): exact
         # equality / suffix checks, port stripped, and *.localhost counted as
         # local so a per-tenant dev host like "tenant.localhost" advertises http.
         # The TMP seller-URL resolver asks the same question and calls the same
@@ -478,7 +477,7 @@ app.include_router(api_v1_router)
 app.include_router(health_router)
 app.include_router(health_debug_router)
 # TMP Router discovery endpoint — gated by a credential resolved inside the
-# path's tenant (src.routes.tmp_providers.require_tenant_credential).
+# path's tenant (src.routes.tmp_providers._require_tenant_credential).
 # GET /tenant/{tenant_id}/tmp-providers/discovery
 app.include_router(tmp_providers_router)
 
