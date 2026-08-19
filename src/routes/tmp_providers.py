@@ -62,17 +62,14 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends
+from pydantic import ValidationError
 
 from src.core.auth_context import AuthContext, get_auth_context
 from src.core.auth_utils import get_principal_from_token
 from src.core.database.repositories.uow import TMPProviderUoW
-from src.core.exceptions import (
-    AdCPAccountNotFoundError,
-    AdCPAuthRequiredError,
-    AdCPServiceUnavailableError,
-)
+from src.core.exceptions import AdCPAccountNotFoundError, AdCPAuthRequiredError
 from src.core.logging_config import log_safe
-from src.core.schemas.tmp_provider import TMPDiscoveryResponse
+from src.core.schemas.tmp_provider import TMPDiscoveryResponse, TMPProviderDiscoveryEntry
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +134,7 @@ def _require_tenant_credential(tenant_id: str, auth_ctx: AuthContext = get_auth_
 require_tenant_credential: Any = Depends(_require_tenant_credential)
 
 
-@router.get(DISCOVERY_ROUTE, response_model=TMPDiscoveryResponse)
+@router.get(DISCOVERY_ROUTE, response_model=TMPDiscoveryResponse, response_model_exclude_none=True)
 async def tmp_providers_discovery(
     tenant_id: str, principal_id: str = require_tenant_credential
 ) -> TMPDiscoveryResponse:
@@ -149,9 +146,9 @@ async def tmp_providers_discovery(
 
     Returns the typed :class:`TMPDiscoveryResponse` rather than a hand-built
     ``JSONResponse``: FastAPI then publishes an OpenAPI schema for this
-    versioned contract and validates the outgoing keys against
-    :data:`PROVIDER_REGISTRATION_SCHEMA`'s closed key set, which an unvalidated
-    ``JSONResponse`` did not (#1197 review).
+    versioned contract, and the response model IS the pinned schema's codegen, so
+    the outgoing key set is the schema's by construction rather than by a
+    hand-maintained key list (#1197 review).
 
     Lifecycle filtering:
       active   → included
@@ -162,38 +159,54 @@ async def tmp_providers_discovery(
     # tenant_config repositories, so the tenant-existence check and the
     # provider read run as ONE transaction rather than two separate ones.
     #
-    # to_discovery_dict() is also called INSIDE this block — TMPProvider
+    # from_row() is also called INSIDE this block — TMPProvider
     # attributes expire on commit (default expire_on_commit=True), so
     # serializing after the `with` block closes hits a detached session and
     # raises DetachedInstanceError.
     with TMPProviderUoW(tenant_id) as uow:
-        # Both repository guards raise the same typed error, never `assert`:
-        # `python -O` strips asserts, and an AssertionError escapes as an
-        # un-enveloped 500 instead of the typed AdCP envelope this endpoint's
-        # contract promises.  Every raise on this route carries `suggestion=`
-        # so the buyer-facing envelope always has a next step (#1197 review).
-        if uow.tenant_config is None:
-            raise AdCPServiceUnavailableError(
-                "Tenant config repository unavailable.",
-                suggestion="Retry shortly; the sales agent could not open a tenant configuration session.",
-            )
+        # No repository narrowing here: TMPProviderUoW exposes its repositories
+        # through RepositoryAccessor, which hands back the concrete repository
+        # inside the `with` block and raises the same typed
+        # AdCPServiceUnavailableError outside it. An `assert` would have been
+        # wrong twice — `python -O` strips it, and an AssertionError escapes as
+        # an un-enveloped 500 instead of the typed AdCP envelope this endpoint's
+        # contract promises (#1197 review).
         if uow.tenant_config.get_tenant() is None:
             raise AdCPAccountNotFoundError(
                 f"Tenant '{tenant_id}' not found.",
                 suggestion="Provide a valid tenant ID.",
             )
-        if uow.tmp_providers is None:
-            raise AdCPServiceUnavailableError(
-                "TMP provider repository unavailable.",
-                suggestion="Retry shortly; the sales agent could not open a TMP provider session.",
-            )
 
         providers = uow.tmp_providers.list_syncable()
 
-        # to_discovery_dict() is the machine-wire serializer: the closed key set
-        # of provider-registration.json, with absent conditional arrays omitted
-        # rather than nulled. The admin views use to_admin_dict() instead.
-        provider_list = [p.to_discovery_dict() for p in providers]
+        # Construction, not serialization: TMPProviderDiscoveryEntry extends the
+        # pinned SDK type, so a row that cannot be represented conformantly fails
+        # HERE rather than reaching a strict router as an invalid entry (#1197
+        # review). ``response_model_exclude_none=True`` on the decorator is what
+        # keeps absent conditional arrays omitted rather than nulled — the schema
+        # types all three as arrays with minItems: 1.
+        #
+        # Per row, not per response. The only rows that can fail conversion are
+        # legacy ones predating TMPProviderRegistration (e.g. identity_match with
+        # no countries — a state the schema's if/then makes unrepresentable at any
+        # serialization). Raising for the whole tenant would let one such row take
+        # discovery down for every other provider, which is the per-batch failure
+        # mode this feature removed from the sync path and the health scheduler.
+        # The row is dropped and named at ERROR so an operator can repair it.
+        provider_list = []
+        for provider in providers:
+            try:
+                provider_list.append(TMPProviderDiscoveryEntry.from_row(provider))
+            except ValidationError:
+                logger.error(
+                    "[TMP discovery] Skipping provider %s for tenant=%s — the row cannot be "
+                    "represented conformantly (%s). Re-save it through the admin form to repair it; "
+                    "the remaining providers are unaffected.",
+                    log_safe(provider.provider_id),
+                    log_safe(tenant_id),
+                    PROVIDER_REGISTRATION_SCHEMA,
+                    exc_info=True,
+                )
 
     logger.debug(
         "[TMP discovery] tenant=%s principal=%s returned %d provider(s)",

@@ -33,16 +33,39 @@ def provider_url(endpoint: str, path: str) -> str:
     return endpoint.rstrip("/") + path
 
 
-def bearer_headers(auth_credentials: str) -> dict[str, str]:
-    """Build HTTP headers for a TMP Provider request.
+#: The auth schemes an outbound TMP Provider call can actually make.
+#:
+#: One entry, and that is the point: the registration's ``auth_type`` used to be
+#: an unconstrained ``str`` whose admin form offered "API Key" while this module
+#: always emitted ``Authorization: Bearer`` regardless — selecting a scheme
+#: changed nothing (#1197 review). The vocabulary now lives where the behaviour
+#: is, ``TMPProviderRegistration.auth_type`` is typed from it, and
+#: :func:`provider_auth_headers` dispatches on it, so adding a scheme means adding
+#: a branch here rather than an option to a template.
+PROVIDER_AUTH_SCHEMES: frozenset[str] = frozenset({"bearer"})
 
-    Returns an ``Authorization: Bearer`` header when *auth_credentials* is
-    non-empty, otherwise an empty dict.  Centralising this ensures every
-    outbound call inherits the same auth shape — no per-call copy-paste.
+
+def provider_auth_headers(auth_type: str | None, auth_credentials: str) -> dict[str, str]:
+    """Build the auth headers for one outbound TMP Provider request.
+
+    Returns an empty dict when the provider has no credential — an
+    unauthenticated provider is a supported registration. A credential with no
+    explicit ``auth_type`` is sent as Bearer: that is the only scheme implemented,
+    and it is what every previously-stored registration already got.
+
+    An ``auth_type`` outside :data:`PROVIDER_AUTH_SCHEMES` cannot reach here from
+    any write surface (the record types the field), so it is a programming error
+    rather than operator input — hence a raise, not a silent fallback that would
+    reintroduce "the selected scheme is ignored".
     """
-    if auth_credentials:
-        return {"Authorization": f"Bearer {auth_credentials}"}
-    return {}
+    if not auth_credentials:
+        return {}
+    scheme = auth_type or "bearer"
+    if scheme not in PROVIDER_AUTH_SCHEMES:
+        raise ValueError(
+            f"Unsupported TMP provider auth scheme {scheme!r}; expected one of {sorted(PROVIDER_AUTH_SCHEMES)}"
+        )
+    return {"Authorization": f"Bearer {auth_credentials}"}
 
 
 class ProviderClientKwargs(TypedDict):

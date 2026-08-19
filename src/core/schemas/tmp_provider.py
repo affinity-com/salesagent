@@ -52,17 +52,32 @@ SDK enums and pinned against the library model by
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 from typing import Annotated, TypedDict
 from uuid import UUID
 
 from adcp.types.generated_poc.enums.uid_type import UidType
 from adcp.types.generated_poc.trusted_match.provider_registration import Status as ProviderStatus
-from pydantic import AfterValidator, Field, StringConstraints, ValidationError, model_validator
+from adcp.types.generated_poc.trusted_match.provider_registration import (
+    TmpProviderRegistration1 as LibraryContextMatchRegistration,
+)
+from adcp.types.generated_poc.trusted_match.provider_registration import (
+    TmpProviderRegistration2 as LibraryIdentityMatchRegistration,
+)
+from pydantic import (
+    AfterValidator,
+    AnyUrl,
+    Field,
+    RootModel,
+    StringConstraints,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from src.core.logging_config import log_safe
 from src.core.schemas._base import SalesAgentBaseModel
 from src.core.security.url_validator import check_url_ssrf
+from src.services._provider_http import PROVIDER_AUTH_SCHEMES
 
 logger = logging.getLogger(__name__)
 
@@ -73,13 +88,12 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "VALID_STATUSES",
     "VALID_UID_TYPES",
+    "AuthScheme",
     "CountryCode",
     "PropertyRid",
     "TMPDiscoveryResponse",
-    "TMPProviderAdminDict",
-    "TMPProviderDiscoveryDict",
+    "TMPProviderDiscoveryEntry",
     "TMPProviderFields",
-    "TMPProviderFormDict",
     "TMPProviderRegistration",
     "TMPProviderValidationError",
 ]
@@ -115,6 +129,17 @@ CountryCode = Annotated[str, StringConstraints(pattern=r"^[A-Z]{2}$")]
 PropertyRid = Annotated[str, AfterValidator(_require_uuid)]
 
 
+def _known_auth_scheme(value: str) -> str:
+    """Reject an auth scheme no outbound call can actually make."""
+    if value not in PROVIDER_AUTH_SCHEMES:
+        raise ValueError(f"Invalid auth_type '{value}'. Valid values: {', '.join(sorted(PROVIDER_AUTH_SCHEMES))}")
+    return value
+
+
+#: The provider auth scheme, typed from what ``provider_auth_headers`` implements.
+AuthScheme = Annotated[str, AfterValidator(_known_auth_scheme)]
+
+
 class TMPProviderValidationError(ValueError):
     """A TMP provider registration was rejected by a domain invariant.
 
@@ -143,6 +168,10 @@ class TMPProviderFields(TypedDict, total=False):
     context_match: bool
     identity_match: bool
     countries: list[str] | None
+    # ``list[str]``, not ``list[UidType]``: this is the PERSISTENCE contract, and
+    # the column is JSONType. ``UidType`` is a ``str`` subclass so the values pass
+    # through unchanged; typing the persisted shape as plain ``str`` keeps the
+    # repository free of a protocol enum import.
     uid_types: list[str] | None
     properties: list[str] | None
     timeout_ms: int
@@ -152,102 +181,116 @@ class TMPProviderFields(TypedDict, total=False):
     auth_credentials: str | None
 
 
-class _TMPProviderAdminScalars(TypedDict):
-    """The scalar half shared by the two admin-side views (see below).
+def _permit_local_http_endpoint(value: AnyUrl) -> AnyUrl:
+    """Replace the SDK's https-only endpoint validator with the schema's rule.
 
-    Split out only so the two views can type ``countries``/``uid_types``/
-    ``properties`` differently without restating the nine keys they agree on —
-    a TypedDict subclass may add keys but not retype inherited ones.
+    The authority is the pinned schema, which types ``endpoint`` as
+    ``{"type": "string", "format": "uri"}`` — the HTTPS requirement is prose in
+    the field ``description`` ("MUST be HTTPS in production"), not a constraint
+    the schema expresses. The SDK codegen hard-rejects any non-https scheme, so
+    inheriting it unchanged would make the discovery endpoint 500 in local
+    development against an ``http://…​.localhost`` provider, which this feature
+    supports deliberately.
+
+    Overriding by re-declaring the parent's validator name is what pydantic
+    offers for "inherit the model, drop this one rule"; it is the single
+    documented divergence from the SDK type, and it diverges toward the schema
+    rather than away from it.
+    """
+    return value
+
+
+class _ContextMatchEntry(LibraryContextMatchRegistration):
+    """The ``context_match: true`` branch of the pinned schema's ``anyOf``."""
+
+    @field_validator("endpoint")
+    @classmethod
+    def _require_https_endpoint(cls, value: AnyUrl) -> AnyUrl:
+        return _permit_local_http_endpoint(value)
+
+
+class _IdentityMatchEntry(LibraryIdentityMatchRegistration):
+    """The ``identity_match: true`` branch of the pinned schema's ``anyOf``."""
+
+    @field_validator("endpoint")
+    @classmethod
+    def _require_https_endpoint(cls, value: AnyUrl) -> AnyUrl:
+        return _permit_local_http_endpoint(value)
+
+
+class TMPProviderDiscoveryEntry(RootModel[_ContextMatchEntry | _IdentityMatchEntry]):
+    """One provider entry on the discovery wire — the SDK's own wire type.
+
+    Extends the pinned codegen of ``provider-registration.json``
+    (:data:`src.routes.tmp_providers.PROVIDER_REGISTRATION_SCHEMA`) instead of
+    restating its closed key set as a ``TypedDict``, per CLAUDE.md Pattern #1.
+    The sibling sync payload already did this — ``_build_package_payload`` builds
+    through ``AvailablePackage`` so "a spec bump that renames or adds a required
+    field becomes a construction error" — and this entry, the payload that
+    actually crosses the service boundary, did the opposite (#1197 review).
+
+    What the model carries that a ``TypedDict`` could not, and which therefore
+    stopped being re-implemented by hand:
+
+      - ``uid_types: list[UidType]`` — the enum, **unconditionally**. The local
+        copy checked the vocabulary only under ``if identity_match:``, while the
+        schema refs ``enums/uid-type.json`` on ``uid_types.items`` with no
+        condition, so a context-only provider could persist a row the wire
+        rejects.
+      - ``countries: list[Country]`` (``^[A-Z]{2}$``), ``properties: list[UUID]``,
+        ``timeout_ms`` 5..5000, ``priority`` >= 0, ``provider_id``
+        ``^[A-Za-z0-9_]+$``.
+      - the schema's ``if/then`` (``identity_match ⇒ countries + uid_types``) and
+        its ``anyOf`` over the two match modes — expressed as the union of the two
+        branch variants, which is exactly what the schema says and what a
+        ``TypedDict`` cannot say at all.
+
+    Emission is therefore construction: :meth:`from_row` raises on a row that
+    cannot be represented conformantly, at the boundary, instead of serializing
+    it and leaving a strict router to reject it.
+
+    One wire-visible consequence of the SDK typing ``endpoint`` as ``AnyUrl``:
+    pydantic canonicalizes it, so a stored ``http://host:3003`` publishes as
+    ``http://host:3003/``. This is conformant and semantically identical — the
+    schema states that two registrations "differing only in case, default port,
+    or path-slash collapsing are the same provider" — and the outbound side is
+    unaffected because ``provider_url()`` strips the trailing slash before
+    appending ``/packages/sync``.
     """
 
-    provider_id: str
-    name: str
-    endpoint: str
-    context_match: bool
-    identity_match: bool
-    timeout_ms: int
-    priority: int
-    status: str
+    @classmethod
+    def from_row(cls, row: object) -> TMPProviderDiscoveryEntry:
+        """Build the wire entry from a ``TMPProvider`` ORM row.
 
+        The row→entry mapping lives here rather than on the ORM model so that
+        persistence does not import the protocol-schema package (that import made
+        any future ``schemas → models`` import a circular-import failure instead
+        of a design question).
 
-class TMPProviderAdminDict(_TMPProviderAdminScalars, total=False):
-    """What :meth:`TMPProvider.to_admin_dict` returns — the admin list view's row.
+        ``None`` conditionals are dropped rather than passed: the schema types
+        ``countries``/``uid_types``/``properties`` as arrays with ``minItems: 1``,
+        so an absent value must be omitted — ``null`` is a type violation, not an
+        unknown key. Building a mapping and validating it (rather than picking a
+        branch here) lets the union discriminate on the match-mode flags exactly
+        as the schema's ``anyOf`` does.
 
-    Typed rather than a bare ``dict`` for the same reason its machine-wire
-    sibling :class:`TMPProviderDiscoveryDict` is: both are closed key sets whose
-    consumers (here, ``templates/tmp_providers.html``) break on a renamed key,
-    and only one of the two was typed (#1197 review).
-
-    ``created_at`` is declared here because the list handler adds it to the
-    returned mapping: a key a caller writes is part of this shape whether or not
-    the serializer emits it, and declaring it is what makes that write a checked
-    one.  ``total=False`` covers exactly that — the serializer always emits the
-    other keys.
-
-    The three conditional arrays are ``list[str] | None`` (never omitted):
-    unlike the discovery wire, the list view distinguishes "no restriction" from
-    "not shown", and the edit template renders all three unconditionally.
-    """
-
-    countries: list[str] | None
-    uid_types: list[str] | None
-    properties: list[str] | None
-    created_at: datetime
-
-
-class TMPProviderFormDict(_TMPProviderAdminScalars, total=False):
-    """The edit form's view of a provider — ``templates/tmp_provider_form.html``.
-
-    Diverges from :class:`TMPProviderAdminDict` in exactly the ways an HTML form
-    does: the three arrays are the comma-separated strings a text input round-trips,
-    and the two auth keys the handler adds are present (``auth_credentials`` being
-    a mask, never the credential).  Form shape belongs to the blueprint, so the
-    conversion lives there (``_form_view``) rather than on the model.
-    """
-
-    countries: str
-    uid_types: str
-    properties: str
-    auth_type: str | None
-    auth_credentials: str
-
-
-class _TMPProviderDiscoveryRequired(TypedDict):
-    """The always-emitted half of :class:`TMPProviderDiscoveryDict` (see there)."""
-
-    provider_id: str
-    endpoint: str
-    context_match: bool
-    identity_match: bool
-    timeout_ms: int
-    priority: int
-    status: str
-
-
-class TMPProviderDiscoveryDict(_TMPProviderDiscoveryRequired, total=False):
-    """One provider entry on the discovery wire, typed against the closed schema.
-
-    The pinned ``provider-registration.json``
-    (:data:`src.routes.tmp_providers.PROVIDER_REGISTRATION_SCHEMA`) is a closed
-    object (``additionalProperties: false``), so this is the exact key set the
-    discovery endpoint may emit — not a partial view.  The three keys declared
-    here are ``total=False`` because the schema types each as ``array`` with
-    ``minItems: 1``: an absent value must be **omitted**, never sent as ``null``
-    (``null`` is a type violation a strictly-validating router rejects).
-
-    ``name`` is deliberately absent: it is not in the closed schema.  It stays
-    on the admin serialization (:meth:`TMPProvider.to_admin_dict`), which feeds
-    Jinja templates rather than the machine wire (#1197 review).
-
-    ``tmpx_macros`` — the schema's remaining optional property, added by 3.1.1
-    for provider-namespaced ad-server macro names — is not carried: there is no
-    column, admin field, or router consumer for it yet, and omitting an optional
-    property is conformant.
-    """
-
-    countries: list[str]
-    uid_types: list[str]
-    properties: list[str]
+        ``name`` is deliberately not carried: it is not in the closed schema. It
+        lives on the admin view shapes, which the admin layer owns.
+        """
+        payload: dict[str, object] = {
+            "provider_id": row.provider_id,  # type: ignore[attr-defined]
+            "endpoint": row.endpoint,  # type: ignore[attr-defined]
+            "context_match": row.context_match,  # type: ignore[attr-defined]
+            "identity_match": row.identity_match,  # type: ignore[attr-defined]
+            "timeout_ms": row.timeout_ms,  # type: ignore[attr-defined]
+            "priority": row.priority,  # type: ignore[attr-defined]
+            "status": row.status,  # type: ignore[attr-defined]
+        }
+        for key in ("countries", "uid_types", "properties"):
+            value = getattr(row, key, None)
+            if value:
+                payload[key] = value
+        return cls.model_validate(payload)
 
 
 class TMPDiscoveryResponse(SalesAgentBaseModel):
@@ -259,7 +302,7 @@ class TMPDiscoveryResponse(SalesAgentBaseModel):
     """
 
     tenant_id: str
-    providers: list[TMPProviderDiscoveryDict]
+    providers: list[TMPProviderDiscoveryEntry]
 
 
 class TMPProviderRegistration(SalesAgentBaseModel):
@@ -284,12 +327,23 @@ class TMPProviderRegistration(SalesAgentBaseModel):
     # (#1197 review).  Graded against the schema itself by
     # ``tests/unit/test_tmp_provider_registration.py``.
     countries: list[CountryCode] | None = None
-    uid_types: list[str] | None = None
+    # The vocabulary is enforced as a FIELD TYPE, not inside the
+    # ``if self.identity_match:`` branch below. The pinned schema refs
+    # ``enums/uid-type.json`` on ``uid_types.items`` unconditionally, so a
+    # context-only provider with a bogus uid type was a row the discovery wire
+    # rejected while this record accepted it (#1197 review). ``UidType`` is the
+    # SDK enum ``VALID_UID_TYPES`` is derived from, so the two cannot disagree.
+    uid_types: list[UidType] | None = None
     properties: list[PropertyRid] | None = None
     timeout_ms: int = Field(default=50, ge=5, le=5000)
     priority: int = Field(default=0, ge=0)
     status: str = "active"
-    auth_type: str | None = None
+    # Constrained from the vocabulary of the code that ACTS on it. An
+    # unconstrained ``str`` let the admin form offer "API Key" while
+    # ``provider_auth_headers`` emitted Bearer regardless, so the selected scheme
+    # changed nothing (#1197 review). ``PROVIDER_AUTH_SCHEMES`` is the set that
+    # function implements, so the field and the behaviour cannot disagree.
+    auth_type: AuthScheme | None = None
     auth_credentials: str | None = None
 
     @model_validator(mode="after")
@@ -329,12 +383,6 @@ class TMPProviderRegistration(SalesAgentBaseModel):
                 raise ValueError(
                     "UID types are required when identity_match is enabled (e.g. uid2, publisher_first_party)"
                 )
-            invalid_types = [u for u in self.uid_types if u not in VALID_UID_TYPES]
-            if invalid_types:
-                raise ValueError(
-                    f"Invalid uid_type(s): {', '.join(invalid_types)}. "
-                    f"Valid values: {', '.join(sorted(VALID_UID_TYPES))}"
-                )
         return self
 
     @classmethod
@@ -360,7 +408,7 @@ class TMPProviderRegistration(SalesAgentBaseModel):
             context_match=self.context_match,
             identity_match=self.identity_match,
             countries=self.countries,
-            uid_types=self.uid_types,
+            uid_types=[str(u) for u in self.uid_types] if self.uid_types else None,
             properties=self.properties,
             timeout_ms=self.timeout_ms,
             priority=self.priority,
@@ -387,6 +435,39 @@ def _first_error_message(exc: ValidationError) -> str:
 
     Pydantic prefixes messages raised by a validator with ``"Value error, "``;
     strip it so the admin UI flashes the message this module wrote.
+
+    The failing field is prefixed from ``loc``. That was unnecessary while every
+    rejection was a hand-written sentence naming its own subject ("Countries are
+    required when identity_match is enabled"), but the value constraints are now
+    field types, and pydantic's message for one is
+    ``String should match pattern '^[A-Z]{2}$'`` — which of the three
+    comma-separated inputs the operator got wrong is exactly the information
+    ``loc`` carries and the bare message drops (#1197 review).
+
+    Model-level errors have an empty ``loc`` (or a synthetic one), so they keep
+    their unprefixed sentence.
     """
     first = exc.errors()[0]
-    return str(first.get("msg", "Invalid TMP provider registration")).removeprefix("Value error, ")
+    message = str(first.get("msg", "Invalid TMP provider registration")).removeprefix("Value error, ")
+
+    loc = first.get("loc") or ()
+    field = next((part for part in loc if isinstance(part, str)), None)
+    if not field or field not in TMPProviderRegistration.model_fields:
+        # A model-level invariant: its message is a hand-written sentence that
+        # already names its own subject ("Provider must support at least one of
+        # context_match or identity_match").
+        return message
+
+    # For a list field, ``loc`` also carries the failing INDEX — which entry of a
+    # comma-separated input was rejected.
+    index = next((part for part in loc if isinstance(part, int)), None)
+    label = field if index is None else f"{field}[{index}]"
+
+    # Pydantic's built-in messages state what was expected but not what was given
+    # ("Input should be 'rampid', 'uid2', …"), so a CSV field with several entries
+    # left the operator without the offending value. The hand-written messages this
+    # replaced did echo it; ``input`` puts it back.
+    rejected = first.get("input")
+    if rejected is not None and str(rejected) not in message:
+        return f"{label}: {message} (got {rejected!r})"
+    return f"{label}: {message}"

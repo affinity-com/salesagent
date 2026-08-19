@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 import pytest
 
+from src.admin.blueprints.tmp_providers import _form_render_context
 from src.core.database.models import TMPProvider
 from src.core.schemas.tmp_provider import VALID_STATUSES, VALID_UID_TYPES
 from tests.unit._tmp_helpers import _make_blueprint_uow, _make_mock_provider, make_super_admin_client
@@ -394,7 +395,12 @@ class TestTMPProviderHealthCheck:
 
         assert response.status_code == 200
         data = response.get_json()
-        assert data["success"] is False
+        # `success` means "request served" — the SAME meaning it has on the
+        # deactivate/delete siblings — and never the health verdict. It used to
+        # flip meaning between the two branches of this route while the JS read it
+        # as the verdict, which reported a never-probed provider as healthy
+        # (#1197 review).
+        assert data["success"] is True
         assert data["status"] == "unhealthy"
 
     def test_health_check_returns_pending_when_never_checked(self):
@@ -534,8 +540,10 @@ class TestTMPProviderAuthFields:
                 "auth_type": "bearer",
                 "auth_credentials": "••••••••",
             },
-            valid_uid_types=sorted(VALID_UID_TYPES),
-            valid_statuses=sorted(VALID_STATUSES),
+            # Through the production helper, not a hand-listed copy: the form
+            # context is one thing the blueprint owns, and re-typing its keys per
+            # test is how the template's own vocabularies drifted (#1197 review).
+            **_form_render_context(),
         )
 
     def test_edit_post_preserves_existing_credentials_when_empty_submitted(self):
@@ -737,8 +745,10 @@ class TestAddGetRendersTheEmptyForm:
             tenant_id="default",
             tenant_name="Default Tenant",
             provider=None,
-            valid_uid_types=sorted(VALID_UID_TYPES),
-            valid_statuses=sorted(VALID_STATUSES),
+            # Through the production helper, not a hand-listed copy: the form
+            # context is one thing the blueprint owns, and re-typing its keys per
+            # test is how the template's own vocabularies drifted (#1197 review).
+            **_form_render_context(),
         )
 
     def test_the_rendered_vocabularies_cover_the_whole_enum(self):
@@ -748,8 +758,6 @@ class TestAddGetRendersTheEmptyForm:
         hand-written list was missing ``rampid_derived`` and
         ``world_id_nullifier``, so the form rejected values the enum accepts.
         """
-        from src.admin.blueprints.tmp_providers import _form_render_context
-
         context = _form_render_context()
 
         assert set(context["valid_uid_types"]) == set(VALID_UID_TYPES)

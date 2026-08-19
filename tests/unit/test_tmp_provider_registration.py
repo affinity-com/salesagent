@@ -132,8 +132,16 @@ class TestEnumsTrackThePinnedSdk:
     def test_unknown_uid_type_is_rejected(self):
         message = _rejection_message(identity_match=True, countries=["US"], uid_types=["uid2", "not_a_uid_type"])
 
-        assert message.startswith("Invalid uid_type(s):")
-        assert "not_a_uid_type" in message
+        # The vocabulary is a FIELD TYPE now (enforced unconditionally, per the
+        # schema), so the message is pydantic's enum message prefixed with the
+        # field name — which is what tells the operator WHICH of three CSV inputs
+        # was wrong (#1197 review).
+        # The vocabulary is a FIELD TYPE now (enforced unconditionally, per the
+        # schema), so the message is pydantic's — prefixed with the field AND the
+        # failing index, and with the rejected value appended (#1197 review).
+        assert message.startswith("uid_types[1]: ")
+        assert "uid2" in message, "the message must enumerate the accepted vocabulary"
+        assert message.endswith("(got 'not_a_uid_type')")
 
     @pytest.mark.parametrize("status", [s.value for s in ProviderStatus])
     def test_every_sdk_status_is_accepted(self, status: str):
@@ -324,3 +332,45 @@ class TestValueConstraintsComeFromTheSchema:
             **{k: v for k, v in fields.items() if k not in ("name", "auth_type", "auth_credentials")},
         }
         validate_against_pinned_schema(PROVIDER_REGISTRATION_SCHEMA, entry)
+
+
+class TestRejectionMessagesNameTheOffendingInput:
+    """The operator-facing string for each field-level constraint, pinned exactly.
+
+    ``_first_error_message`` used to return pydantic's bare message, which for the
+    four field-level constraints says what was expected and not what was given —
+    so an operator who mistyped one of three comma-separated countries got
+    ``String should match pattern '^[A-Z]{2}$'`` and no way to tell which. These
+    assertions are what keep the field, the index and the rejected value in the
+    message (#1197 review).
+    """
+
+    def test_country_names_the_failing_index_and_value(self):
+        assert (
+            _rejection_message(identity_match=True, countries=["US", "usa"], uid_types=["uid2"])
+            == "countries[1]: String should match pattern '^[A-Z]{2}$' (got 'usa')"
+        )
+
+    def test_uid_type_names_the_failing_index_and_value(self):
+        message = _rejection_message(uid_types=["uid2", "nope"])
+        assert message.startswith("uid_types[1]: Input should be ")
+        assert message.endswith("(got 'nope')")
+
+    def test_property_rid_names_the_failing_index_and_value(self):
+        message = _rejection_message(properties=["not-a-uuid"])
+        assert message.startswith("properties[0]: ")
+        assert message.endswith("(got 'not-a-uuid')")
+
+    def test_numeric_bound_names_the_field_and_value(self):
+        assert _rejection_message(timeout_ms=1) == "timeout_ms: Input should be greater than or equal to 5 (got 1)"
+        assert _rejection_message(priority=-1) == "priority: Input should be greater than or equal to 0 (got -1)"
+
+    def test_auth_scheme_names_the_field_and_the_accepted_set(self):
+        assert _rejection_message(auth_type="api_key") == "auth_type: Invalid auth_type 'api_key'. Valid values: bearer"
+
+    def test_model_level_invariant_keeps_its_own_sentence(self):
+        """A hand-written invariant names its own subject, so it is NOT field-prefixed."""
+        assert (
+            _rejection_message(context_match=False, identity_match=False)
+            == "Provider must support at least one of context_match or identity_match"
+        )

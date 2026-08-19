@@ -167,17 +167,31 @@ Sales Agent Admin{% endblock %} {% block content %}
   const tenantId = '{{ tenant_id }}';
   const providerBase = `${scriptRoot}/tenant/${tenantId}/tmp-providers/`;
 
+  // Icons per health status. `success` is NOT the verdict — it means the request
+  // was served — so this branches on `status`, which is the only key that carries
+  // the provider's health. Reading `success` reported a never-probed provider as
+  // healthy.
+  const HEALTH_ICONS = {
+    healthy: "✅",
+    pending: "⏳",
+    unhealthy: "❌",
+    error: "❌",
+  };
+
   function healthCheck(providerId, providerName) {
     fetch(`${providerBase}${providerId}/health`, { method: "GET" })
       .then((r) => r.json())
       .then((data) => {
-        if (data.success) {
-          alert(`✅ ${providerName}: healthy`);
-        } else {
-          alert(
-            `❌ ${providerName}: ${data.error || data.status || "unhealthy"}`,
-          );
+        if (!data.success) {
+          alert(`❌ ${providerName}: ${data.error || "health check failed"}`);
+          return;
         }
+        const status = data.status || "error";
+        const icon = HEALTH_ICONS[status] || "❌";
+        const checked = data.last_checked
+          ? ` (last checked ${data.last_checked})`
+          : " (never checked)";
+        alert(`${icon} ${providerName}: ${status}${checked}`);
       })
       .catch((err) => alert(`❌ ${providerName}: ${err}`));
   }

@@ -38,6 +38,7 @@ from src.core.database.repositories.uow import TenantConfigUoW
 from src.core.helpers import enum_value
 from src.core.helpers.activity_helpers import log_tool_activity
 from src.core.helpers.adapter_helpers import get_adapter
+from src.core.logging_config import log_safe
 from src.core.resolved_identity import ResolvedIdentity
 from src.core.tool_context import ToolContext
 from src.core.tools._mcp import mcp_result
@@ -88,26 +89,41 @@ def _experimental_features(tenant_id: str) -> list[str] | None:
     """The experimental surfaces this tenant actually has wired, or ``None``.
 
     Derived from the state that makes the surface real rather than from a
-    constant: a tenant with no TMP provider registered has nothing to sync, and a
+    constant: a tenant with no syncable TMP provider has nothing to sync, and a
     tenant with one has the seller-side Package Sync surface live on all four
-    transports. Read through the same ``TMPProviderUoW`` the discovery route
-    uses, so "advertised" and "implemented" cannot drift apart by memory.
+    transports.
+
+    The question is asked through ``TMPProviderRepository.has_syncable()`` — the
+    same ``_SYNCABLE_STATUSES`` the two advertised surfaces filter on. Answering
+    it with ``list_all()`` made a tenant whose only registration is ``inactive``
+    advertise ``trusted_match.core`` while discovery returned ``[]`` and the sync
+    no-oped (#1197 review).
 
     Returns ``None`` (the field omitted) rather than ``[]`` when there is nothing
     to declare — the schema types this as an array and an empty one carries no
     more information than absence.
+
+    Note what omission means: AdCP 3.1.1
+    ``reference/experimental-status.mdx`` — "Sellers that do not list an
+    experimental surface MUST NOT implement it — there is no 'silently
+    experimental' mode". Omitting the field is therefore a positive claim, not a
+    safe default, and ``fire_tmp_sync`` keeps POSTing to this tenant's providers
+    either way. So only a *storage* failure is swallowed here; a programming
+    error must surface rather than silently un-declare a live surface.
     """
+    from sqlalchemy.exc import SQLAlchemyError
+
     from src.core.database.repositories.uow import TMPProviderUoW
 
     try:
         with TMPProviderUoW(tenant_id) as uow:
-            assert uow.tmp_providers is not None
-            has_providers = bool(uow.tmp_providers.list_all())
-    except Exception as e:
-        # Capability discovery must answer even if this read fails; under-claiming
-        # is the conservative direction (a buyer that does not see the surface
-        # simply does not use it), and the failure is logged rather than silent.
-        logger.warning("Could not determine experimental features for tenant %s: %s", tenant_id, e)
+            has_providers = uow.tmp_providers.has_syncable()
+    except SQLAlchemyError as e:
+        logger.warning(
+            "[TMP capabilities] Could not determine experimental features for tenant %s: %s",
+            log_safe(tenant_id),
+            e,
+        )
         return None
 
     return [TRUSTED_MATCH_FEATURE_ID] if has_providers else None

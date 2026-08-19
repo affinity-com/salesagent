@@ -16,16 +16,19 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
+from adcp.types import AvailablePackage, SellerAgentReference
 from sqlalchemy.orm.exc import DetachedInstanceError
 
 from src.services.tmp_provider_sync import (
+    AVAILABLE_PACKAGE_SCHEMA,
     _build_package_payload,
     _post_packages_sync,
     _resolve_seller_agent_url,
     sync_packages_for_media_buy,
 )
+from tests.helpers.pinned_schema import validate_against_pinned_schema
 from tests.helpers.tmp_provider_http import make_mock_http_client
-from tests.unit._tmp_helpers import _make_sync_uow, _make_tenant_config_uow
+from tests.unit._tmp_helpers import _make_mock_package, _make_sync_uow, _make_tenant_config_uow
 
 # The only shape ``_resolve_seller_agent_url`` can return besides ``None``: it
 # rejects a non-https override and builds the virtual_host branch as
@@ -40,74 +43,101 @@ _SELLER_AGENT_URL = "https://agent.example.com/mcp"
 # ---------------------------------------------------------------------------
 
 
-class TestBuildPackagePayload:
-    """_build_package_payload emits a spec-compliant AvailablePackage payload.
+def _package_wire(package_id: str = "pkg-1") -> dict:
+    """The JSON body ``_post_packages_sync`` must produce for :func:`_a_package`."""
+    return _a_package(package_id).model_dump(mode="json", exclude_none=True)
 
-    Authority: adcp/_schemas/3.1/trusted-match/available-package.json (AdCP 3.1.1).
-    The schema has ``additionalProperties: false`` and requires exactly:
-    ``package_id``, ``media_buy_id``, ``seller_agent``.
-    Optional allowed fields: ``format_ids``, ``catalogs``.
+
+def _a_package(package_id: str = "pkg-1") -> AvailablePackage:
+    """A minimal valid ``AvailablePackage``, as the fan-out hands to the poster.
+
+    ``_post_packages_sync`` takes models now, not dicts — the single
+    ``model_dump`` happens inside it, at the transport edge (#1197 review).
+    """
+    return AvailablePackage(
+        package_id=package_id,
+        media_buy_id="mb-1",
+        seller_agent=SellerAgentReference(agent_url=_SELLER_AGENT_URL),
+    )
+
+
+class TestBuildPackagePayload:
+    """``_build_package_payload`` produces a schema-valid ``AvailablePackage``.
+
+    Graded against the pinned file the module itself declares
+    (:data:`src.services.tmp_provider_sync.AVAILABLE_PACKAGE_SCHEMA`) plus the SDK
+    codegen, not against a hand-written ``allowed_keys`` set. A restated key set
+    could not see a ``seller_agent`` that lost ``agent_url``, a wrong-typed
+    ``package_id``, or a non-https ``agent_url`` — the one value constraint this
+    module spends a docstring, an error branch and a skip path on. It also failed
+    in the wrong direction: a spec bump adding an optional member that production
+    correctly emits broke the exact-set assertion for a payload the schema accepts
+    (#1197 review).
     """
 
-    def test_emits_required_fields(self):
-        """Payload contains the three required fields: package_id, media_buy_id, seller_agent."""
-        pkg = MagicMock()
-        pkg.package_id = "pkg-001"
-        pkg.package_config = {}
+    @staticmethod
+    def _wire(package: AvailablePackage) -> dict:
+        """The package as ``_post_packages_sync`` serializes it."""
+        return package.model_dump(mode="json", exclude_none=True)
 
-        result = _build_package_payload("mb-100", pkg, "https://agent.example.com/mcp")
+    def _built(self, package_id: str, media_buy_id: str, agent_url: str = _SELLER_AGENT_URL) -> dict:
+        pkg = _make_mock_package(package_id=package_id)
+        built = _build_package_payload(media_buy_id, pkg, agent_url)
+        # The builder returns the MODEL — that is what travels through the
+        # fan-out, so `Any` never leaves this module (#1197 review).
+        assert isinstance(built, AvailablePackage)
+        wire = self._wire(built)
+        validate_against_pinned_schema(AVAILABLE_PACKAGE_SCHEMA, wire)
+        AvailablePackage.model_validate(wire)
+        return wire
 
-        assert result["package_id"] == "pkg-001"
-        assert result["media_buy_id"] == "mb-100"
-        assert result["seller_agent"] == {"agent_url": "https://agent.example.com/mcp"}
+    def test_carries_the_identity_of_the_package_and_its_media_buy(self):
+        """The two values only this function can get wrong."""
+        wire = self._built("pkg-001", "mb-100")
 
-    def test_seller_agent_is_structured_object(self):
-        """seller_agent is a dict with agent_url, not a flat string.
+        assert wire["package_id"] == "pkg-001"
+        assert wire["media_buy_id"] == "mb-100"
 
-        Per adcp/_schemas/3.1/core/seller-agent-ref.json, seller_agent MUST be
-        an object with agent_url — not the legacy flat si_agent_endpoint string.
+    def test_seller_agent_is_the_structured_reference(self):
+        """``seller_agent`` is ``{"agent_url": ...}``, not a flat string.
+
+        Per ``adcp/_schemas/3.1/core/seller-agent-ref.json`` — the legacy flat
+        ``si_agent_endpoint`` string is not this shape.
         """
-        pkg = MagicMock()
-        pkg.package_id = "pkg-002"
-        pkg.package_config = {}
+        wire = self._built("pkg-002", "mb-200")
 
-        result = _build_package_payload("mb-200", pkg, "https://agent.example.com/mcp")
+        assert wire["seller_agent"] == {"agent_url": _SELLER_AGENT_URL}
 
-        assert isinstance(result["seller_agent"], dict)
-        assert "agent_url" in result["seller_agent"]
-        assert result["seller_agent"]["agent_url"] == "https://agent.example.com/mcp"
+    def test_a_non_https_seller_agent_url_cannot_be_built(self):
+        """The https rule is enforced by construction, which the key-set form could not see.
 
-    def test_no_additional_properties(self):
-        """Payload contains only schema-allowed keys (additionalProperties: false).
-
-        The schema allows: package_id, media_buy_id, seller_agent, format_ids, catalogs.
-        Keys like offering_id, brand, keywords, si_agent_endpoint etc. are forbidden.
+        ``seller-agent-ref.json`` requires https for ``agent_url``; callers resolve
+        one before calling this (``_resolve_seller_agent_url``) and skip the sync
+        when they cannot.
         """
-        pkg = MagicMock()
-        pkg.package_id = "pkg-003"
-        pkg.package_config = {
-            "product_id": "prod-42",
-            "brand": "Acme Corp",
-            "keywords": ["shoes"],
-        }
+        pkg = _make_mock_package(package_id="pkg-005")
+        with pytest.raises(ValueError, match="https"):
+            _build_package_payload("mb-500", pkg, "http://agent.example.com/mcp")
 
-        result = _build_package_payload("mb-300", pkg, "https://agent.example.com/mcp")
+    def test_package_config_contents_never_reach_the_wire(self):
+        """The schema is closed, so nothing from package_config may leak into the body."""
+        pkg = _make_mock_package(
+            package_id="pkg-003",
+            package_config={"product_id": "prod-42", "brand": "Acme Corp", "keywords": ["shoes"]},
+        )
+        wire = self._wire(_build_package_payload("mb-300", pkg, _SELLER_AGENT_URL))
 
-        allowed_keys = {"package_id", "media_buy_id", "seller_agent", "format_ids", "catalogs"}
-        extra_keys = set(result.keys()) - allowed_keys
-        assert not extra_keys, f"Payload contains schema-forbidden keys: {extra_keys}"
+        validate_against_pinned_schema(AVAILABLE_PACKAGE_SCHEMA, wire)
+        assert "brand" not in wire
+        assert "keywords" not in wire
 
     def test_handles_none_package_config(self):
-        """package_config=None doesn't crash."""
-        pkg = MagicMock()
-        pkg.package_id = "pkg-004"
-        pkg.package_config = None
+        """``package_config=None`` doesn't crash — the body never reads it."""
+        pkg = _make_mock_package(package_id="pkg-004", package_config=None)
+        wire = self._wire(_build_package_payload("mb-400", pkg, _SELLER_AGENT_URL))
 
-        result = _build_package_payload("mb-400", pkg, "https://agent.example.com/mcp")
-
-        assert result["package_id"] == "pkg-004"
-        assert result["media_buy_id"] == "mb-400"
-        assert result["seller_agent"] == {"agent_url": "https://agent.example.com/mcp"}
+        validate_against_pinned_schema(AVAILABLE_PACKAGE_SCHEMA, wire)
+        assert wire["package_id"] == "pkg-004"
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +301,11 @@ class TestProviderMaterializedBeforeSessionCloses:
             self._check()
             return self._auth_credentials
 
+        @property
+        def auth_type(self):
+            self._check()
+            return "bearer"
+
     @patch("src.services.tmp_provider_sync._post_packages_sync")
     @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
     def test_provider_attributes_read_before_uow_exits(self, mock_resolve, mock_post):
@@ -302,6 +337,7 @@ class TestProviderMaterializedBeforeSessionCloses:
             "http://provider-a:3000",
             mock.ANY,  # payload correctness pinned by TestBuildPackagePayload
             "secret",
+            mock.ANY,  # auth_type — its dispatch is pinned by TestProviderAuthHeaders
         )
 
 
@@ -721,13 +757,15 @@ class TestPostPackagesSyncAuth:
         with patch("src.services.tmp_provider_sync.httpx.Client", return_value=mock_client):
             _post_packages_sync(
                 "http://provider:3000",
-                [{"package_id": "pkg-1"}],
+                [_a_package()],
                 auth_credentials="secret-token",
             )
 
         mock_client.post.assert_called_once_with(
             "http://provider:3000/packages/sync",
-            json=[{"package_id": "pkg-1"}],
+            # The SERIALIZED body, not the model: _post_packages_sync owns the one
+            # model_dump in the path, so this asserts what goes on the wire.
+            json=[_package_wire()],
             headers={"Authorization": "Bearer secret-token"},
         )
 
@@ -738,13 +776,15 @@ class TestPostPackagesSyncAuth:
         with patch("src.services.tmp_provider_sync.httpx.Client", return_value=mock_client):
             _post_packages_sync(
                 "http://provider:3000",
-                [{"package_id": "pkg-1"}],
+                [_a_package()],
                 auth_credentials="",
             )
 
         mock_client.post.assert_called_once_with(
             "http://provider:3000/packages/sync",
-            json=[{"package_id": "pkg-1"}],
+            # The SERIALIZED body, not the model: _post_packages_sync owns the one
+            # model_dump in the path, so this asserts what goes on the wire.
+            json=[_package_wire()],
             headers={},
         )
 
@@ -753,7 +793,7 @@ class TestPostPackagesSyncAuth:
         mock_client, _ = self._make_mock_client(200)
 
         with patch("src.services.tmp_provider_sync.httpx.Client", return_value=mock_client) as mock_cls:
-            _post_packages_sync("http://provider:3000", [{"package_id": "pkg-1"}])
+            _post_packages_sync("http://provider:3000", [_a_package()])
 
         _, kwargs = mock_cls.call_args
         assert kwargs.get("follow_redirects") is False
@@ -768,7 +808,7 @@ class TestPostPackagesSyncAuth:
 
         with patch("src.services.tmp_provider_sync.httpx.Client", return_value=mock_client):
             with pytest.raises(httpx.HTTPStatusError):
-                _post_packages_sync("http://provider:3000", [{"package_id": "pkg-1"}])
+                _post_packages_sync("http://provider:3000", [_a_package()])
 
     def test_fan_out_uses_provider_auth_credentials(self):
         """sync_packages_for_media_buy passes provider.auth_credentials to _post_packages_sync."""
@@ -794,4 +834,5 @@ class TestPostPackagesSyncAuth:
             "http://provider:3000",
             mock.ANY,  # payload correctness pinned by TestBuildPackagePayload
             "provider-secret",
+            mock.ANY,  # auth_type — its dispatch is pinned by TestProviderAuthHeaders
         )

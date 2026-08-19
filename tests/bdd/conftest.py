@@ -69,6 +69,7 @@ pytest_plugins = [
     "tests.bdd.steps.domain.uc_get_products_inventory",
     "tests.bdd.steps.domain.uc_brand_shorthand",
     "tests.bdd.steps.domain.compat_normalization",
+    "tests.bdd.steps.domain.tmp_capability_declaration",
     "tests.bdd.steps.domain.tmp_package_sync",
 ]
 
@@ -3104,6 +3105,8 @@ def _detect_uc(request: pytest.FixtureRequest) -> str | None:
         return "COMPAT"
     if any(t.startswith("T-TMP-SYNC") for t in marker_names):
         return "TMP-SYNC"
+    if any(t.startswith("T-TMP-CAPS") for t in marker_names):
+        return "TMP-CAPS"
     return None
 
 
@@ -3310,6 +3313,22 @@ def _harness_env(request: pytest.FixtureRequest, ctx: dict) -> Generator[None, N
             ctx["principal"] = principal
             ctx["default_product"] = product
             ctx["default_pricing_option"] = pricing_option
+            yield
+
+    elif uc == "TMP-CAPS":
+        # Locally-added TMP capability-declaration feature
+        # (features/local-tmp-capability-declaration.feature).
+        # CapabilitiesEnv, not MediaBuyDualEnv: the obligation is what
+        # get_adcp_capabilities emits, and this env is the one that dispatches it
+        # on every transport (REST_ENDPOINT = /api/v1/capabilities). Registering
+        # the provider row is the Given's job, so nothing here presumes one.
+        from tests.harness.capabilities import CapabilitiesEnv
+
+        with _db_scope_for(request, e2e_config), CapabilitiesEnv(e2e_config=e2e_config) as env:
+            tenant, principal = env.setup_default_data()
+            ctx["env"] = env
+            ctx["tenant"] = tenant
+            ctx["principal"] = principal
             yield
 
     elif uc == "UC-003":

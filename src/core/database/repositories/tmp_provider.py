@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Unpack
 
-from sqlalchemy import select
+from sqlalchemy import literal, select
 from sqlalchemy.orm import Session
 
 from src.core.database.models import TMPProvider
@@ -71,6 +71,35 @@ class TMPProviderRepository:
                 )
                 .order_by(TMPProvider.priority.asc(), TMPProvider.name.asc())
             ).all()
+        )
+
+    def has_syncable(self) -> bool:
+        """Whether this tenant has at least one syncable provider.
+
+        The existence form of :meth:`list_syncable` — same ``_SYNCABLE_STATUSES``
+        constant, so "does this tenant run TMP?" has one authority. The
+        capability declaration asks exactly this question and must answer it the
+        way the two surfaces it advertises behave: discovery returns
+        ``_SYNCABLE_STATUSES`` and package sync fans out to
+        ``_SYNCABLE_STATUSES``, so a tenant whose only registration is
+        ``inactive`` runs neither and must not advertise the surface
+        (#1197 review).
+
+        Emits ``SELECT 1 ... LIMIT 1`` rather than materializing every row for a
+        boolean, matching the sibling predicate forms
+        (``AccountRepository.has_access``, ``WorkflowRepository.count_by_tenant``).
+        """
+        return (
+            self._session.scalars(
+                select(literal(1))
+                .select_from(TMPProvider)
+                .where(
+                    TMPProvider.tenant_id == self._tenant_id,
+                    TMPProvider.status.in_(_SYNCABLE_STATUSES),
+                )
+                .limit(1)
+            ).first()
+            is not None
         )
 
     def list_all(self) -> list[TMPProvider]:

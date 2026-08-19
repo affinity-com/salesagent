@@ -385,16 +385,32 @@ def _make_capabilities_identity(
 def _patch_capabilities_deps(
     adapter=None,
     db_partners=None,
+    tmp_has_syncable=False,
 ):
     """Return a context manager stack patching common capabilities dependencies.
 
     Args:
         adapter: Mock adapter to return from get_adapter (None = no adapter).
         db_partners: List of mock PublisherPartner objects from DB query.
+        tmp_has_syncable: What the TMP provider repository reports for this
+            tenant. Patched (rather than left to hit the DB) because
+            ``_experimental_features`` opens a real ``TMPProviderUoW``: these
+            tests are about channel mapping and response shape, and a unit test
+            must not reach for Postgres. It used to "work" only because a
+            blanket ``except Exception`` swallowed the unit-suite's
+            no-real-connections guard — narrowing that except to
+            ``SQLAlchemyError`` (#1197 review) made the reliance visible.
     """
     from contextlib import ExitStack
 
     stack = ExitStack()
+
+    # Mock TMPProviderUoW — the experimental-features read.
+    mock_tmp_uow = MagicMock()
+    mock_tmp_uow.__enter__ = MagicMock(return_value=mock_tmp_uow)
+    mock_tmp_uow.__exit__ = MagicMock(return_value=False)
+    mock_tmp_uow.tmp_providers.has_syncable.return_value = tmp_has_syncable
+    stack.enter_context(patch("src.core.database.repositories.uow.TMPProviderUoW", return_value=mock_tmp_uow))
 
     # Mock TenantConfigUoW — the repository pattern replacement for get_db_session
     mock_repo = MagicMock()
@@ -754,3 +770,89 @@ class TestGeoPostalAreas:
             response = _get_adcp_capabilities_impl(None, identity)
 
         assert response.media_buy.execution.targeting.geo_postal_areas is None
+
+
+class TestExperimentalFeaturesDeclaration:
+    """``_experimental_features`` — what the agent claims it implements.
+
+    AdCP 3.1.1 ``reference/experimental-status.mdx``: "Sellers that do not list
+    an experimental surface MUST NOT implement it — there is no 'silently
+    experimental' mode."  Omitting the field is therefore a positive claim, which
+    makes both branches below obligations rather than preferences (#1197 review).
+    """
+
+    @staticmethod
+    def _patch_uow(*, has_syncable=None, error=None):
+        """Patch TMPProviderUoW so the repository answers has_syncable()."""
+        mock_uow = MagicMock()
+        if error is not None:
+            mock_uow.tmp_providers.has_syncable.side_effect = error
+        else:
+            mock_uow.tmp_providers.has_syncable.return_value = has_syncable
+        mock_cls = MagicMock()
+        mock_cls.return_value.__enter__.return_value = mock_uow
+        mock_cls.return_value.__exit__.return_value = False
+        return patch("src.core.database.repositories.uow.TMPProviderUoW", mock_cls), mock_uow
+
+    def test_declares_the_feature_when_a_syncable_provider_exists(self):
+        from src.core.tools.capabilities import TRUSTED_MATCH_FEATURE_ID, _experimental_features
+
+        ctx, mock_uow = self._patch_uow(has_syncable=True)
+        with ctx:
+            assert _experimental_features("tenant_x") == [TRUSTED_MATCH_FEATURE_ID]
+        mock_uow.tmp_providers.has_syncable.assert_called_once_with()
+
+    def test_omits_the_field_when_no_syncable_provider_exists(self):
+        from src.core.tools.capabilities import _experimental_features
+
+        ctx, _ = self._patch_uow(has_syncable=False)
+        with ctx:
+            assert _experimental_features("tenant_x") is None
+
+    def test_asks_the_syncable_predicate_not_list_all(self):
+        """The declaration must filter on the statuses the surfaces it advertises use.
+
+        ``list_all()`` made a tenant whose only registration is ``inactive``
+        advertise ``trusted_match.core`` while discovery returned ``[]`` and the
+        sync no-oped — the declaration and the surfaces disagreeing about the
+        same tenant.
+        """
+        from src.core.tools.capabilities import _experimental_features
+
+        ctx, mock_uow = self._patch_uow(has_syncable=False)
+        with ctx:
+            _experimental_features("tenant_x")
+
+        mock_uow.tmp_providers.has_syncable.assert_called_once_with()
+        mock_uow.tmp_providers.list_all.assert_not_called()
+
+    def test_storage_failure_degrades_to_omission_with_a_tagged_log_line(self, caplog):
+        """A DB outage must not fail capability discovery, but must be greppable.
+
+        The log line carries the ``[TMP ...]`` prefix its five sibling modules
+        use — it is the one line an operator gets when the declaration degrades.
+        """
+        import logging
+
+        from sqlalchemy.exc import OperationalError
+
+        from src.core.tools.capabilities import _experimental_features
+
+        ctx, _ = self._patch_uow(error=OperationalError("SELECT 1", {}, Exception("down")))
+        with ctx, caplog.at_level(logging.WARNING):
+            assert _experimental_features("tenant_x") is None
+
+        assert "[TMP capabilities]" in caplog.text
+
+    def test_programming_error_is_not_swallowed(self):
+        """A non-storage error must surface rather than silently un-declare a live surface.
+
+        The blanket ``except Exception`` turned a typo into a false "this seller
+        does not implement trusted_match" while ``fire_tmp_sync`` kept POSTing to
+        that tenant's providers.
+        """
+        from src.core.tools.capabilities import _experimental_features
+
+        ctx, _ = self._patch_uow(error=AttributeError("has_syncabel"))
+        with ctx, pytest.raises(AttributeError):
+            _experimental_features("tenant_x")

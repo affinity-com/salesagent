@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from datetime import datetime
+from typing import TypedDict
 
 from flask import Blueprint, flash, jsonify, redirect, render_template, request, url_for
 
@@ -34,15 +36,88 @@ from src.core.schemas.tmp_provider import (
     VALID_STATUSES,
     VALID_UID_TYPES,
     TMPProviderFields,
-    TMPProviderFormDict,
     TMPProviderRegistration,
     TMPProviderValidationError,
 )
+from src.services._provider_http import PROVIDER_AUTH_SCHEMES
 
 logger = logging.getLogger(__name__)
 
 # Create Blueprint
 tmp_providers_bp = Blueprint("tmp_providers", __name__)
+
+
+# ---------------------------------------------------------------------------
+# View shapes — what the Jinja templates read.
+#
+# These live in the admin layer, not in src/core/schemas: neither has an AdCP
+# counterpart (``name`` is not in the closed provider-registration schema, and
+# CSV strings are an HTML-form artifact), so the protocol-schema package is the
+# wrong owner. The machine wire is the pinned SDK type
+# ``TMPProviderDiscoveryEntry`` (#1197 review).
+# ---------------------------------------------------------------------------
+
+
+class _TMPProviderAdminScalars(TypedDict):
+    """The scalar half shared by the two admin-side views (see below).
+
+    Split out only so the two views can type ``countries``/``uid_types``/
+    ``properties`` differently without restating the nine keys they agree on —
+    a TypedDict subclass may add keys but not retype inherited ones.
+    """
+
+    provider_id: str
+    name: str
+    endpoint: str
+    context_match: bool
+    identity_match: bool
+    timeout_ms: int
+    priority: int
+    status: str
+
+
+class TMPProviderAdminDict(_TMPProviderAdminScalars, total=False):
+    """What :meth:`TMPProvider.to_admin_dict` returns — the admin list view's row.
+
+    Typed rather than a bare ``dict`` because its consumer
+    (``templates/tmp_providers.html``) breaks on a renamed key. It lives HERE,
+    with the layer that consumes it, rather than in the protocol-schema package:
+    it is a Jinja view shape with no counterpart in the AdCP schema, and the
+    machine wire is the SDK type ``TMPProviderDiscoveryEntry`` (#1197 review).
+
+    ``created_at`` is declared here because the list handler adds it to the
+    returned mapping: a key a caller writes is part of this shape whether or not
+    the serializer emits it, and declaring it is what makes that write a checked
+    one.  ``total=False`` covers exactly that — the serializer always emits the
+    other keys.
+
+    The three conditional arrays are ``list[str] | None`` (never omitted):
+    unlike the discovery wire, which omits them, the list view distinguishes
+    "no restriction" from "not shown", and the edit template renders all three
+    unconditionally.
+    """
+
+    countries: list[str] | None
+    uid_types: list[str] | None
+    properties: list[str] | None
+    created_at: datetime
+
+
+class TMPProviderFormDict(_TMPProviderAdminScalars, total=False):
+    """The edit form's view of a provider — ``templates/tmp_provider_form.html``.
+
+    Diverges from :class:`TMPProviderAdminDict` in exactly the ways an HTML form
+    does: the three arrays are the comma-separated strings a text input round-trips,
+    and the two auth keys the handler adds are present (``auth_credentials`` being
+    a mask, never the credential).  Form shape belongs to the blueprint, so the
+    conversion lives there (``_form_view``) rather than on the model.
+    """
+
+    countries: str
+    uid_types: str
+    properties: str
+    auth_type: str | None
+    auth_credentials: str
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +307,7 @@ def _validated_registration_or_redirect(
         return on_error_redirect
 
 
-def _form_render_context() -> dict[str, list[str]]:
+def _form_render_context() -> dict[str, object]:
     """The enum vocabularies the provider form renders.
 
     Passed to the template rather than retyped in it: ``VALID_UID_TYPES`` /
@@ -242,7 +317,33 @@ def _form_render_context() -> dict[str, list[str]]:
     told an operator a value was invalid that the enum accepts and the form never
     offered (#1197 review).
     """
-    return {"valid_uid_types": sorted(VALID_UID_TYPES), "valid_statuses": sorted(VALID_STATUSES)}
+    return {
+        "valid_uid_types": sorted(VALID_UID_TYPES),
+        "valid_statuses": sorted(VALID_STATUSES),
+        "valid_auth_schemes": sorted(PROVIDER_AUTH_SCHEMES),
+        "field_bounds": _numeric_field_bounds(),
+    }
+
+
+def _numeric_field_bounds() -> dict[str, dict[str, int | None]]:
+    """The numeric input bounds, read off the record rather than typed into the form.
+
+    ``min``/``max`` in the template were hand-written and had drifted: ``min="10"``
+    against a record (and pinned schema) minimum of 5, so the browser refused a
+    legal 5-9 ms registration before it could be submitted (#1197 review). Reading
+    the constraint metadata means the form cannot disagree with the validator.
+    """
+    bounds: dict[str, dict[str, int | None]] = {}
+    for name in ("timeout_ms", "priority"):
+        field = TMPProviderRegistration.model_fields[name]
+        limits: dict[str, int | None] = {"min": None, "max": None, "default": field.default}
+        for meta in field.metadata:
+            if (value := getattr(meta, "ge", None)) is not None:
+                limits["min"] = value
+            if (value := getattr(meta, "le", None)) is not None:
+                limits["max"] = value
+        bounds[name] = limits
+    return bounds
 
 
 def _form_view(provider: TMPProvider) -> TMPProviderFormDict:
@@ -284,8 +385,6 @@ def list_tmp_providers(tenant_id):
     """List all TMP providers for a tenant."""
     try:
         with TMPProviderUoW(tenant_id) as uow:
-            assert uow.tenant_config is not None
-            assert uow.tmp_providers is not None
             tenant = uow.tenant_config.get_tenant()
             if not tenant:
                 return _tenant_not_found_redirect()
@@ -326,7 +425,6 @@ def add_tmp_provider(tenant_id):
     """Add a new TMP provider."""
     if request.method == "GET":
         with TMPProviderUoW(tenant_id) as uow:
-            assert uow.tenant_config is not None
             tenant = uow.tenant_config.get_tenant()
             if not tenant:
                 return _tenant_not_found_redirect()
@@ -343,8 +441,6 @@ def add_tmp_provider(tenant_id):
     # POST — create new TMP provider
     try:
         with TMPProviderUoW(tenant_id) as uow:
-            assert uow.tenant_config is not None
-            assert uow.tmp_providers is not None
             tenant = uow.tenant_config.get_tenant()
             if not tenant:
                 return _tenant_not_found_redirect()
@@ -378,8 +474,6 @@ def edit_tmp_provider(tenant_id, provider_id):
     """Edit an existing TMP provider."""
     if request.method == "GET":
         with TMPProviderUoW(tenant_id) as uow:
-            assert uow.tenant_config is not None
-            assert uow.tmp_providers is not None
             tenant = uow.tenant_config.get_tenant()
             if not tenant:
                 return _tenant_not_found_redirect()
@@ -400,7 +494,6 @@ def edit_tmp_provider(tenant_id, provider_id):
     # POST — update TMP provider
     try:
         with TMPProviderUoW(tenant_id) as uow:
-            assert uow.tmp_providers is not None
             provider = uow.tmp_providers.get_by_id(provider_id)
             if not provider:
                 return _provider_not_found_redirect(tenant_id)
@@ -439,7 +532,6 @@ def deactivate_tmp_provider(tenant_id, provider_id):
     """Soft-deactivate a TMP provider (set status='inactive')."""
     try:
         with TMPProviderUoW(tenant_id) as uow:
-            assert uow.tmp_providers is not None
             provider = uow.tmp_providers.deactivate(provider_id)
             if not provider:
                 return _provider_not_found_json()
@@ -457,7 +549,6 @@ def delete_tmp_provider(tenant_id, provider_id):
     """Hard-delete a TMP provider."""
     try:
         with TMPProviderUoW(tenant_id) as uow:
-            assert uow.tmp_providers is not None
             # Get name before deleting for the response message
             provider = uow.tmp_providers.get_by_id(provider_id)
             if not provider:
@@ -482,28 +573,30 @@ def health_check_tmp_provider(tenant_id, provider_id):
     every 60 s and writes the result to ``health_status`` /
     ``last_health_checked_at``.  This route reads from the DB — no live
     HTTP call, no worker starvation risk.
+
+    Response shape (one meaning per key, always the same key set):
+      ``success``     — the request was served (never the health verdict)
+      ``status``      — ``pending`` | ``healthy`` | ``unhealthy`` | ``error``
+      ``provider``    — the provider's admin-facing name
+      ``last_checked`` — ISO timestamp, or ``null`` when never probed
     """
     try:
         with TMPProviderUoW(tenant_id) as uow:
-            assert uow.tmp_providers is not None
             provider = uow.tmp_providers.get_by_id(provider_id)
             if not provider:
                 return _provider_not_found_json()
 
-            if provider.health_status is None:
-                return jsonify(
-                    {
-                        "success": True,
-                        "status": "pending",
-                        "provider": provider.name,
-                        "message": "Health check has not run yet",
-                    }
-                )
-
+            # ONE shape, one meaning per key. ``success`` means "request served"
+            # — the same thing it means on the deactivate and delete siblings —
+            # and the health verdict is carried by ``status`` alone. Previously
+            # ``success`` meant "request served" in the never-probed branch and
+            # "provider is healthy" in the other, while the JS read it as the
+            # latter, so a provider that had never been probed was reported to the
+            # operator as healthy (#1197 review).
             return jsonify(
                 {
-                    "success": provider.health_status == "healthy",
-                    "status": provider.health_status,
+                    "success": True,
+                    "status": provider.health_status or "pending",
                     "provider": provider.name,
                     "last_checked": (
                         provider.last_health_checked_at.isoformat() if provider.last_health_checked_at else None

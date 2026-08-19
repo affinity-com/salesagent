@@ -41,10 +41,10 @@ class _RecordingScheduler(IntervalScheduler):
 
 
 class TestMakeSingleton:
-    """make_singleton(cls) returns a (get, start, stop) trio over one cached instance."""
+    """make_singleton(cls, name="test scheduler") returns a (get, start, stop) trio over one cached instance."""
 
     def test_get_returns_same_instance_on_repeated_calls(self):
-        get_scheduler, _, _ = make_singleton(_RecordingScheduler)
+        get_scheduler, _, _ = make_singleton(_RecordingScheduler, name="test scheduler")
 
         first = get_scheduler()
         second = get_scheduler()
@@ -59,14 +59,14 @@ class TestMakeSingleton:
         by nothing) would make two scheduler modules share one instance, so
         stopping one would stop the other.
         """
-        get_a, _, _ = make_singleton(_RecordingScheduler)
-        get_b, _, _ = make_singleton(_RecordingScheduler)
+        get_a, _, _ = make_singleton(_RecordingScheduler, name="test scheduler")
+        get_b, _, _ = make_singleton(_RecordingScheduler, name="test scheduler")
 
         assert get_a() is not get_b()
 
     @pytest.mark.asyncio
     async def test_start_and_stop_delegate_to_the_cached_instance(self):
-        get_scheduler, start_scheduler, stop_scheduler = make_singleton(_RecordingScheduler)
+        get_scheduler, start_scheduler, stop_scheduler = make_singleton(_RecordingScheduler, name="test scheduler")
 
         await start_scheduler()
         await stop_scheduler()
@@ -77,7 +77,7 @@ class TestMakeSingleton:
     @pytest.mark.asyncio
     async def test_start_creates_the_instance_when_get_was_never_called(self):
         """The instance is built lazily on first use, whichever function is called first."""
-        get_scheduler, start_scheduler, _ = make_singleton(_RecordingScheduler)
+        get_scheduler, start_scheduler, _ = make_singleton(_RecordingScheduler, name="test scheduler")
 
         await start_scheduler()
 

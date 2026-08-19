@@ -42,12 +42,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from starlette.testclient import TestClient
 
-from src.core.tools.capabilities import TRUSTED_MATCH_FEATURE_ID
 from src.routes.tmp_providers import PROVIDER_REGISTRATION_SCHEMA
 from tests.factories import MediaBuyFactory, MediaPackageFactory, PrincipalFactory, TenantFactory, TMPProviderFactory
 from tests.harness._base import IntegrationEnv
-from tests.harness.capabilities import CapabilitiesEnv
-from tests.harness.transport import Transport
 from tests.helpers.envelope_assertions import assert_envelope_shape
 from tests.helpers.pinned_schema import validate_against_pinned_schema
 
@@ -391,63 +388,14 @@ class TestHealthSchedulerTickPersistsStatus:
 # ---------------------------------------------------------------------------
 # 4. The agent declares the experimental surface it implements
 # ---------------------------------------------------------------------------
-
-
-def _wire_experimental_features(result: object) -> list[str]:
-    """The ``experimental_features`` array as it appears on the wire.
-
-    Read from ``result.wire_response`` (the real serialized body on all three
-    transports) rather than from the typed payload: the payload's items are
-    ``ExperimentalFeature`` RootModels whose values are already coerced, so a
-    serialization-side drop would be invisible there (tests/CLAUDE.md § wire_response).
-    """
-    wire = result.wire_response  # type: ignore[attr-defined]
-    assert wire is not None, "capabilities dispatch produced no wire body"
-    return list(wire.get("experimental_features") or [])
-
-
-class TestExperimentalFeatureDeclaration:
-    """A tenant with a TMP provider declares ``trusted_match.core`` on the wire.
-
-    AdCP 3.1.1, ``docs/reference/experimental-status`` (restated in the pinned
-    ``get-adcp-capabilities-response.json``): a seller implementing any
-    experimental surface MUST list its feature id in ``experimental_features``,
-    and a seller that does not list one is asserting it does not implement it.
-    Seller-side Package Sync is a ``trusted_match.core`` surface that this PR
-    wires on all four transports, so the diff creates the obligation (#1197
-    review).
-
-    Graded on the real serialized response through the capabilities harness, on
-    every wire transport — not on a ``model_dump()`` of the typed model, which
-    cannot catch a serialization-side drop.
-    """
-
-    @pytest.mark.parametrize("transport", [Transport.MCP, Transport.A2A, Transport.REST], ids=lambda t: t.value)
-    def test_declared_when_the_tenant_has_a_provider(self, integration_db, transport):
-        with CapabilitiesEnv(tenant_id="tmp_caps_with", principal_id="caps_principal") as env:
-            tenant = TenantFactory(tenant_id="tmp_caps_with")
-            PrincipalFactory(tenant=tenant, principal_id="caps_principal")
-            TMPProviderFactory(tenant=tenant, name="Declared Provider", status="active")
-            env._commit_factory_data()
-
-            result = env.call_via(transport)
-
-        assert result.is_success, result.error
-        assert TRUSTED_MATCH_FEATURE_ID in _wire_experimental_features(result)
-
-    @pytest.mark.parametrize("transport", [Transport.MCP, Transport.A2A, Transport.REST], ids=lambda t: t.value)
-    def test_not_declared_when_the_tenant_has_no_provider(self, integration_db, transport):
-        """The falsifiable half: a hardcoded constant would fail here.
-
-        Without it, "declare trusted_match.core" could be satisfied by a literal
-        that no longer tracks whether the surface is actually wired.
-        """
-        with CapabilitiesEnv(tenant_id="tmp_caps_without", principal_id="caps_principal") as env:
-            tenant = TenantFactory(tenant_id="tmp_caps_without")
-            PrincipalFactory(tenant=tenant, principal_id="caps_principal")
-            env._commit_factory_data()
-
-            result = env.call_via(transport)
-
-        assert result.is_success, result.error
-        assert TRUSTED_MATCH_FEATURE_ID not in _wire_experimental_features(result)
+#
+# Moved to a BDD scenario: tests/bdd/features/local-tmp-capability-declaration.feature,
+# bound by tests/bdd/test_tmp_capability_declaration.py.
+#
+# What lived here was a @parametrize("transport", [MCP, A2A, REST]) with its own
+# envelope extraction (`wire.get("experimental_features")`). That hand-written
+# transport list could not include e2e_rest — the fan-out invariant names that
+# shape specifically — and it restated an extraction the wire helpers own. The
+# scenario grades the same obligation plus the two the parametrize could not
+# express (draining counts, inactive-only does not), on every transport the
+# harness fans out to (#1197 review).

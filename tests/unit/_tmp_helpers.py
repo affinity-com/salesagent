@@ -33,6 +33,9 @@ Usage::
     with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
         ...
 
+    # Sync service payload tests:
+    pkg = _make_mock_package(package_id="pkg-001")
+
     # Sync service tests (MediaBuyUoW + TMPProviderUoW pair):
     mock_mb_cls, mock_mb_uow, mock_tp_cls, mock_tp_uow = _make_sync_uow(
         packages=[pkg], providers=[provider]
@@ -124,6 +127,21 @@ def _make_mock_provider(**overrides) -> MagicMock:
     return provider
 
 
+def _make_mock_package(package_id: str = "pkg-001", package_config: dict | None = None) -> MagicMock:
+    """Return a mock ``MediaPackage`` row for the sync payload builders.
+
+    The one package factory for the TMP suites. ``test_tmp_provider_sync.py`` had
+    ~12 inline three-line builders of exactly this shape with no shared factory
+    (#1197 review); the builder under test reads only ``package_id``, so that is
+    what this pins, with ``package_config`` settable for the tests that assert it
+    never reaches the wire.
+    """
+    pkg = MagicMock()
+    pkg.package_id = package_id
+    pkg.package_config = {} if package_config is None else package_config
+    return pkg
+
+
 def _make_tmp_repo_uow(mock_repo: MagicMock) -> MagicMock:
     """Return a mock ``TMPProviderUoW`` class exposing ``tmp_providers=mock_repo``.
 
@@ -171,7 +189,7 @@ def _make_provider(
     name: str = "Provider A",
     endpoint: str = "http://si-agent.localhost:3003",
     context_match: bool = True,
-    identity_match: bool = True,
+    identity_match: bool = False,
     countries: list[str] | None = None,
     uid_types: list[str] | None = None,
     properties: list[str] | None = None,
@@ -189,6 +207,12 @@ def _make_provider(
     ``provider_id`` defaults to a hyphen-free value because that is what the
     pinned schema's ``^[A-Za-z0-9_]+$`` allows — a hyphenated default would make
     every entry these tests serialize schema-invalid.
+
+    ``identity_match`` defaults to ``False`` (a context-only provider) for the
+    same reason: the schema's ``if/then`` requires ``countries`` + ``uid_types``
+    whenever ``identity_match`` is true, so the old ``True``-with-no-countries
+    default was a row the discovery contract cannot represent at all
+    (#1197 review).
     """
     p = TMPProvider()
     p.provider_id = provider_id

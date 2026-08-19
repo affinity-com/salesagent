@@ -3,6 +3,7 @@
 import logging
 from datetime import datetime
 from decimal import Decimal
+from typing import Any
 from uuid import uuid4
 
 from adcp.types import BrandReference
@@ -34,7 +35,6 @@ from sqlalchemy.sql import func
 from src.core.database.json_type import JSONType
 from src.core.exceptions import AdCPConfigurationError
 from src.core.json_validators import JSONValidatorMixin
-from src.core.schemas.tmp_provider import TMPProviderAdminDict, TMPProviderDiscoveryDict
 
 logger = logging.getLogger(__name__)
 
@@ -1511,62 +1511,7 @@ class TMPProvider(Base):
         """
         return self._auth_credentials is not None
 
-    def to_discovery_dict(self) -> TMPProviderDiscoveryDict:
-        """Serialize for the machine wire: ``GET /tenant/{id}/tmp-providers/discovery``.
-
-        Conforms to :data:`src.routes.tmp_providers.PROVIDER_REGISTRATION_SCHEMA`,
-        a closed object (``additionalProperties: false``).  Two consequences that
-        this method — unlike the admin serialization — must respect:
-
-          1. ``name`` is not in the schema, so it is not emitted here.  It stays
-             on :meth:`to_admin_dict` for the Jinja views.  (The TMP Router
-             reads ``name`` only as a fallback identifier when ``provider_id``
-             is empty; this endpoint always emits ``provider_id``, the UUID
-             primary key.)
-          2. ``countries`` / ``uid_types`` / ``properties`` are typed ``array``
-             with ``minItems: 1``, so an absent value is **omitted**, never sent
-             as ``null`` — ``null`` is a type violation, not an unknown key, and
-             for ``identity_match: true`` rows the schema's if/then branch
-             additionally requires ``countries`` and ``uid_types`` non-empty.
-             Consumers read an omitted field as "no restriction" (the router
-             decodes a missing key to a nil slice, exactly as it did the
-             previous ``null``).
-
-        Both divergences were previously emitted and documented as tolerated;
-        a closed object grants no tolerant-reader allowance, so they are now
-        fixed rather than described (#1197 review).
-
-        One residue is a *data* state, not a serialization choice: a legacy
-        ``identity_match: true`` row with no countries/uid_types cannot satisfy
-        the schema's if/then no matter how it is serialized. Every row written
-        through ``TMPProviderRegistration`` is rejected in that state, so this
-        can only arise from rows predating the validator.
-
-        Not carried: ``tmpx_macros``, the schema's remaining optional property
-        (added by 3.1.1). It declares the provider-namespaced ad-server macro
-        names a provider's TMPX response fills. Optional, so omitting it is
-        conformant, and there is no column, admin field, or router consumer for
-        it yet — registering TMPX macros is its own feature.
-        """
-        result = TMPProviderDiscoveryDict(
-            provider_id=self.provider_id,
-            endpoint=self.endpoint,
-            context_match=self.context_match,
-            identity_match=self.identity_match,
-            timeout_ms=self.timeout_ms,
-            priority=self.priority,
-            status=self.status,
-        )
-        # Omit rather than null: see (2) above.
-        if self.countries:
-            result["countries"] = self.countries
-        if self.uid_types:
-            result["uid_types"] = self.uid_types
-        if self.properties:
-            result["properties"] = self.properties
-        return result
-
-    def to_admin_dict(self) -> TMPProviderAdminDict:
+    def to_admin_dict(self) -> dict[str, Any]:
         """Serialize for the admin UI (list + edit views).
 
         Not the machine wire — see :meth:`to_discovery_dict` for that.  This
@@ -1578,24 +1523,30 @@ class TMPProvider(Base):
 
         Auth fields are deliberately absent — the edit handler adds
         ``auth_type`` plus a masked ``auth_credentials`` placeholder itself, so
-        a credential is never serialized here by accident.  Its return type is
-        :class:`TMPProviderAdminDict` rather than a bare ``dict`` so the keys the
-        two handlers add (``created_at``; the form view's CSV strings) are
-        checked additions rather than free-form ones (#1197 review).
+        a credential is never serialized here by accident.
+
+        The machine wire is NOT built here: the discovery entry is the pinned
+        SDK type, constructed by
+        ``TMPProviderDiscoveryEntry.from_row`` in the schema layer. This module
+        deliberately imports nothing from ``src.core.schemas`` — persistence must
+        not depend on the protocol-schema package, or a future
+        ``schemas → models`` import becomes a circular-import failure rather than
+        a design question (#1197 review). The typed admin/form view shapes live
+        with the admin layer that consumes them.
         """
-        return TMPProviderAdminDict(
-            provider_id=self.provider_id,
-            name=self.name,
-            endpoint=self.endpoint,
-            context_match=self.context_match,
-            identity_match=self.identity_match,
-            timeout_ms=self.timeout_ms,
-            priority=self.priority,
-            status=self.status,
-            countries=self.countries,
-            uid_types=self.uid_types,
-            properties=self.properties,
-        )
+        return {
+            "provider_id": self.provider_id,
+            "name": self.name,
+            "endpoint": self.endpoint,
+            "context_match": self.context_match,
+            "identity_match": self.identity_match,
+            "timeout_ms": self.timeout_ms,
+            "priority": self.priority,
+            "status": self.status,
+            "countries": self.countries,
+            "uid_types": self.uid_types,
+            "properties": self.properties,
+        }
 
 
 class GAMInventory(Base):

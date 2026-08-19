@@ -1625,6 +1625,7 @@ async def _validate_and_convert_format_ids(
 
 from src.services.setup_checklist_service import SetupIncompleteError, validate_setup_complete
 from src.services.slack_notifier import get_slack_notifier
+from src.services.tmp_provider_sync import fires_tmp_sync
 
 # Scope component of the idempotency cache key (see IdempotencyAttempt.tool_name).
 _IDEMPOTENCY_TOOL_NAME = "create_media_buy"
@@ -2004,6 +2005,7 @@ def _resolve_idempotency_race_or_raise(
     )
 
 
+@fires_tmp_sync
 async def _create_media_buy_impl(
     req: CreateMediaBuyRequest,
     push_notification_config: dict[str, Any] | None = None,
@@ -4491,9 +4493,6 @@ async def create_media_buy(
         raw_wire_payload=raw_wire_payload,
     )
 
-    from src.services.tmp_provider_sync import fire_tmp_sync
-
-    fire_tmp_sync(result, identity)
     return mcp_result(result)
 
 
@@ -4589,9 +4588,6 @@ async def create_media_buy_raw(
         raw_wire_payload=raw_wire_payload,
     )
 
-    from src.services.tmp_provider_sync import fire_tmp_sync
-
-    fire_tmp_sync(result, identity)
     return result
 
 

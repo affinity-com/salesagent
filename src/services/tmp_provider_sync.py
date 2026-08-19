@@ -27,9 +27,12 @@ beads: salesagent-tmp-sync
 
 from __future__ import annotations
 
+import functools
+import inspect
 import logging
 import os
 import threading
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -38,6 +41,7 @@ from adcp.types import AvailablePackage, SellerAgentReference
 from src.core.database.models import MediaPackage, TMPProvider
 from src.core.database.repositories.uow import MediaBuyUoW, TenantConfigUoW, TMPProviderUoW
 from src.core.domain_config import is_local_host
+from src.core.exceptions import AdCPConfigurationError
 from src.core.logging_config import log_safe
 from src.core.schemas._base import (
     CreateMediaBuyResult,
@@ -47,12 +51,22 @@ from src.core.schemas._base import (
     UpdateMediaBuySuccess,
 )
 from src.core.thread_registry import ThreadRegistry
-from src.services._provider_http import bearer_headers, provider_client_kwargs, provider_url
+from src.services._provider_http import provider_auth_headers, provider_client_kwargs, provider_url
 
 if TYPE_CHECKING:
     from src.core.resolved_identity import ResolvedIdentity
 
 logger = logging.getLogger(__name__)
+
+#: The sync body's authority, declared once next to the builder that produces it.
+#:
+#: The sibling discovery wire has had ``PROVIDER_REGISTRATION_SCHEMA`` since
+#: round 18 and is therefore graded by the schema; this wire had no declaration,
+#: so its tests restated the key set instead — and a restatement cannot see a
+#: ``seller_agent`` that lost ``agent_url`` (#1197 review). The citation guard
+#: (``tests/unit/test_architecture_pinned_schema_citations.py``) keeps the path
+#: resolvable.
+AVAILABLE_PACKAGE_SCHEMA = "trusted-match/available-package.json"
 
 # Log-sanitization rule across the TMP surfaces (this module,
 # tmp_health_scheduler, the admin blueprint, the discovery route): a value goes
@@ -149,6 +163,53 @@ def fire_tmp_sync(
     )
     _active_syncs.add(media_buy_id, t)
     t.start()
+
+
+def fires_tmp_sync(impl: Callable[..., Any]) -> Callable[..., Any]:
+    """Fire the package sync once, on the return of a media-buy ``_impl``.
+
+    Package sync is a transport-agnostic consequence of a media-buy write: it
+    takes the ``_impl`` return value and an already-resolved ``ResolvedIdentity``,
+    and nothing about it is transport-specific.  It nevertheless lived at four
+    transport edges (two MCP wrappers, two ``_raw`` wrappers), with the import
+    deferred inside each function body to make the repetition tolerable, so
+    "exactly one sync per media-buy write" was held by a docstring warning future
+    authors where not to add a fifth trigger (#1197 review).
+
+    A decorator rather than a literal call at the return statement because
+    ``_create_media_buy_impl`` has seven return points; one of them is the replay
+    path, and every one of them is a write the router must see. Decorating gives
+    the property the four call sites were approximating — fires once per ``_impl``
+    invocation, on every transport, and cannot double-fire — at a single site a
+    new entry point cannot forget.
+
+    This does not make ``_impl`` transport-aware: Pattern #5's guard bans
+    transport imports, ``Context``/``ToolContext`` parameters and ``ToolError``,
+    none of which this module has, and both ``_impl`` functions already dispatch
+    sibling post-write side effects (Slack notification, activity feed, push
+    notifications) from inside the business logic.
+
+    ``identity`` is read from the keyword arguments — every caller passes it by
+    keyword — and a call without one still reaches ``fire_tmp_sync``, which logs
+    the no-op rather than guessing.
+    """
+    if inspect.iscoroutinefunction(impl):
+
+        @functools.wraps(impl)
+        async def _async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            result = await impl(*args, **kwargs)
+            fire_tmp_sync(result, kwargs.get("identity"))
+            return result
+
+        return _async_wrapper
+
+    @functools.wraps(impl)
+    def _sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+        result = impl(*args, **kwargs)
+        fire_tmp_sync(result, kwargs.get("identity"))
+        return result
+
+    return _sync_wrapper
 
 
 def _run_sync(tenant_id: str, media_buy_id: str, predecessor: threading.Thread | None) -> None:
@@ -292,7 +353,6 @@ def _resolve_seller_agent_url(tenant_id: str) -> str | None:
     # Uses TenantConfigUoW for architecture compliance (no raw get_db_session).
     try:
         with TenantConfigUoW(tenant_id) as uow:
-            assert uow.tenant_config is not None
             tenant = uow.tenant_config.get_tenant()
             if tenant and tenant.virtual_host:
                 host = tenant.virtual_host
@@ -321,7 +381,7 @@ def _build_package_payload(
     media_buy_id: str,
     pkg_row: MediaPackage,
     seller_agent_url: str,
-) -> dict[str, Any]:
+) -> AvailablePackage:
     """Build the POST /packages/sync payload from a MediaPackage DB row.
 
     The body is produced by the pinned SDK's ``AvailablePackage`` — the codegen
@@ -335,24 +395,37 @@ def _build_package_payload(
 
     ``seller_agent`` is ``SellerAgentReference``
     (``adcp/_schemas/3.1/core/seller-agent-ref.json``): ``{"agent_url": ...}``,
-    whose ``agent_url`` MUST use the ``https://`` scheme.  Callers must resolve a
-    valid https URL before calling this (see ``_resolve_seller_agent_url``); an
-    invalid one raises out of the model rather than reaching a provider.
+    whose ``agent_url`` MUST use the ``https://`` scheme.  Callers resolve a valid
+    https URL before calling this (see ``_resolve_seller_agent_url``), and the
+    scheme is re-checked HERE so the rule holds by construction at the point the
+    body is built.  The check is not redundant: the SDK model does not enforce it
+    (the requirement is prose in the field's ``description``, not a validator), so
+    the previous claim that "an invalid one raises out of the model" was false and
+    a non-https URL would have reached a provider (#1197 review).
 
-    ``mode="json"`` renders ``AnyUrl`` as a plain string so the result is
-    directly JSON-serializable; ``exclude_none=True`` drops the optional
-    members (and ``seller_agent.id``, reserved and unpopulated per the spec)
-    so the emitted object stays inside the closed key set.
+    Returns the MODEL, not a ``dict``. Collapsing it here left an untyped mapping
+    travelling to ``httpx`` with no declared authority for the sync body, so its
+    tests restated the key set instead of validating against the schema — and a
+    restatement cannot see a ``seller_agent`` that lost ``agent_url`` or a
+    non-https ``agent_url``, the one constraint this module spends a docstring, an
+    error branch and a skip path on (#1197 review). The ``model_dump`` happens
+    once, in ``_post_packages_sync``, where JSON is actually needed.
     """
+    if not seller_agent_url.startswith("https://"):
+        raise ValueError(
+            f"seller_agent.agent_url must use https:// per seller-agent-ref.json, got {seller_agent_url!r}"
+        )
     return AvailablePackage(
         package_id=pkg_row.package_id,
         media_buy_id=media_buy_id,
         # seller_agent is required by the schema; agent_url MUST be https.
         seller_agent=SellerAgentReference(agent_url=seller_agent_url),
-    ).model_dump(mode="json", exclude_none=True)
+    )
 
 
-def _post_packages_sync(endpoint: str, payloads: list[dict[str, Any]], auth_credentials: str = "") -> None:
+def _post_packages_sync(
+    endpoint: str, payloads: list[AvailablePackage], auth_credentials: str = "", auth_type: str | None = None
+) -> None:
     """POST /packages/sync to a single TMP Provider endpoint.
 
     Sends the full list as a JSON array.  The TMP Provider's handler accepts
@@ -369,9 +442,13 @@ def _post_packages_sync(endpoint: str, payloads: list[dict[str, Any]], auth_cred
     continue to the next provider.
     """
     url = provider_url(endpoint, "/packages/sync")
-    headers = bearer_headers(auth_credentials)
+    headers = provider_auth_headers(auth_type, auth_credentials)
+    # The single model_dump in the whole path: the fan-out carries validated
+    # AvailablePackage models and JSON is produced only here, at the transport
+    # edge, so `Any` never travels through this module (#1197 review).
+    body = [pkg.model_dump(mode="json", exclude_none=True) for pkg in payloads]
     with httpx.Client(**provider_client_kwargs()) as client:
-        resp = client.post(url, json=payloads, headers=headers)
+        resp = client.post(url, json=body, headers=headers)
         resp.raise_for_status()
     # Sync fires on every media-buy create/update; keep at DEBUG (failures stay
     # at WARNING in sync_packages_for_media_buy's fan-out loop below).
@@ -384,8 +461,8 @@ def _post_packages_sync(endpoint: str, payloads: list[dict[str, Any]], auth_cred
     )
 
 
-def _readable_providers(provider_rows: list[TMPProvider], tenant_id: str) -> list[tuple[str, str, str]]:
-    """Materialise ``(name, endpoint, credential)`` per provider, skipping unreadable ones.
+def _readable_providers(provider_rows: list[TMPProvider], tenant_id: str) -> list[tuple[str, str, str, str | None]]:
+    """Materialise ``(name, endpoint, credential, auth_type)`` per provider, skipping unreadable ones.
 
     The unit of work is one provider, so the failure handling is per provider:
     :attr:`TMPProvider.auth_credentials` decrypts on read and raises
@@ -396,14 +473,20 @@ def _readable_providers(provider_rows: list[TMPProvider], tenant_id: str) -> lis
     stopped the sync for every other provider the tenant had registered
     (#1197 review).
 
+    Narrowed to ``AdCPConfigurationError`` — the decrypt failure — rather than
+    ``Exception``: a broad catch here silently dropped a provider for ANY error
+    raised while materialising it (an ``AttributeError`` from a renamed column, for
+    instance), which is the same "swallow the programming error, under-deliver the
+    feature" shape as the capability handler's (#1197 review).
+
     Runs inside the caller's UoW block: the attribute reads (and the decrypt)
     need a live session.
     """
-    providers: list[tuple[str, str, str]] = []
+    providers: list[tuple[str, str, str, str | None]] = []
     for p in provider_rows:
         try:
             credential = p.auth_credentials or ""
-        except Exception:
+        except AdCPConfigurationError:
             # Named per provider, and at WARNING like the fan-out failures — an
             # operator reading this line must be able to tell WHICH registration
             # to re-enter the credential for.
@@ -416,7 +499,7 @@ def _readable_providers(provider_rows: list[TMPProvider], tenant_id: str) -> lis
                 exc_info=True,
             )
             continue
-        providers.append((p.name, p.endpoint, credential))
+        providers.append((p.name, p.endpoint, credential, p.auth_type))
     return providers
 
 
@@ -505,7 +588,6 @@ def sync_packages_for_media_buy(tenant_id: str, media_buy_id: str) -> None:
     # which then repeats in the except-handler's own attribute reads below.
     try:
         with TMPProviderUoW(tenant_id) as uow:
-            assert uow.tmp_providers is not None
             providers = _readable_providers(uow.tmp_providers.list_syncable(), tenant_id)
     except Exception:
         logger.exception(
@@ -522,9 +604,9 @@ def sync_packages_for_media_buy(tenant_id: str, media_buy_id: str) -> None:
         return
 
     # --- Step 4: fan out to each provider (best-effort) ---
-    for provider_name, provider_endpoint, provider_auth_credentials in providers:
+    for provider_name, provider_endpoint, provider_auth_credentials, provider_auth_type in providers:
         try:
-            _post_packages_sync(provider_endpoint, payloads, provider_auth_credentials)
+            _post_packages_sync(provider_endpoint, payloads, provider_auth_credentials, provider_auth_type)
         except Exception:
             # Log with full context but do NOT re-raise — one provider failure
             # must not block the others.  The media buy is already committed.

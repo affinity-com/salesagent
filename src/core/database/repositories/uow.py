@@ -44,8 +44,44 @@ from src.core.database.repositories.push_notification_config import PushNotifica
 from src.core.database.repositories.tenant_config import TenantConfigRepository
 from src.core.database.repositories.tmp_provider import TMPProviderRepository
 from src.core.database.repositories.workflow import WorkflowRepository
+from src.core.exceptions import AdCPServiceUnavailableError
 
 logger = logging.getLogger(__name__)
+
+
+class RepositoryAccessor[RepoT]:
+    """Exposes a UoW repository as a non-optional attribute.
+
+    The repositories a UoW owns are created by ``_init_repos`` on ``__enter__``
+    and cleared on ``__exit__``, so inside the ``with`` block they are always
+    present.  Typing them ``Repository | None`` pushed that fact onto every call
+    site, which then invented its own narrowing — bare ``assert`` in some files,
+    a typed ``raise`` in others, sixteen of them in one feature (#1197 review).
+    ``assert`` is the wrong one twice over: ``python -O`` strips it, and an
+    ``AssertionError`` escapes a protocol surface as an un-enveloped 500 rather
+    than the typed AdCP envelope the contract promises.
+
+    This descriptor answers the question once.  Callers read
+    ``uow.tmp_providers`` with no guard and get the concrete repository; reading
+    it outside an open session raises the typed
+    :class:`AdCPServiceUnavailableError` that the surfaces want anyway.
+    """
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        self._name = name
+        self._slot = f"_repo_{name}"
+
+    def __get__(self, instance: object, owner: type | None = None) -> RepoT:
+        repo = getattr(instance, self._slot, None)
+        if repo is None:
+            raise AdCPServiceUnavailableError(
+                f"{self._name} repository unavailable.",
+                suggestion="Retry shortly; the sales agent could not open a database session.",
+            )
+        return repo
+
+    def __set__(self, instance: object, value: RepoT | None) -> None:
+        setattr(instance, self._slot, value)
 
 
 class BaseUoW:
@@ -203,7 +239,8 @@ class TenantConfigUoW(BaseUoW):
         tenant_id: Tenant scope for all repository queries.
     """
 
-    tenant_config: TenantConfigRepository | None
+    # Non-optional to callers — see RepositoryAccessor.
+    tenant_config: RepositoryAccessor[TenantConfigRepository] = RepositoryAccessor()
 
     def _init_repos(self) -> None:
         assert self._session is not None
@@ -336,8 +373,11 @@ class TMPProviderUoW(BaseUoW):
     beads: salesagent-tmp-sync
     """
 
-    tmp_providers: TMPProviderRepository | None
-    tenant_config: TenantConfigRepository | None
+    # Non-optional to callers: see RepositoryAccessor. Reading either outside an
+    # open session raises AdCPServiceUnavailableError instead of handing back a
+    # None that every call site has to narrow for itself (#1197 review).
+    tmp_providers: RepositoryAccessor[TMPProviderRepository] = RepositoryAccessor()
+    tenant_config: RepositoryAccessor[TenantConfigRepository] = RepositoryAccessor()
 
     def _init_repos(self) -> None:
         assert self._session is not None

@@ -105,6 +105,7 @@ from src.services.targeting_capabilities import (
     validate_property_targeting_allowed,
     validate_unknown_targeting_fields,
 )
+from src.services.tmp_provider_sync import fires_tmp_sync
 
 
 def _adcp_status_and_actions(
@@ -343,6 +344,7 @@ def _verify_principal(
         )
 
 
+@fires_tmp_sync
 def _update_media_buy_impl(
     req: UpdateMediaBuyRequest,
     identity: ResolvedIdentity | None = None,
@@ -1593,9 +1595,6 @@ async def update_media_buy(
     _ctx_id = (await ctx.get_state("context_id")) if isinstance(ctx, Context) else None
     response = _update_media_buy_impl(req=req, identity=identity, context_id=_ctx_id)
 
-    from src.services.tmp_provider_sync import fire_tmp_sync
-
-    fire_tmp_sync(response, identity)
     return mcp_result(response)
 
 
@@ -1676,7 +1675,4 @@ def update_media_buy_raw(
     # is no workflow context_id to forward — _impl creates one if needed.
     result = _update_media_buy_impl(req=req, identity=identity, context_id=None)
 
-    from src.services.tmp_provider_sync import fire_tmp_sync
-
-    fire_tmp_sync(result, identity)
     return result

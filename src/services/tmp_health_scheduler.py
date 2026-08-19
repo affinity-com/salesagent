@@ -132,7 +132,6 @@ class TMPHealthScheduler(IntervalScheduler):
         for tenant_id, updates in by_tenant.items():
             try:
                 with TMPProviderUoW(tenant_id) as uow:
-                    assert uow.tmp_providers is not None
                     for provider_id, status in updates:
                         uow.tmp_providers.update_health_status(provider_id, status)
             except Exception:

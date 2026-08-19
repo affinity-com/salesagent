@@ -12,9 +12,11 @@ dispatched tests on the same code path (#1197 review).
 
 What remains, and why each is distinct:
 
-- ``TestWrapperDoesNotFireOnFailure`` — the *no-fire* contract: a create or
-  update that raised must not sync. A dispatched scenario cannot express this as
-  sharply (a failed dispatch has no media_buy_id to assert absence against).
+- ``TestFiresTmpSyncDecorator`` — that both ``_impl`` functions carry the
+  decorator (a new entry point cannot forget the sync), and its fire/no-fire
+  contract on the sync and async forms. A dispatched scenario cannot express the
+  no-fire half as sharply (a failed dispatch has no media_buy_id to assert
+  absence against).
 - ``TestExtractMediaBuyId`` — ``_extract_media_buy_id`` graded as the pure
   function it is: its return value per member of the result union. That pins the
   rename regression the typed extraction exists to prevent far more directly than
@@ -63,58 +65,96 @@ def _update_result(media_buy_id: str) -> UpdateMediaBuyResult:
     )
 
 
-class TestWrapperDoesNotFireOnFailure:
-    """A create/update that raised must not trigger a package sync.
+class TestFiresTmpSyncDecorator:
+    """The sync is a consequence of the write, wired once per ``_impl``.
 
-    ``fire_tmp_sync`` is observed at its module attribute: the wrappers import it
-    inside the function body, so the deferred import resolves the patched
-    attribute at call time.
+    It used to be four calls at the transport edges, so a fifth entry point could
+    silently forget it and "exactly one sync per media-buy write" was held by a
+    docstring rather than by the code (#1197 review). These grade the property the
+    four call sites were approximating.
     """
 
-    def test_create_wrapper_does_not_fire_when_impl_raises(self):
-        import asyncio
-        from unittest.mock import MagicMock, patch
+    def test_both_media_buy_impls_are_decorated(self):
+        """The structural claim: the sync cannot be forgotten by a new entry point.
 
-        from src.core.tools.media_buy_create import create_media_buy_raw
+        Asserted on the wrapped functions themselves, so deleting a decorator
+        fails here rather than silently switching the feature off on every
+        transport at once.
+        """
+        from src.core.tools.media_buy_create import _create_media_buy_impl
+        from src.core.tools.media_buy_update import _update_media_buy_impl
 
+        for impl in (_create_media_buy_impl, _update_media_buy_impl):
+            assert getattr(impl, "__wrapped__", None) is not None, (
+                f"{impl.__name__} is not decorated with @fires_tmp_sync — the sync would "
+                "no longer fire on any transport"
+            )
+
+    def test_fires_with_the_impl_result_and_identity_on_success(self):
+        from unittest.mock import patch
+
+        from src.services.tmp_provider_sync import fires_tmp_sync
+
+        result = _create_result("mb_decorated")
         identity = make_identity(tenant_id="tenant_1")
-        mock_req = MagicMock()
-        mock_req.account = None
 
-        with (
-            patch(
-                "src.core.tools.media_buy_create._create_media_buy_impl",
-                side_effect=RuntimeError("boom"),
-            ),
-            patch(
-                "src.core.tools.media_buy_create._build_create_media_buy_request",
-                return_value=mock_req,
-            ),
-            patch("src.core.transport_helpers.enrich_identity_with_account", return_value=identity),
-            patch("src.services.tmp_provider_sync.fire_tmp_sync") as mock_fire,
-        ):
+        @fires_tmp_sync
+        def _impl(*, identity):
+            return result
+
+        with patch("src.services.tmp_provider_sync.fire_tmp_sync") as mock_fire:
+            assert _impl(identity=identity) is result
+
+        mock_fire.assert_called_once_with(result, identity)
+
+    def test_does_not_fire_when_the_impl_raises(self):
+        """The no-fire contract: a failed write must not sync."""
+        from unittest.mock import patch
+
+        from src.services.tmp_provider_sync import fires_tmp_sync
+
+        @fires_tmp_sync
+        def _impl(*, identity):
+            raise RuntimeError("boom")
+
+        with patch("src.services.tmp_provider_sync.fire_tmp_sync") as mock_fire:
             with pytest.raises(RuntimeError, match="boom"):
-                asyncio.run(create_media_buy_raw(identity=identity))
+                _impl(identity=make_identity(tenant_id="tenant_1"))
 
         mock_fire.assert_not_called()
 
-    def test_update_wrapper_does_not_fire_when_impl_raises(self):
-        from unittest.mock import MagicMock, patch
+    def test_async_impl_is_awaited_before_firing(self):
+        """``_create_media_buy_impl`` is async; the decorator must await, not fire on a coroutine."""
+        import asyncio
+        from unittest.mock import patch
 
-        from src.core.tools.media_buy_update import update_media_buy_raw
+        from src.services.tmp_provider_sync import fires_tmp_sync
 
-        identity = make_identity(tenant_id="tenant_2")
+        result = _create_result("mb_async")
 
-        with (
-            patch(
-                "src.core.tools.media_buy_update._update_media_buy_impl",
-                side_effect=RuntimeError("boom"),
-            ),
-            patch("src.core.tools.media_buy_update._build_update_request", return_value=MagicMock()),
-            patch("src.services.tmp_provider_sync.fire_tmp_sync") as mock_fire,
-        ):
+        @fires_tmp_sync
+        async def _impl(*, identity):
+            return result
+
+        identity = make_identity(tenant_id="tenant_1")
+        with patch("src.services.tmp_provider_sync.fire_tmp_sync") as mock_fire:
+            assert asyncio.run(_impl(identity=identity)) is result
+
+        mock_fire.assert_called_once_with(result, identity)
+
+    def test_async_impl_does_not_fire_when_it_raises(self):
+        import asyncio
+        from unittest.mock import patch
+
+        from src.services.tmp_provider_sync import fires_tmp_sync
+
+        @fires_tmp_sync
+        async def _impl(*, identity):
+            raise RuntimeError("boom")
+
+        with patch("src.services.tmp_provider_sync.fire_tmp_sync") as mock_fire:
             with pytest.raises(RuntimeError, match="boom"):
-                update_media_buy_raw(media_buy_id="mb-update-1", identity=identity)
+                asyncio.run(_impl(identity=make_identity(tenant_id="tenant_1")))
 
         mock_fire.assert_not_called()
 

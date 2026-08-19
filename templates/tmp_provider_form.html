@@ -177,9 +177,12 @@ block content %}
         id="timeout_ms"
         name="timeout_ms"
         class="form-control"
-        value="{{ provider.timeout_ms if provider else 50 }}"
-        min="10"
-        max="5000"
+        value="{{ provider.timeout_ms if provider else field_bounds.timeout_ms.default }}"
+        {# Rendered from TMPProviderRegistration.model_fields, not hand-typed: the
+           hand-written min="10" refused a legal 5-9 ms registration the record and
+           the pinned schema both accept (#1197 review). #}
+        min="{{ field_bounds.timeout_ms.min }}"
+        max="{{ field_bounds.timeout_ms.max }}"
         style="max-width: 200px"
       />
       <small class="form-text text-muted">
@@ -232,10 +235,14 @@ block content %}
     <!-- Auth Configuration -->
     <div class="form-group">
       <label for="auth_type">Auth Type</label>
+      {# Rendered from PROVIDER_AUTH_SCHEMES — the schemes provider_auth_headers
+         actually implements. The hand-typed list offered "API Key", which the
+         outbound call ignored: selecting it changed nothing (#1197 review). #}
       <select name="auth_type" id="auth_type" class="form-control">
         <option value="">None (unauthenticated)</option>
-        <option value="bearer" {% if provider and provider.auth_type == 'bearer' %}selected{% endif %}>Bearer Token</option>
-        <option value="api_key" {% if provider and provider.auth_type == 'api_key' %}selected{% endif %}>API Key</option>
+        {% for scheme in valid_auth_schemes %}
+        <option value="{{ scheme }}" {% if provider and provider.auth_type == scheme %}selected{% endif %}>{{ scheme|capitalize }} token</option>
+        {% endfor %}
       </select>
     </div>
     <div class="form-group">

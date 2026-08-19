@@ -14,8 +14,8 @@ Covers:
 - Providers ordered by priority ASC, name ASC
 - Handles legacy rows with null countries/uid_types
 - uow.tenant_config is None → 500 (not an assert)
-- TMPProvider.to_discovery_dict() / to_admin_dict() serialize their own contracts,
-  the discovery half graded against the pinned schema itself
+- TMPProviderDiscoveryEntry (the pinned SDK type) is what the wire carries, and
+  TMPProvider.to_admin_dict() is the separate Jinja-facing shape
 
 Every request here goes through the PRODUCTION app (``src.app.app``) — its
 router mount, its middleware stack and its ``AdCPError`` handler — rather than a
@@ -28,14 +28,16 @@ against the same app in ``tests/integration/test_tmp_provider_integration.py``
 (#1197 review).
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
-from adcp.types.generated_poc.trusted_match.provider_registration import TmpProviderRegistration
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy.orm.exc import DetachedInstanceError
 
 from src.core.database.models import TMPProvider
+from src.core.exceptions import AdCPServiceUnavailableError
+from src.core.schemas.tmp_provider import TMPProviderDiscoveryEntry
 from src.routes.tmp_providers import PROVIDER_REGISTRATION_SCHEMA
 from tests.helpers.envelope_assertions import assert_envelope_shape
 from tests.helpers.pinned_schema import validate_against_pinned_schema
@@ -269,68 +271,37 @@ class TestDiscoveryOrdering:
 
 
 # ---------------------------------------------------------------------------
-# uow.tenant_config is None guard (replaces the old assert)
+# Repository availability — now a property of the UoW, not of this route
 # ---------------------------------------------------------------------------
 
 
 class TestDiscoveryRepositoryUnavailable:
-    """Both UoW repository guards emit the typed 503 envelope — never a bare ``assert``.
+    """The typed 503 envelope survives, but the guard is no longer in the route.
 
-    ``assert uow.<repo> is not None`` is stripped by ``python -O``, and when it
-    does fire it raises ``AssertionError`` → an un-enveloped 500 rather than the
-    typed AdCP envelope this endpoint's contract promises.  These two tests are
-    siblings on purpose: the ``tenant_config`` guard had a test, the parallel
-    ``tmp_providers`` guard eight lines down did not (#1197 review).
+    ``TMPProviderUoW`` exposes its repositories through ``RepositoryAccessor``,
+    so inside the ``with`` block they are the concrete repository and outside it
+    the read raises the typed ``AdCPServiceUnavailableError``.  There is no
+    ``uow.<repo> is None`` state for the route to test any more — the per-call-site
+    narrowing (and the ``assert`` spelling of it, which ``python -O`` strips and
+    which escapes as an un-enveloped 500) is gone by construction (#1197 review).
+
+    What still needs grading here is the *boundary translation*: a typed
+    ``AdCPServiceUnavailableError`` raised anywhere inside the route body must
+    reach the client as the AdCP 503 envelope, not a bare 500.  The accessor's
+    own contract is graded in ``tests/unit/test_uow_repository_accessor.py``.
     """
 
-    @staticmethod
-    def _uow_cls_with(*, tenant_config, tmp_providers) -> MagicMock:
-        """A UoW class whose yielded UoW exposes the two repositories as given.
-
-        Unlike ``_make_tmp_uow``, either repository may be ``None`` — that is
-        the condition under test. The context-manager plumbing itself is
-        ``_mock_cm``'s job, not this factory's.
-        """
+    def test_service_unavailable_from_the_uow_becomes_the_typed_503_envelope(self, client):
+        """A repository read that raises AdCPServiceUnavailableError → AdCP 503 envelope."""
         mock_uow = MagicMock()
-        mock_uow.tenant_config = tenant_config
-        mock_uow.tmp_providers = tmp_providers
-        return _mock_cm(mock_uow)
-
-    def test_returns_503_when_tenant_config_is_none(self, client):
-        """If TMPProviderUoW yields uow.tenant_config=None the endpoint returns 503 (service unavailable).
-
-        AdCPServiceUnavailableError (503, transient) is the right error here: the
-        repository layer is temporarily unavailable; the buyer should retry.
-        """
-        mock_uow_cls = self._uow_cls_with(tenant_config=None, tmp_providers=MagicMock())
-
-        with patch("src.routes.tmp_providers.TMPProviderUoW", mock_uow_cls):
-            response = client.get("/tenant/si-host/tmp-providers/discovery")
-
-        assert response.status_code == 503
-        # AdCPServiceUnavailableError: recovery=transient (buyer should retry)
-        envelope = response.json()
-        assert_envelope_shape(
-            envelope,
-            "SERVICE_UNAVAILABLE",
-            recovery="transient",
-            message_substr="Tenant config repository unavailable",
+        type(mock_uow).tenant_config = PropertyMock(
+            side_effect=AdCPServiceUnavailableError(
+                "tenant_config repository unavailable.",
+                suggestion="Retry shortly; the sales agent could not open a database session.",
+            )
         )
-        assert "Retry shortly" in envelope["errors"][0]["suggestion"]
 
-    def test_returns_503_when_tmp_providers_is_none(self, client):
-        """If TMPProviderUoW yields uow.tmp_providers=None the endpoint returns the same typed 503.
-
-        Mutation this pins: reverting the guard to ``assert uow.tmp_providers is
-        not None`` produces an ``AssertionError`` → status 500 with no AdCP
-        envelope, failing both the status and the envelope assertion below.
-        The tenant_config repo is present so this test isolates the second guard.
-        """
-        tenant_config = MagicMock()
-        tenant_config.get_tenant.return_value = _make_tenant()
-        mock_uow_cls = self._uow_cls_with(tenant_config=tenant_config, tmp_providers=None)
-
-        with patch("src.routes.tmp_providers.TMPProviderUoW", mock_uow_cls):
+        with patch("src.routes.tmp_providers.TMPProviderUoW", _mock_cm(mock_uow)):
             response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 503
@@ -339,7 +310,7 @@ class TestDiscoveryRepositoryUnavailable:
             envelope,
             "SERVICE_UNAVAILABLE",
             recovery="transient",
-            message_substr="TMP provider repository unavailable",
+            message_substr="repository unavailable",
         )
         assert "Retry shortly" in envelope["errors"][0]["suggestion"]
 
@@ -362,26 +333,39 @@ class TestDiscoverySingleTransactionAndNoDetachedInstance:
     """
 
     class _DetachAfterCloseProvider:
-        """Fake provider whose to_discovery_dict() raises DetachedInstanceError once the UoW closed."""
+        """Fake provider whose ATTRIBUTE reads raise DetachedInstanceError once the UoW closed.
+
+        ``TMPProviderDiscoveryEntry.from_row`` reads the row attribute by
+        attribute, so the detachment is simulated where SQLAlchemy raises it —
+        on attribute access — rather than on a serializer method that no longer
+        exists.
+        """
+
+        _VALUES = {
+            "provider_id": "fake_uuid",
+            "endpoint": "http://fake:3000",
+            "context_match": True,
+            "identity_match": False,
+            "countries": None,
+            "uid_types": None,
+            "properties": None,
+            "timeout_ms": 200,
+            "priority": 0,
+            "status": "active",
+        }
 
         def __init__(self, closed_flag: list[bool]):
             self._closed_flag = closed_flag
 
-        def _check(self):
+        def __getattr__(self, name: str):
+            if name.startswith("_"):
+                raise AttributeError(name)
             if self._closed_flag[0]:
                 raise DetachedInstanceError("Instance is not bound to a Session; attribute access failed")
-
-        def to_discovery_dict(self) -> dict:
-            self._check()
-            return {
-                "provider_id": "fake-uuid",
-                "endpoint": "http://fake:3000",
-                "context_match": True,
-                "identity_match": True,
-                "timeout_ms": 200,
-                "priority": 0,
-                "status": "active",
-            }
+            try:
+                return self._VALUES[name]
+            except KeyError as exc:
+                raise AttributeError(name) from exc
 
     def test_tmp_provider_uow_constructed_exactly_once(self, client):
         """TMPProviderUoW is instantiated exactly once — not twice (no separate TenantConfigUoW)."""
@@ -394,13 +378,13 @@ class TestDiscoverySingleTransactionAndNoDetachedInstance:
         # The class must have been called (constructed) exactly once.
         mock_tmp_uow_cls.assert_called_once_with("si-host")
 
-    def test_to_dict_called_before_uow_exits(self, client):
-        """provider.to_discovery_dict() is called inside the UoW block, not after it closes.
+    def test_entry_built_before_uow_exits(self, client):
+        """The wire entry is constructed inside the UoW block, not after it closes.
 
-        Uses a fake provider whose to_discovery_dict() raises
-        DetachedInstanceError once the UoW __exit__ sets a closed_flag. If the
-        route serializes after the block exits, the request would 500; if it
-        serializes inside, it succeeds.
+        Uses a fake provider whose attribute reads raise DetachedInstanceError
+        once the UoW ``__exit__`` sets a closed_flag. If the route builds entries
+        after the block exits, the request fails; if it builds them inside, it
+        succeeds.
         """
         closed_flag = [False]
         provider = self._DetachAfterCloseProvider(closed_flag)
@@ -418,13 +402,13 @@ class TestDiscoverySingleTransactionAndNoDetachedInstance:
         mock_uow_cls = _mock_cm(mock_uow, on_exit=_mark_closed)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_uow_cls):
-            # Would raise DetachedInstanceError (→ 500) if to_dict() ran after __exit__.
+            # Would raise DetachedInstanceError (→ 500) if from_row() ran after __exit__.
             response = client.get("/tenant/si-host/tmp-providers/discovery")
 
         assert response.status_code == 200
         data = response.json()
         assert len(data["providers"]) == 1
-        assert data["providers"][0]["provider_id"] == "fake-uuid"
+        assert data["providers"][0]["provider_id"] == "fake_uuid"
 
 
 # ---------------------------------------------------------------------------
@@ -432,46 +416,68 @@ class TestDiscoverySingleTransactionAndNoDetachedInstance:
 # ---------------------------------------------------------------------------
 
 
-class TestTMPProviderSerializers:
-    """The two serializers carry two different contracts and must not converge.
+class TestDiscoverySkipsUnrepresentableRows:
+    """A legacy row that cannot be represented is dropped, not published, and not fatal.
 
-    ``to_discovery_dict()`` is the machine wire — the closed key set of
-    ``provider-registration.json``, absent conditionals omitted, no ``name``.
-    ``to_admin_dict()`` is the Jinja-facing shape — ``name`` plus all three
-    conditional keys always present (``None`` meaning "no restriction").
-
-    These tests use real TMPProvider instances (no DB session) to ensure the
-    production serialization contract is tested directly — not a MagicMock
-    reimplementation that can silently diverge.
+    Per row rather than per response: the only rows that can fail conversion are
+    ones predating ``TMPProviderRegistration`` (an ``identity_match`` row with no
+    countries is unrepresentable under the schema's if/then at any
+    serialization). Failing the whole response would let one such row take
+    discovery down for every other provider — the per-batch failure mode this
+    feature removed from the sync path and the health scheduler (#1197 review).
     """
 
-    def test_discovery_dict_omits_absent_conditionals(self):
-        """Absent countries/uid_types/properties are omitted — never emitted as null."""
-        p = _make_provider(countries=None, uid_types=None, properties=None)
-        result = p.to_discovery_dict()
-        assert "countries" not in result
-        assert "uid_types" not in result
-        assert "properties" not in result
+    def test_bad_row_is_skipped_and_good_rows_still_publish(self, client, caplog):
+        import logging
 
-    def test_discovery_dict_includes_populated_conditionals(self):
-        """Populated countries/uid_types/properties are carried through verbatim."""
-        p = _make_provider(countries=["US", "GB"], uid_types=["uid2"], properties=[_RID])
-        result = p.to_discovery_dict()
-        assert result["countries"] == ["US", "GB"]
-        assert result["uid_types"] == ["uid2"]
-        assert result["properties"] == [_RID]
+        good = _make_provider(provider_id="prov_good", endpoint="https://good.example.com/tmp")
+        # Unrepresentable: identity_match with no countries/uid_types.
+        bad = _make_provider(
+            provider_id="prov_legacy",
+            context_match=False,
+            identity_match=True,
+            countries=None,
+            uid_types=None,
+        )
+        mock_tmp_uow_cls = _make_tmp_uow([bad, good], tenant=_make_tenant())
 
-    def test_discovery_dict_validates_against_the_pinned_schema(self):
-        """A fully-populated entry validates against ``provider-registration.json`` itself.
+        with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
+            with caplog.at_level(logging.ERROR, logger="src.routes.tmp_providers"):
+                response = client.get("/tenant/si-host/tmp-providers/discovery")
 
-        The grader is the pinned schema, not a hand-written restatement of it:
-        the previous ``set(result) == {...}`` key list could only detect
-        key-name drift, which is why a hyphenated ``provider_id`` violating
-        ``^[A-Za-z0-9_]+$`` shipped on this wire past eighteen review rounds
-        (#1197 review).  ``validate_against_pinned_schema`` reads the file named
-        by the route module's own citation, so a citation pointing at a
-        non-existent path fails here too.
-        """
+        assert response.status_code == 200
+        returned = [p["provider_id"] for p in response.json()["providers"]]
+        assert returned == ["prov_good"]
+        # The operator gets the id of the row to repair.
+        assert "prov_legacy" in caplog.text
+
+
+class TestDiscoveryEntryIsTheSdkType:
+    """The wire entry is the pinned SDK model, so the schema's rules are its rules.
+
+    These used to grade a hand-written ``to_discovery_dict()`` against the schema.
+    The entry is now :class:`TMPProviderDiscoveryEntry`, which extends the pinned
+    codegen — so the tests that remain are the ones that can still fail: that a
+    row converts, that the conversion enforces what the schema says, and that the
+    admin-only ``name`` never reaches this wire (#1197 review).
+    """
+
+    @staticmethod
+    def _entry_dict(provider: TMPProvider) -> dict:
+        """The entry as it goes on the wire — omitting absent conditionals."""
+        return TMPProviderDiscoveryEntry.from_row(provider).model_dump(mode="json", exclude_none=True)
+
+    def test_context_only_row_converts_and_validates(self):
+        p = _make_provider(endpoint="https://ctx.example.com/tmp", context_match=True, identity_match=False)
+        entry = self._entry_dict(p)
+
+        validate_against_pinned_schema(PROVIDER_REGISTRATION_SCHEMA, entry)
+        assert "countries" not in entry
+        assert "uid_types" not in entry
+        assert "properties" not in entry
+        assert "name" not in entry, "the admin-only label must never reach the machine wire"
+
+    def test_fully_populated_identity_row_converts_and_validates(self):
         p = _make_provider(
             provider_id="prov_test",
             name="Test Provider",
@@ -485,52 +491,75 @@ class TestTMPProviderSerializers:
             priority=2,
             status="draining",
         )
-        result = p.to_discovery_dict()
+        entry = self._entry_dict(p)
 
-        validate_against_pinned_schema(PROVIDER_REGISTRATION_SCHEMA, result)
-        # Cross-check against the SDK codegen of the same schema: it is the type
-        # a router built on the pinned SDK deserializes this entry into.
-        TmpProviderRegistration.model_validate(result)
+        validate_against_pinned_schema(PROVIDER_REGISTRATION_SCHEMA, entry)
+        assert entry["countries"] == ["DE"]
+        assert entry["uid_types"] == ["id5"]
+        assert entry["properties"] == [_RID]
+        assert entry["status"] == "draining"
+        assert entry["timeout_ms"] == 300
 
-        # `name` is the one admin-side key that must never reach this wire; the
-        # closed schema (additionalProperties: false) makes it an error, and
-        # asserting it here names the specific regression.
-        assert "name" not in result
+    def test_local_http_endpoint_is_permitted(self):
+        """The one documented divergence from the SDK type, and it follows the schema.
 
-    def test_discovery_dict_omitting_conditionals_still_validates(self):
-        """A context-only provider — no countries/uid_types/properties — is schema-valid.
+        The schema types ``endpoint`` ``format: uri``; the HTTPS requirement is
+        prose in the field description. Local development against
+        ``http://…​.localhost`` must keep working.
 
-        The omit-don't-null rule and the schema's ``anyOf`` are graded together
-        on the same instrument as the populated case.
+        Also pins the one wire-visible consequence of typing the field as
+        ``AnyUrl``: pydantic canonicalizes, so a stored
+        ``http://host:3003`` is published as ``http://host:3003/``. That is
+        conformant and semantically identical — the schema states that two
+        registrations "differing only in case, default port, or path-slash
+        collapsing are the same provider" — and our own outbound path is
+        unaffected because ``provider_url()`` strips the trailing slash before
+        appending. Asserted explicitly so the normalization is a stated property
+        rather than a surprise to a router operator diffing stored vs published.
         """
-        p = _make_provider(
-            endpoint="https://ctx.example.com/tmp",
-            context_match=True,
-            identity_match=False,
-            countries=None,
-            uid_types=None,
-            properties=None,
-        )
-        result = p.to_discovery_dict()
-        validate_against_pinned_schema(PROVIDER_REGISTRATION_SCHEMA, result)
-        # https, unlike the module-level default: the SDK codegen adds an
-        # https-only validator on top of the schema's `format: uri`, and this
-        # record deliberately allows http://*.localhost for local development
-        # (see src/core/schemas/tmp_provider.py). The schema is the authority;
-        # the codegen is the cross-check, so the cross-check gets an https URL.
-        TmpProviderRegistration.model_validate(result)
+        p = _make_provider(endpoint="http://si-agent.localhost:3003")
+        entry = self._entry_dict(p)
 
-    def test_hyphenated_provider_id_is_rejected_by_the_schema(self):
-        """The canonical-UUID form this column used to emit fails the schema.
+        validate_against_pinned_schema(PROVIDER_REGISTRATION_SCHEMA, entry)
+        assert entry["endpoint"] == "http://si-agent.localhost:3003/"
 
-        Pins the reason ``provider_id`` is ``uuid4().hex`` rather than a Postgres
-        ``uuid``: reverting the column type puts a ``-`` back in the value, and
-        ``^[A-Za-z0-9_]+$`` rejects it.  Without this, the migration looks like
-        cosmetics.
+    def test_hyphenated_provider_id_cannot_be_emitted(self):
+        """Construction fails on the charset rule — it is no longer possible to serialize it.
+
+        Pins why ``provider_id`` is ``uuid4().hex`` in a ``varchar`` column: put a
+        ``-`` back and the entry cannot be built, rather than being built and
+        rejected downstream by a router.
         """
         p = _make_provider(provider_id="5f1c0e3a-9b7d-4e8f-a1c2-b3d4e5f60718")
-        with pytest.raises(AssertionError):
-            validate_against_pinned_schema(PROVIDER_REGISTRATION_SCHEMA, p.to_discovery_dict())
+        with pytest.raises(ValidationError):
+            TMPProviderDiscoveryEntry.from_row(p)
+
+    def test_uid_type_vocabulary_is_enforced_on_a_context_only_row(self):
+        """The leak this type closed: the enum applies with no ``identity_match`` condition.
+
+        The schema refs ``enums/uid-type.json`` on ``uid_types.items``
+        unconditionally, so a context-only provider carrying a bogus uid type is a
+        row the wire rejects — previously accepted, because the vocabulary check
+        lived inside ``if self.identity_match:`` (#1197 review).
+        """
+        p = _make_provider(context_match=True, identity_match=False, uid_types=["not_a_uid_type"])
+        with pytest.raises(ValidationError):
+            TMPProviderDiscoveryEntry.from_row(p)
+
+    def test_identity_row_without_dimensions_cannot_be_emitted(self):
+        """The schema's if/then, which a TypedDict could not express at all.
+
+        A legacy ``identity_match`` row with no countries/uid_types is
+        unrepresentable at any serialization; the route drops and logs it rather
+        than publishing it (see TestDiscoverySkipsUnrepresentableRows).
+        """
+        p = _make_provider(context_match=False, identity_match=True, countries=None, uid_types=None)
+        with pytest.raises(ValidationError):
+            TMPProviderDiscoveryEntry.from_row(p)
+
+
+class TestAdminSerializer:
+    """``to_admin_dict()`` is the Jinja-facing shape and must not adopt the wire's rules."""
 
     def test_admin_dict_keeps_name_and_null_conditionals(self):
         """The admin shape carries `name` and all three conditional keys, `None` included.
@@ -545,8 +574,8 @@ class TestTMPProviderSerializers:
         assert result["uid_types"] is None
         assert result["properties"] is None
 
-    def test_discovery_endpoint_uses_the_wire_serializer(self, client):
-        """The route serializes with to_discovery_dict(), not the admin shape."""
+    def test_discovery_endpoint_emits_the_wire_entry_not_the_admin_shape(self, client):
+        """The route publishes the SDK entry, so `name` is absent from the response."""
         tenant = _make_tenant()
         providers = [_make_provider(name="Admin Only Label", countries=None, uid_types=None, properties=None)]
 
