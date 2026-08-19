@@ -14,6 +14,8 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import httpx
@@ -126,6 +128,36 @@ class TestCheckProviderHealth:
         )
 
 
+@asynccontextmanager
+async def _run_tick(providers: list, *, probe: Any):
+    """Arrange the four patches ``tick()`` needs, run it, and yield the mocks.
+
+    The same four-patch block (read session, repository, write UoW, probe) was
+    re-typed in seven tests, so a change to the scheduler's dependencies meant
+    seven edits (#1197 review).
+
+    ``probe`` is what ``_check_provider_health`` returns — a value, a list of
+    per-provider values, or an exception — mirroring ``AsyncMock``'s
+    return_value/side_effect. Yields ``(mock_repo, mock_check)``: the write
+    repository and the probe, which is what every caller asserts on.
+    """
+    mock_repo = MagicMock()
+    probe_mock = AsyncMock(side_effect=probe) if isinstance(probe, list | Exception) else AsyncMock(return_value=probe)
+
+    with (
+        patch(
+            "src.services.tmp_health_scheduler.get_db_session",
+            return_value=_make_db_context(MagicMock()),
+        ),
+        patch("src.services.tmp_health_scheduler.TMPProviderRepository") as mock_repo_cls,
+        patch("src.services.tmp_health_scheduler.TMPProviderUoW", _make_tmp_repo_uow(mock_repo)),
+        patch("src.services.tmp_health_scheduler._check_provider_health", new=probe_mock),
+    ):
+        mock_repo_cls.get_all_syncable.return_value = providers
+        await TMPHealthScheduler().tick()
+        yield mock_repo, probe_mock
+
+
 class TestCheckAllProviders:
     """tick() polls every active/draining provider and persists results."""
 
@@ -135,26 +167,8 @@ class TestCheckAllProviders:
         provider_a = _make_mock_provider(provider_id="prov_a", tenant_id="tenant-1", endpoint="https://a.example.com")
         provider_b = _make_mock_provider(provider_id="prov_b", tenant_id="tenant-2", endpoint="https://b.example.com")
 
-        mock_session_read = MagicMock()
-        mock_repo = MagicMock()
-        mock_uow_cls = _make_tmp_repo_uow(mock_repo)
-
-        with (
-            patch(
-                "src.services.tmp_health_scheduler.get_db_session",
-                return_value=_make_db_context(mock_session_read),
-            ),
-            patch("src.services.tmp_health_scheduler.TMPProviderRepository") as mock_repo_cls,
-            patch("src.services.tmp_health_scheduler.TMPProviderUoW", mock_uow_cls),
-            patch(
-                "src.services.tmp_health_scheduler._check_provider_health",
-                new=AsyncMock(side_effect=["unhealthy", "error"]),
-            ) as mock_check,
-        ):
-            mock_repo_cls.get_all_syncable.return_value = [provider_a, provider_b]
-
-            scheduler = TMPHealthScheduler()
-            await scheduler.tick()
+        async with _run_tick([provider_a, provider_b], probe=["unhealthy", "error"]) as (mock_repo, mock_check):
+            pass
 
         # Verify probes were called with correct endpoints
         mock_check.assert_has_calls(
@@ -180,26 +194,8 @@ class TestCheckAllProviders:
             provider_id="prov_healthy", tenant_id="tenant-1", endpoint="https://healthy.example.com"
         )
 
-        mock_session_read = MagicMock()
-        mock_repo = MagicMock()
-        mock_uow_cls = _make_tmp_repo_uow(mock_repo)
-
-        with (
-            patch(
-                "src.services.tmp_health_scheduler.get_db_session",
-                return_value=_make_db_context(mock_session_read),
-            ),
-            patch("src.services.tmp_health_scheduler.TMPProviderRepository") as mock_repo_cls,
-            patch("src.services.tmp_health_scheduler.TMPProviderUoW", mock_uow_cls),
-            patch(
-                "src.services.tmp_health_scheduler._check_provider_health",
-                new=AsyncMock(return_value="healthy"),
-            ),
-        ):
-            mock_repo_cls.get_all_syncable.return_value = [provider]
-
-            scheduler = TMPHealthScheduler()
-            await scheduler.tick()
+        async with _run_tick([provider], probe="healthy") as (mock_repo, _):
+            pass
 
         mock_repo.update_health_status.assert_called_once_with("prov_healthy", "healthy")
 
@@ -282,7 +278,9 @@ class TestCheckAllProviders:
         mock_uow_cls = _make_tmp_repo_uow(mock_repo)
 
         # _check_provider_health already maps all exceptions to "error",
-        # but simulate a raw exception escaping to test the gather guard.
+        # but simulate a raw exception escaping to test the gather guard. This test
+        # keeps its own arrange block because the probe must branch on the endpoint,
+        # which _run_tick's value/list/exception forms deliberately do not model.
         async def probe_side_effect(endpoint: str) -> str:
             if "bad" in endpoint:
                 raise OSError("DNS failure")

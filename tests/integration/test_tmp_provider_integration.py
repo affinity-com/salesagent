@@ -45,6 +45,7 @@ from starlette.testclient import TestClient
 from src.routes.tmp_providers import PROVIDER_REGISTRATION_SCHEMA
 from tests.factories import MediaBuyFactory, MediaPackageFactory, PrincipalFactory, TenantFactory, TMPProviderFactory
 from tests.harness._base import IntegrationEnv
+from tests.helpers.admin_client import make_super_admin_client
 from tests.helpers.envelope_assertions import assert_envelope_shape
 from tests.helpers.pinned_schema import validate_against_pinned_schema
 from tests.helpers.tmp_provider_http import make_mock_http_client
@@ -123,6 +124,139 @@ class TestDiscoveryReturnsActiveProviders:
 
         for entry in data["providers"]:
             validate_against_pinned_schema(PROVIDER_REGISTRATION_SCHEMA, entry)
+
+
+class TestAdminWriteReachesTheDiscoveryContract:
+    """The round trip: an operator registers a provider, the contract publishes it.
+
+    Invariant 2 spans two layers, and until now nothing owned the seam between
+    them. The admin-write tests assert on the kwargs handed to
+    ``create_from_fields`` with the UoW mocked, and the discovery tests validate
+    the entry from factory-built rows with the UoW mocked — so the actual write and
+    the actual read of what was written were mocked on both sides, and their
+    agreement was a coincidence maintained by two mocks agreeing on a signature.
+    That is the gap through which a hyphenated ``provider_id`` shipped every entry
+    in a schema-rejecting shape for eighteen rounds (#1197 review).
+
+    Real Flask client, real form POST, real Postgres, real discovery request, every
+    published entry validated against the pinned schema.
+    """
+
+    _FORM = {
+        "name": "Round Trip Provider",
+        "endpoint": "https://roundtrip.example.com/tmp",
+        "context_match": "on",
+        "identity_match": "on",
+        "countries": "US, DE",
+        "uid_types": "uid2,id5",
+        "timeout_ms": "250",
+        "priority": "3",
+        "status": "active",
+    }
+
+    def test_form_registration_is_published_and_schema_valid(self, integration_db):
+        with _TMPEnv() as env:
+            tenant = TenantFactory(tenant_id="tmp_roundtrip")
+            principal = PrincipalFactory(tenant=tenant)
+            env._commit_factory_data()
+            token = principal.access_token
+
+        admin = make_super_admin_client()
+        with (
+            patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}),
+            # The record's SSRF check resolves DNS; stub the resolution (not the
+            # check) so production's real guard still runs, against a public IP.
+            patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"),
+        ):
+            posted = admin.post("/tenant/tmp_roundtrip/tmp-providers/add", data=self._FORM, follow_redirects=False)
+        # A rejected form redirects back to /add; a successful one to the list.
+        assert posted.status_code == 302, posted.data
+        assert "/add" not in posted.headers["Location"], "the form rejected a valid registration"
+
+        response = _get_discovery("tmp_roundtrip", token)
+
+        assert response.status_code == 200, response.text
+        providers = response.json()["providers"]
+        assert len(providers) == 1, f"expected the registered provider on the wire, got {providers}"
+        entry = providers[0]
+
+        # The whole point: what the admin layer wrote is what the contract can
+        # publish, graded by the schema itself.
+        validate_against_pinned_schema(PROVIDER_REGISTRATION_SCHEMA, entry)
+
+        # Values the form owns, as they must appear on the machine wire. Whitespace
+        # around the CSV entries is form shape (the blueprint strips it); the
+        # ``^[A-Z]{2}$`` charset is the record's rule, which is why the input here
+        # is already uppercase — dropping the blueprint's `upper=True` moved
+        # normalization out of the form, so a lowercase code is now REJECTED rather
+        # than silently corrected (asserted below).
+        assert entry["countries"] == ["US", "DE"]
+        assert entry["uid_types"] == ["uid2", "id5"]
+        assert entry["timeout_ms"] == 250
+        assert entry["priority"] == 3
+        assert entry["identity_match"] is True
+        # `name` is admin-only and must never cross to the machine wire.
+        assert "name" not in entry
+
+    def test_lowercase_country_is_rejected_not_normalized(self, integration_db):
+        """The blueprint no longer uppercases, so the record's charset rule is what applies.
+
+        Round 18 moved the ``^[A-Z]{2}$`` rule onto the record and dropped the
+        form helper's ``upper=True``, which was the only thing anywhere moving a
+        country code toward the pattern — a domain rule stranded in a form helper
+        that the second write surface inherited nothing of. The consequence is
+        visible here: a lowercase code is rejected with a message naming the field,
+        the index and the value, rather than silently corrected.
+        """
+        with _TMPEnv() as env:
+            tenant = TenantFactory(tenant_id="tmp_roundtrip_lower")
+            PrincipalFactory(tenant=tenant)
+            env._commit_factory_data()
+
+        admin = make_super_admin_client()
+        with (
+            patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}),
+            patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"),
+        ):
+            posted = admin.post(
+                "/tenant/tmp_roundtrip_lower/tmp-providers/add",
+                data={**self._FORM, "countries": "us, de"},
+                follow_redirects=True,
+            )
+
+        assert posted.status_code == 200
+        assert b"countries[0]" in posted.data, "the flash must name which CSV entry was rejected"
+
+    def test_form_rejection_publishes_nothing(self, integration_db):
+        """The falsifiable half: a rejected form leaves the contract empty.
+
+        Without this, "the write reaches the wire" could pass on a fixture row
+        rather than on the row the form actually created.
+        """
+        with _TMPEnv() as env:
+            tenant = TenantFactory(tenant_id="tmp_roundtrip_bad")
+            principal = PrincipalFactory(tenant=tenant)
+            env._commit_factory_data()
+            token = principal.access_token
+
+        admin = make_super_admin_client()
+        with (
+            patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}),
+            patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"),
+        ):
+            # identity_match with no countries — rejected by the record.
+            posted = admin.post(
+                "/tenant/tmp_roundtrip_bad/tmp-providers/add",
+                data={**self._FORM, "countries": ""},
+                follow_redirects=False,
+            )
+        assert posted.status_code == 302
+        assert "/add" in posted.headers["Location"], "an invalid registration must bounce back to the form"
+
+        response = _get_discovery("tmp_roundtrip_bad", token)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["providers"] == []
 
 
 class TestDiscoveryAuth:

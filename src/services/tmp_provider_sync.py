@@ -428,8 +428,14 @@ def _post_packages_sync(
 ) -> None:
     """POST /packages/sync to a single TMP Provider endpoint.
 
-    Sends the full list as a JSON array.  The TMP Provider's handler accepts
-    both a single object and an array (see handlers_packages.go).
+    Sends the full list as a JSON array.  The pinned spec is deliberately SILENT
+    on this framing — the sync transport between a seller agent and a provider is
+    deployment-specific, and ``available-package.json`` types one package, not the
+    envelope around it.  So the array is this deployment's choice, not a spec
+    requirement, and the previous citation of ``handlers_packages.go`` named a file
+    in another repository as the authority for it: unverifiable from here, and it
+    obscured the more useful fact that nothing in the spec constrains it
+    (#1197 review).
 
     Auth: Bearer token — when auth_credentials is set, sends
     ``Authorization: Bearer <credentials>``.  The TMP Provider resolves
