@@ -217,15 +217,11 @@ class TestGetAdcpCapabilitiesWithTenant:
         current_tenant.set(mock_tenant)
 
         try:
-            # Mock TenantConfigUoW to avoid actual DB calls
-            mock_repo = MagicMock()
-            mock_repo.list_publisher_partners.return_value = []
-            mock_uow = MagicMock()
-            mock_uow.__enter__ = MagicMock(return_value=mock_uow)
-            mock_uow.__exit__ = MagicMock(return_value=False)
-            mock_uow.tenant_config = mock_repo
-
-            with patch("src.core.tools.capabilities.TenantConfigUoW", return_value=mock_uow):
+            # Through the shared helper: it is the one declaration of the patch
+            # set every capabilities test needs, and it includes the TMP
+            # experimental-features read. Hand-rolling a TenantConfigUoW patch
+            # here left that read hitting Postgres (#1197 review).
+            with _patch_capabilities_deps():
                 from tests.factories import PrincipalFactory
 
                 identity = PrincipalFactory.make_identity(
@@ -296,14 +292,7 @@ class TestGetAdcpCapabilitiesWithTenant:
                 us_zip=True,
             )
 
-            mock_repo = MagicMock()
-            mock_repo.list_publisher_partners.return_value = []
-            mock_uow = MagicMock()
-            mock_uow.__enter__ = MagicMock(return_value=mock_uow)
-            mock_uow.__exit__ = MagicMock(return_value=False)
-            mock_uow.tenant_config = mock_repo
-
-            with patch("src.core.tools.capabilities.TenantConfigUoW", return_value=mock_uow):
+            with _patch_capabilities_deps(adapter=mock_adapter):
                 from tests.factories import PrincipalFactory
 
                 identity = PrincipalFactory.make_identity(
@@ -526,17 +515,10 @@ class TestGracefulDegradation:
 
         identity = _make_capabilities_identity()
 
-        mock_repo = MagicMock()
-        mock_repo.list_publisher_partners.return_value = []
-        mock_uow = MagicMock()
-        mock_uow.__enter__ = MagicMock(return_value=mock_uow)
-        mock_uow.__exit__ = MagicMock(return_value=False)
-        mock_uow.tenant_config = mock_repo
-
+        # The shared helper carries the TMP experimental-features patch too; the
+        # adapter fault is the only thing this test injects itself.
         with (
-            patch("src.core.tools.capabilities.TenantConfigUoW", return_value=mock_uow),
-            patch("src.core.tools.capabilities.log_tool_activity"),
-            patch("src.core.tools.capabilities.get_principal_object", return_value=MagicMock()),
+            _patch_capabilities_deps(),
             patch("src.core.tools.capabilities.get_adapter", side_effect=Exception("Adapter init failed")),
         ):
             response = _get_adcp_capabilities_impl(None, identity)
@@ -553,9 +535,12 @@ class TestGracefulDegradation:
             tenant={"tenant_id": "t1", "name": "Test", "subdomain": "testpub"},
         )
 
+        # TenantConfigUoW must RAISE here, so this test keeps its own patch for it
+        # and layers the shared set underneath for everything else (including the
+        # TMP read, which would otherwise reach for Postgres).
         with (
+            _patch_capabilities_deps(),
             patch("src.core.tools.capabilities.TenantConfigUoW", side_effect=Exception("DB down")),
-            patch("src.core.tools.capabilities.log_tool_activity"),
             patch("src.core.tools.capabilities.get_principal_object", return_value=None),
         ):
             response = _get_adcp_capabilities_impl(None, identity)

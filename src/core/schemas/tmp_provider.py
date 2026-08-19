@@ -52,7 +52,7 @@ SDK enums and pinned against the library model by
 from __future__ import annotations
 
 import logging
-from typing import Annotated, TypedDict
+from typing import Annotated, TypedDict, cast
 from uuid import UUID
 
 from adcp.types.generated_poc.enums.uid_type import UidType
@@ -66,6 +66,7 @@ from adcp.types.generated_poc.trusted_match.provider_registration import (
 from pydantic import (
     AfterValidator,
     AnyUrl,
+    ConfigDict,
     Field,
     RootModel,
     StringConstraints,
@@ -150,14 +151,21 @@ class TMPProviderValidationError(ValueError):
     """
 
 
-class TMPProviderFields(TypedDict, total=False):
+class TMPProviderFields(TypedDict):
     """The twelve persisted TMP provider fields, as a static kwargs contract.
 
-    ``total=False`` because the update path writes a subset (``auth_credentials``
-    is only included when the operator submitted a new value).  Used via
-    ``**Unpack[TMPProviderFields]`` on the repository write methods so a typo
-    (``timout_ms``, ``contry``) is a type error at the call site rather than a
+    Used via ``**Unpack[TMPProviderFields]`` on the repository write methods so a
+    typo (``timout_ms``, ``contry``) is a type error at the call site rather than a
     ``ValueError`` raised when the write finally runs.
+
+    **Total**, with ``auth_credentials`` the one ``NotRequired`` key. It was
+    ``total=False``, which meant ``create_from_fields()`` with no fields at all
+    type-checked clean — so the required half of the contract its docstring claims
+    did not exist, and a missing ``name``/``endpoint`` surfaced as an
+    ``IntegrityError`` at flush. One key's optionality had been paid for by
+    dropping the contract on all twelve (#1197 review). ``auth_credentials`` is
+    the only key ``to_update_fields`` drops, to preserve a stored credential when
+    the operator leaves the field blank.
 
     Mirrors :class:`TMPProviderRegistration`'s field set; the two are pinned
     equal by ``test_tmp_provider_registration.py`` so they cannot drift.
@@ -221,42 +229,50 @@ class _IdentityMatchEntry(LibraryIdentityMatchRegistration):
 class TMPProviderDiscoveryEntry(RootModel[_ContextMatchEntry | _IdentityMatchEntry]):
     """One provider entry on the discovery wire — the SDK's own wire type.
 
-    Extends the pinned codegen of ``provider-registration.json``
-    (:data:`src.routes.tmp_providers.PROVIDER_REGISTRATION_SCHEMA`) instead of
-    restating its closed key set as a ``TypedDict``, per CLAUDE.md Pattern #1.
-    The sibling sync payload already did this — ``_build_package_payload`` builds
-    through ``AvailablePackage`` so "a spec bump that renames or adds a required
-    field becomes a construction error" — and this entry, the payload that
-    actually crosses the service boundary, did the opposite (#1197 review).
+        Extends the pinned codegen of ``provider-registration.json``
+        (:data:`src.routes.tmp_providers.PROVIDER_REGISTRATION_SCHEMA`) instead of
+        restating its closed key set as a ``TypedDict``, per CLAUDE.md Pattern #1.
+        The sibling sync payload already did this — ``_build_package_payload`` builds
+        through ``AvailablePackage`` so "a spec bump that renames or adds a required
+        field becomes a construction error" — and this entry, the payload that
+        actually crosses the service boundary, did the opposite (#1197 review).
 
-    What the model carries that a ``TypedDict`` could not, and which therefore
-    stopped being re-implemented by hand:
+        What the model carries that a ``TypedDict`` could not, and which therefore
+        stopped being re-implemented by hand:
 
-      - ``uid_types: list[UidType]`` — the enum, **unconditionally**. The local
-        copy checked the vocabulary only under ``if identity_match:``, while the
-        schema refs ``enums/uid-type.json`` on ``uid_types.items`` with no
-        condition, so a context-only provider could persist a row the wire
-        rejects.
-      - ``countries: list[Country]`` (``^[A-Z]{2}$``), ``properties: list[UUID]``,
-        ``timeout_ms`` 5..5000, ``priority`` >= 0, ``provider_id``
-        ``^[A-Za-z0-9_]+$``.
-      - the schema's ``if/then`` (``identity_match ⇒ countries + uid_types``) and
-        its ``anyOf`` over the two match modes — expressed as the union of the two
-        branch variants, which is exactly what the schema says and what a
-        ``TypedDict`` cannot say at all.
+          - ``uid_types: list[UidType]`` — the enum, **unconditionally**. The local
+            copy checked the vocabulary only under ``if identity_match:``, while the
+            schema refs ``enums/uid-type.json`` on ``uid_types.items`` with no
+            condition, so a context-only provider could persist a row the wire
+            rejects.
+          - ``countries: list[Country]`` (``^[A-Z]{2}$``), ``properties: list[UUID]``,
+            ``timeout_ms`` 5..5000, ``priority`` >= 0, ``provider_id``
+            ``^[A-Za-z0-9_]+$``.
+          - the schema's ``if/then`` (``identity_match ⇒ countries + uid_types``) and
+            its ``anyOf`` over the two match modes — expressed as the union of the two
+            branch variants, which is exactly what the schema says and what a
+            ``TypedDict`` cannot say at all.
 
-    Emission is therefore construction: :meth:`from_row` raises on a row that
-    cannot be represented conformantly, at the boundary, instead of serializing
-    it and leaving a strict router to reject it.
+        Emission is therefore construction: :meth:`from_row` raises on a row that
+        cannot be represented conformantly, at the boundary, instead of serializing
+        it and leaving a strict router to reject it.
 
-    One wire-visible consequence of the SDK typing ``endpoint`` as ``AnyUrl``:
-    pydantic canonicalizes it, so a stored ``http://host:3003`` publishes as
-    ``http://host:3003/``. This is conformant and semantically identical — the
-    schema states that two registrations "differing only in case, default port,
-    or path-slash collapsing are the same provider" — and the outbound side is
-    unaffected because ``provider_url()`` strips the trailing slash before
-    appending ``/packages/sync``.
+        One wire-visible consequence of the SDK typing ``endpoint`` as ``AnyUrl``:
+        pydantic canonicalizes it, so a stored ``http://host:3003`` publishes as
+        ``http://host:3003/``. This is conformant and semantically identical — the
+        schema states that two registrations "differing only in case, default port,
+        or path-slash collapsing are the same provider" — and the outbound side is
+        unaffected because ``provider_url()`` strips the trailing slash before
+        appending ``/packages/sync``.
+
+    The extra-field policy (Pattern #7) is carried by the two branch variants,
+        which inherit ``extra="forbid"`` from the pinned codegen — pydantic rejects
+        ``extra`` on a ``RootModel`` itself. ``frozen=True`` is the wrapper's own
+        declared policy and a real property of the value: an entry is built from a row
+        at the boundary and published, never mutated afterwards.
     """
+
+    model_config = ConfigDict(frozen=True)
 
     @classmethod
     def from_row(cls, row: object) -> TMPProviderDiscoveryEntry:
@@ -401,33 +417,43 @@ class TMPProviderRegistration(SalesAgentBaseModel):
             raise TMPProviderValidationError(_first_error_message(exc)) from exc
 
     def to_fields(self) -> TMPProviderFields:
-        """Return the persisted field set for ``create_from_fields(**…)``."""
-        return TMPProviderFields(
-            name=self.name,
-            endpoint=self.endpoint,
-            context_match=self.context_match,
-            identity_match=self.identity_match,
-            countries=self.countries,
-            uid_types=[str(u) for u in self.uid_types] if self.uid_types else None,
-            properties=self.properties,
-            timeout_ms=self.timeout_ms,
-            priority=self.priority,
-            status=self.status,
-            auth_type=self.auth_type,
-            auth_credentials=self.auth_credentials,
-        )
+        """Return the persisted field set for ``create_from_fields(**…)``.
+
+        Derived from the model rather than re-listing the twelve names: the field
+        set was transcribed at four sites (the model, ``TMPProviderFields``, this
+        method, and the test suite's ``_VALID``), and only the first two were
+        pinned equal — so adding a field to both and forgetting this method still
+        passed while the field silently never reached the repository
+        (#1197 review).
+
+        ``mode="json"`` is what turns the ``UidType`` members into the plain
+        strings the ``JSONType`` column stores.  ``exclude_none=False`` is load
+        bearing and NOT the default on this base: the persisted contract is all
+        twelve keys, and a dropped ``countries: None`` would mean "leave the column
+        as it is" on the update path — so clearing a provider's country list
+        through the edit form would silently keep the old value.
+        """
+        return cast(TMPProviderFields, self.model_dump(mode="json", exclude_none=False))
 
     def to_update_fields(self, *, include_credentials: bool) -> TMPProviderFields:
         """Return the field set for ``update_fields(provider_id, **…)``.
 
         ``auth_credentials`` is omitted unless *include_credentials* is true, so
         an edit that leaves the credential field blank preserves the stored
-        (encrypted) value rather than overwriting it with ``None``.
+        (encrypted) value rather than overwriting it with ``None``.  It is the one
+        ``NotRequired`` key on :class:`TMPProviderFields` precisely so this is
+        expressible without loosening the other eleven.
+
+        Built by exclusion at the dump rather than by deleting a key afterwards: a
+        ``NotRequired`` key still cannot be ``del``-eted from a TypedDict, and
+        ``exclude`` says the intent at the point the payload is produced.
         """
-        fields = self.to_fields()
-        if not include_credentials:
-            fields.pop("auth_credentials", None)
-        return fields
+        if include_credentials:
+            return self.to_fields()
+        return cast(
+            TMPProviderFields,
+            self.model_dump(mode="json", exclude_none=False, exclude={"auth_credentials"}),
+        )
 
 
 def _first_error_message(exc: ValidationError) -> str:

@@ -27,3 +27,16 @@ Feature: TMP package sync — registered providers receive package data (local)
     Given the Buyer Agent created a media buy whose packages were delivered
     When the Buyer Agent updates that media buy
     Then the provider receives the packages for that media buy a second time
+
+  @T-TMP-SYNC-no-credential @trusted_match @experimental
+  Scenario: a provider registered without a credential receives no Authorization header
+    When the Buyer Agent creates a media buy
+    Then the provider receives the packages for that media buy
+    And the delivery carries no credential
+
+  @T-TMP-SYNC-credential @trusted_match @experimental
+  Scenario: a credentialed provider receives the credential as a Bearer header
+    Given a TMP provider with a credential is registered for the tenant
+    When the Buyer Agent creates a media buy
+    Then the provider receives the packages for that media buy
+    And the delivery carries the provider's credential

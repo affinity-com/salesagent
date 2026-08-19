@@ -37,7 +37,7 @@ beads: salesagent-tmp-sync
 from __future__ import annotations
 
 import os
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from starlette.testclient import TestClient
@@ -47,6 +47,7 @@ from tests.factories import MediaBuyFactory, MediaPackageFactory, PrincipalFacto
 from tests.harness._base import IntegrationEnv
 from tests.helpers.envelope_assertions import assert_envelope_shape
 from tests.helpers.pinned_schema import validate_against_pinned_schema
+from tests.helpers.tmp_provider_http import make_mock_http_client
 
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
 
@@ -60,24 +61,6 @@ class _TMPEnv(IntegrationEnv):
     """Bare integration env for TMP tests — external patches applied inline."""
 
     EXTERNAL_PATCHES: dict[str, str] = {}
-
-
-def _make_mock_http_client(status_code: int = 200) -> MagicMock:
-    """Return a mock httpx.Client context manager whose .post() returns *status_code*.
-
-    Used by SF-3 and SF-4 tests to stub outbound HTTP at the httpx.Client level
-    rather than at _post_packages_sync, so the full sync path (URL construction,
-    auth header, body serialisation) is exercised against real production code.
-    """
-    mock_response = MagicMock()
-    mock_response.status_code = status_code
-    mock_response.raise_for_status = MagicMock(return_value=None)
-
-    mock_client = MagicMock()
-    mock_client.__enter__ = MagicMock(return_value=mock_client)
-    mock_client.__exit__ = MagicMock(return_value=False)
-    mock_client.post.return_value = mock_response
-    return mock_client
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +280,7 @@ class TestSyncPackagesPostsToProviders:
 
         from src.services.tmp_provider_sync import sync_packages_for_media_buy
 
-        mock_client = _make_mock_http_client(200)
+        mock_client = make_mock_http_client(200)
         with (
             patch("src.services.tmp_provider_sync.httpx.Client", return_value=mock_client),
             patch.dict(os.environ, {}, clear=False),

@@ -18,7 +18,6 @@ Usage::
         _make_tmp_repo_uow,
         _make_tmp_uow,
         _mock_cm,
-        make_super_admin_client,
     )
 
     # FastAPI discovery route tests:
@@ -44,7 +43,6 @@ Usage::
     # TenantConfigUoW tests (_resolve_seller_agent_url):
     mock_uow_cls = _make_tenant_config_uow(tenant)
 
-    client = make_super_admin_client()
 """
 
 from __future__ import annotations
@@ -164,24 +162,6 @@ def _make_db_context(session: MagicMock) -> MagicMock:
     ctx.__enter__ = MagicMock(return_value=session)
     ctx.__exit__ = MagicMock(return_value=False)
     return ctx
-
-
-def make_super_admin_client():
-    """Create a Flask test client authenticated as super admin.
-
-    Shared by test_ssrf_url_validator.py and test_tmp_providers_blueprint.py
-    to avoid duplicating the identical app-creation + session-setup block
-    (CLAUDE.md DRY invariant).
-    """
-    from src.admin.app import create_app
-
-    app = create_app({"TESTING": True, "SECRET_KEY": "test-secret", "WTF_CSRF_ENABLED": False})
-    client = app.test_client()
-    with client.session_transaction() as sess:
-        sess["test_user"] = "test_super_admin@example.com"
-        sess["test_user_role"] = "super_admin"
-        sess["authenticated"] = True
-    return client
 
 
 def _make_provider(

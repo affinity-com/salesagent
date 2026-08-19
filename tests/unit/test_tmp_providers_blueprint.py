@@ -27,7 +27,8 @@ import pytest
 from src.admin.blueprints.tmp_providers import _form_render_context
 from src.core.database.models import TMPProvider
 from src.core.schemas.tmp_provider import VALID_STATUSES, VALID_UID_TYPES
-from tests.unit._tmp_helpers import _make_blueprint_uow, _make_mock_provider, make_super_admin_client
+from tests.helpers.admin_client import make_super_admin_client
+from tests.unit._tmp_helpers import _make_blueprint_uow, _make_mock_provider
 
 
 def _make_tmp_provider_client():

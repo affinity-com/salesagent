@@ -16,7 +16,7 @@ import pytest
 
 from src.core.domain_config import is_local_host
 from src.core.security.url_validator import BLOCKED_HOSTNAMES, check_url_ssrf
-from tests.unit._tmp_helpers import make_super_admin_client
+from tests.helpers.admin_client import make_super_admin_client
 
 
 class TestIsLocalHost:

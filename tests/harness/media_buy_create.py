@@ -416,9 +416,25 @@ class MediaBuyCreateEnv(TMPSyncMixin, IntegrationEnv):
         return _ensure_idempotency_key(kwargs)
 
     def __exit__(self, *exc: object) -> bool:
-        """Drain/stop the TMP sync seam before the base env tears sessions down."""
-        self._teardown_tmp_sync()
-        return super().__exit__(*exc)
+        """Drain/stop the TMP sync seam before the base env tears sessions down.
+
+        Guarded, and the base teardown runs either way: ``_teardown_tmp_sync``
+        performs a real DB write (``delete_tmp_providers``), so an exception from
+        it used to skip the base's entire collected-error cleanup chain and leak
+        REST-client overrides, patches and sessions into the next test
+        (#1197 review). The base runs in ``finally``; a teardown failure is
+        re-raised after it, chained with any base error.
+        """
+        teardown_error: Exception | None = None
+        try:
+            self._teardown_tmp_sync()
+        except Exception as exc_info:  # noqa: BLE001 — re-raised below, never swallowed
+            teardown_error = exc_info
+        finally:
+            base_result = super().__exit__(*exc)
+        if teardown_error is not None:
+            raise teardown_error
+        return base_result
 
     def parse_rest_response(self, data: dict[str, Any]) -> CreateMediaBuyResult:
         """Parse a flattened create_media_buy wire body back into a CreateMediaBuyResult.

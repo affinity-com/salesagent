@@ -702,12 +702,18 @@ class TMPSyncMixin:
         """The ``seller_agent.agent_url`` production must put on every package."""
         return f"https://{self.TMP_SELLER_AGENT_HOST}/mcp"
 
-    def register_tmp_provider(self, **fields: Any) -> str:
+    def register_tmp_provider(self, *, auth_credentials: str | None = None, **fields: Any) -> str:
         """Register one active TMP provider pointed at this env's collector.
 
         Starts the collector on first call and replaces any provider rows the
         tenant already had, so the fan-out reaches exactly this endpoint.
         Returns the registered endpoint.
+
+        ``auth_credentials`` is a first-class parameter because the credential is
+        half of the cross-transport claim: a scenario registers a credentialed
+        provider and asserts the ``Authorization`` header arrives, or registers an
+        uncredentialed one and asserts it does not. It is written through the
+        model's encrypting property, so the row is what production would store.
         """
         from tests.factories import plant_seller_agent_host, replace_tmp_providers
 
@@ -718,7 +724,14 @@ class TMPSyncMixin:
         fields.setdefault("name", "Package Sync Collector")
         fields.setdefault("endpoint", collector["endpoint"])
         fields.setdefault("timeout_ms", 2000)
-        replace_tmp_providers(self, tenant_id, **fields)
+        if auth_credentials is not None:
+            # `auth_credentials` is the encrypting property; the factory writes
+            # columns, so set it after construction to exercise the real path.
+            fields.setdefault("auth_type", "bearer")
+        provider = replace_tmp_providers(self, tenant_id, **fields)
+        if auth_credentials is not None:
+            provider.auth_credentials = auth_credentials
+            self.get_session().commit()  # type: ignore[attr-defined]
         return str(fields["endpoint"])
 
     def tmp_sync_deliveries(self) -> list[dict[str, Any]]:
@@ -732,8 +745,20 @@ class TMPSyncMixin:
             return []
         return [e for e in self._tmp_collector["received"] if str(e["path"]).endswith("/packages/sync")]
 
+    #: How long to keep watching AFTER the expected deliveries arrive, before a
+    #: Then step asserts the exact count. Without a settle window, "exactly one"
+    #: is unfalsifiable: a second, duplicate delivery in flight would simply not
+    #: have landed yet (#1197 review).
+    TMP_SYNC_SETTLE_SECONDS = 0.75
+
     def await_tmp_sync(self, count: int = 1, timeout: float = 30.0) -> dict[str, Any]:
-        """Block until *count* package-sync deliveries have arrived; return the last one.
+        """Block until *count* package-sync deliveries have arrived; return the *count*-th.
+
+        This is the LIVENESS signal, so it waits for "at least count" — the
+        correctness signal is the Then step's exact ``len(...) == count``, which is
+        what makes a double-fire fail. Reusing a ``>=`` wait as the assertion let a
+        duplicate delivery pass green on every transport, including the REST
+        double-fire that finding 5's placement argument exists to prevent.
 
         In-process, the production registry gives an exact completion signal, so
         the poll below normally returns on its first iteration. Out-of-process the
@@ -754,7 +779,10 @@ class TMPSyncMixin:
         while True:
             deliveries = self.tmp_sync_deliveries()
             if len(deliveries) >= count:
-                return deliveries[count - 1]
+                # Let any duplicate that is already in flight land, so the caller's
+                # exact-count assertion can see it.
+                time.sleep(self.TMP_SYNC_SETTLE_SECONDS)
+                return self.tmp_sync_deliveries()[count - 1]
             if time.monotonic() >= deadline:
                 paths = [e["path"] for e in self._tmp_collector["received"]]
                 raise AssertionError(
@@ -790,12 +818,28 @@ class TMPSyncMixin:
         from tests.e2e._webhook_capture import WebhookCaptureHandler, run_webhook_capture_server
 
         class _PackageSyncCollector(WebhookCaptureHandler):
-            """Stub TMP provider recording the path and body of each POST."""
+            """Stub TMP provider recording the whole REQUEST it received.
+
+            Method, path, headers and body — because that is what a provider
+            receives, and "identical across transports" is a claim about all four.
+            Recording only path+body left ``Authorization: Bearer <credential>``
+            — the one credential this feature transmits to a third party — graded
+            solely by ``mock_client.post.assert_called_once_with(headers=...)``
+            under a patched ``httpx.Client``, the instrument this PR replaced
+            everywhere else for being unable to see the wire (#1197 review).
+            """
 
             received_webhooks: list[Any] = []
 
             def record(self, payload: Any) -> dict[str, Any]:
-                return {"path": self.path, "body": payload}
+                return {
+                    "method": self.command,
+                    "path": self.path,
+                    # Header names are case-insensitive on the wire; normalize so a
+                    # step asserts on one spelling.
+                    "headers": {name.lower(): value for name, value in self.headers.items()},
+                    "body": payload,
+                }
 
         # Loopback is enough in-process; the e2e server runs in a container and
         # reaches the host via ADCP_WEBHOOK_HOST (in-network) or
