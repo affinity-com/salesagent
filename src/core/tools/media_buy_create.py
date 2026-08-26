@@ -3692,6 +3692,13 @@ async def _create_media_buy_impl(
                         "creative_ids": getattr(resp_package, "creative_ids", None),
                         "creative_assignments": getattr(resp_package, "creative_assignments", None),
                         "format_ids_to_provide": getattr(resp_package, "format_ids_to_provide", None),
+                        # The REQUEST's eligible formats for this package. The
+                        # approval path already persists this key; this path did
+                        # not, so the value existed on some rows and not others —
+                        # and the TMP package sync, which puts it on the wire as
+                        # available-package.json's `format_ids`, could never find
+                        # it for a normally-created buy (#1197 review).
+                        "format_ids": getattr(request_pkg, "format_ids", None) if request_pkg else None,
                         "paused": paused,  # Store paused state (adcp 2.12.0)
                         "pricing_info": pricing_info_for_package,  # Store pricing info for UI display
                         "impressions": impressions,  # Store impressions for display
@@ -4470,15 +4477,15 @@ async def create_media_buy(
     # to their string values — plain model_dump() preserves typed objects that SQLAlchemy
     # String columns cannot coerce, causing StatementError at flush time.
     pnc_dict = push_notification_config.model_dump(mode="json") if push_notification_config else None
-    result = await _create_media_buy_impl(
-        req=req,
-        push_notification_config=pnc_dict,
-        identity=identity,
-        context_id=_ctx_id,
-        raw_wire_payload=raw_wire_payload,
+    return mcp_result(
+        await _create_media_buy_impl(
+            req=req,
+            push_notification_config=pnc_dict,
+            identity=identity,
+            context_id=_ctx_id,
+            raw_wire_payload=raw_wire_payload,
+        )
     )
-
-    return mcp_result(result)
 
 
 async def create_media_buy_raw(
@@ -4565,15 +4572,13 @@ async def create_media_buy_raw(
         else push_notification_config
     )
 
-    result = await _create_media_buy_impl(
+    return await _create_media_buy_impl(
         req=req,
         push_notification_config=pnc_dict,
         identity=identity,
         context_id=_ctx_id,
         raw_wire_payload=raw_wire_payload,
     )
-
-    return result
 
 
 # Unified update tools

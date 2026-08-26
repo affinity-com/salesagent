@@ -29,10 +29,10 @@ from src.services.tmp_provider_sync import (
 from tests.helpers.pinned_schema import validate_against_pinned_schema
 from tests.helpers.tmp_provider_http import make_mock_http_client
 from tests.unit._tmp_helpers import (
-    _make_mock_package,
-    _make_mock_provider,
-    _make_sync_uow,
-    _make_tenant_config_uow,
+    make_mock_package,
+    make_mock_provider,
+    make_sync_uow,
+    make_tenant_config_uow,
 )
 
 # The only shape ``_resolve_seller_agent_url`` can return besides ``None``: it
@@ -86,7 +86,7 @@ class TestBuildPackagePayload:
         return package.model_dump(mode="json", exclude_none=True)
 
     def _built(self, package_id: str, media_buy_id: str, agent_url: str = _SELLER_AGENT_URL) -> dict:
-        pkg = _make_mock_package(package_id=package_id)
+        pkg = make_mock_package(package_id=package_id)
         built = _build_package_payload(media_buy_id, pkg, agent_url)
         # The builder returns the MODEL — that is what travels through the
         # fan-out, so `Any` never leaves this module (#1197 review).
@@ -120,13 +120,13 @@ class TestBuildPackagePayload:
         one before calling this (``_resolve_seller_agent_url``) and skip the sync
         when they cannot.
         """
-        pkg = _make_mock_package(package_id="pkg-005")
+        pkg = make_mock_package(package_id="pkg-005")
         with pytest.raises(ValueError, match="https"):
             _build_package_payload("mb-500", pkg, "http://agent.example.com/mcp")
 
     def test_package_config_contents_never_reach_the_wire(self):
         """The schema is closed, so nothing from package_config may leak into the body."""
-        pkg = _make_mock_package(
+        pkg = make_mock_package(
             package_id="pkg-003",
             package_config={"product_id": "prod-42", "brand": "Acme Corp", "keywords": ["shoes"]},
         )
@@ -138,7 +138,7 @@ class TestBuildPackagePayload:
 
     def test_handles_none_package_config(self):
         """``package_config=None`` doesn't crash — the body never reads it."""
-        pkg = _make_mock_package(package_id="pkg-004", package_config=None)
+        pkg = make_mock_package(package_id="pkg-004", package_config=None)
         wire = self._wire(_build_package_payload("mb-400", pkg, _SELLER_AGENT_URL))
 
         validate_against_pinned_schema(AVAILABLE_PACKAGE_SCHEMA, wire)
@@ -210,7 +210,7 @@ class TestSellerAgentUrlResolvedBeforeMediaBuyUoW:
 
         mock_resolve.side_effect = lambda *_a, **_kw: call_order.append("resolve_seller_agent_url") or _SELLER_AGENT_URL
 
-        mock_mb_cls, _mock_mb_uow, mock_tp_cls, _mock_tp_uow = _make_sync_uow(packages=[])
+        mock_mb_cls, _mock_mb_uow, mock_tp_cls, _mock_tp_uow = make_sync_uow(packages=[])
         mock_mb_cls.return_value.__enter__ = MagicMock(
             side_effect=lambda: (
                 call_order.append("media_buy_uow_entered")
@@ -236,14 +236,14 @@ class TestSyncSessionClosedBeforeHTTP:
         """The TMPProviderUoW session is closed before _post_packages_sync is called."""
         call_order: list[str] = []
 
-        pkg = _make_mock_package(package_id="pkg-1", package_config={"product_id": "prod-1"})
+        pkg = make_mock_package(package_id="pkg-1", package_config={"product_id": "prod-1"})
 
         provider = MagicMock()
         provider.name = "Provider A"
         provider.endpoint = "http://provider-a:3000"
         provider.auth_credentials = None
 
-        mock_mb_cls, mock_mb_uow, mock_tp_cls, mock_tp_uow = _make_sync_uow(packages=[pkg], providers=[provider])
+        mock_mb_cls, mock_mb_uow, mock_tp_cls, mock_tp_uow = make_sync_uow(packages=[pkg], providers=[provider])
         # Override __exit__ to track session-close order
         mock_mb_cls.return_value.__exit__ = MagicMock(side_effect=lambda *_: call_order.append("mb_session_closed"))
         mock_tp_cls.return_value.__exit__ = MagicMock(side_effect=lambda *_: call_order.append("tp_session_closed"))
@@ -313,12 +313,12 @@ class TestProviderMaterializedBeforeSessionCloses:
     @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
     def test_provider_attributes_read_before_uow_exits(self, mock_resolve, mock_post):
         """Provider fields are captured inside the `with` block, not after."""
-        pkg = _make_mock_package(package_id="pkg-1", package_config={"product_id": "prod-1"})
+        pkg = make_mock_package(package_id="pkg-1", package_config={"product_id": "prod-1"})
 
         closed_flag = [False]
         provider = self._DetachAfterCloseProvider("Provider A", "http://provider-a:3000", "secret", closed_flag)
 
-        mock_mb_cls, _mock_mb_uow, mock_tp_cls, mock_tp_uow = _make_sync_uow(packages=[pkg], providers=[provider])
+        mock_mb_cls, _mock_mb_uow, mock_tp_cls, mock_tp_uow = make_sync_uow(packages=[pkg], providers=[provider])
 
         def _mark_closed(*_args):
             closed_flag[0] = True
@@ -354,7 +354,7 @@ class TestSyncPackagesFanOut:
     @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
     def test_fans_out_to_all_providers(self, mock_resolve, mock_post):
         """Packages are POSTed to every syncable provider."""
-        pkg = _make_mock_package(package_id="pkg-1", package_config={"product_id": "prod-1", "name": "Test"})
+        pkg = make_mock_package(package_id="pkg-1", package_config={"product_id": "prod-1", "name": "Test"})
 
         provider1 = MagicMock()
         provider1.name = "Provider A"
@@ -365,7 +365,7 @@ class TestSyncPackagesFanOut:
         provider2.endpoint = "http://provider-b:3000"
         provider2.auth_credentials = None
 
-        mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = _make_sync_uow(packages=[pkg], providers=[provider1, provider2])
+        mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = make_sync_uow(packages=[pkg], providers=[provider1, provider2])
         with (
             patch("src.services.tmp_provider_sync.MediaBuyUoW", mock_mb_cls),
             patch("src.services.tmp_provider_sync.TMPProviderUoW", mock_tp_cls),
@@ -387,7 +387,7 @@ class TestSyncPackagesFanOut:
     @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
     def test_skips_when_no_packages(self, mock_resolve, mock_post):
         """No HTTP calls when media buy has no packages."""
-        mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = _make_sync_uow(packages=[])
+        mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = make_sync_uow(packages=[])
         with (
             patch("src.services.tmp_provider_sync.MediaBuyUoW", mock_mb_cls),
             patch("src.services.tmp_provider_sync.TMPProviderUoW", mock_tp_cls),
@@ -400,9 +400,9 @@ class TestSyncPackagesFanOut:
     @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
     def test_skips_when_no_providers(self, mock_resolve, mock_post):
         """No HTTP calls when tenant has no syncable providers."""
-        pkg = _make_mock_package(package_id="pkg-1", package_config={})
+        pkg = make_mock_package(package_id="pkg-1", package_config={})
 
-        mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = _make_sync_uow(packages=[pkg], providers=[])
+        mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = make_sync_uow(packages=[pkg], providers=[])
         with (
             patch("src.services.tmp_provider_sync.MediaBuyUoW", mock_mb_cls),
             patch("src.services.tmp_provider_sync.TMPProviderUoW", mock_tp_cls),
@@ -415,7 +415,7 @@ class TestSyncPackagesFanOut:
     @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
     def test_one_provider_failure_does_not_block_others(self, mock_resolve, mock_post):
         """If one provider fails, the others still get called."""
-        pkg = _make_mock_package(package_id="pkg-1", package_config={})
+        pkg = make_mock_package(package_id="pkg-1", package_config={})
 
         provider1 = MagicMock()
         provider1.name = "Failing Provider"
@@ -424,7 +424,7 @@ class TestSyncPackagesFanOut:
         provider2.name = "Working Provider"
         provider2.endpoint = "http://ok:3000"
 
-        mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = _make_sync_uow(packages=[pkg], providers=[provider1, provider2])
+        mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = make_sync_uow(packages=[pkg], providers=[provider1, provider2])
         # First call raises, second succeeds
         mock_post.side_effect = [httpx.ConnectError("refused"), None]
 
@@ -441,7 +441,7 @@ class TestSyncPackagesFanOut:
     @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
     def test_package_load_failure_returns_early(self, mock_resolve, mock_post):
         """If loading packages fails, no HTTP calls are made."""
-        mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = _make_sync_uow()
+        mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = make_sync_uow()
         mock_mb_cls.return_value.__enter__ = MagicMock(side_effect=RuntimeError("DB connection failed"))
 
         with (
@@ -475,16 +475,16 @@ class TestOneUnreadableCredentialDoesNotSkipTheRest:
     def test_healthy_providers_still_receive_packages(self, mock_resolve, mock_post):
         from src.core.exceptions import AdCPConfigurationError
 
-        pkg = _make_mock_package(package_id="pkg-1")
+        pkg = make_mock_package(package_id="pkg-1")
 
-        rotated = _make_mock_provider(
+        rotated = make_mock_provider(
             name="Rotated Provider",
             endpoint="http://rotated:3000",
             credential=AdCPConfigurationError("Failed to decrypt auth credentials for TMP provider p1"),
         )
-        healthy = _make_mock_provider(name="Healthy Provider", endpoint="http://healthy:3000", credential="tok")
+        healthy = make_mock_provider(name="Healthy Provider", endpoint="http://healthy:3000", credential="tok")
 
-        mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = _make_sync_uow(packages=[pkg], providers=[rotated, healthy])
+        mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = make_sync_uow(packages=[pkg], providers=[rotated, healthy])
         with (
             patch("src.services.tmp_provider_sync.MediaBuyUoW", mock_mb_cls),
             patch("src.services.tmp_provider_sync.TMPProviderUoW", mock_tp_cls),
@@ -503,14 +503,14 @@ class TestOneUnreadableCredentialDoesNotSkipTheRest:
 
         from src.core.exceptions import AdCPConfigurationError
 
-        pkg = _make_mock_package(package_id="pkg-1")
-        rotated = _make_mock_provider(
+        pkg = make_mock_package(package_id="pkg-1")
+        rotated = make_mock_provider(
             name="Rotated Provider",
             endpoint="http://rotated:3000",
             credential=AdCPConfigurationError("boom"),
         )
 
-        mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = _make_sync_uow(packages=[pkg], providers=[rotated])
+        mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = make_sync_uow(packages=[pkg], providers=[rotated])
         with (
             patch("src.services.tmp_provider_sync.MediaBuyUoW", mock_mb_cls),
             patch("src.services.tmp_provider_sync.TMPProviderUoW", mock_tp_cls),
@@ -591,7 +591,7 @@ class TestResolveSellAgentUrl:
         tenant = MagicMock()
         tenant.virtual_host = None
         tenant.subdomain = None
-        mock_uow_cls = _make_tenant_config_uow(tenant)
+        mock_uow_cls = make_tenant_config_uow(tenant)
 
         with patch("src.services.tmp_provider_sync.TenantConfigUoW", mock_uow_cls):
             with patch.dict("os.environ", {"ADCP_AGENT_URL": "http://insecure.agent.com/mcp"}):
@@ -604,7 +604,7 @@ class TestResolveSellAgentUrl:
         tenant = MagicMock()
         tenant.virtual_host = "tenant.salesagent.example.com"
         tenant.subdomain = None
-        mock_uow_cls = _make_tenant_config_uow(tenant)
+        mock_uow_cls = make_tenant_config_uow(tenant)
 
         with patch("src.services.tmp_provider_sync.TenantConfigUoW", mock_uow_cls):
             with patch.dict("os.environ", {"ADCP_AGENT_URL": "http://insecure.agent.com/mcp"}):
@@ -619,7 +619,7 @@ class TestResolveSellAgentUrl:
         tenant = MagicMock()
         tenant.virtual_host = "tenant.salesagent.example.com"
         tenant.subdomain = "tenant"
-        mock_uow_cls = _make_tenant_config_uow(tenant)
+        mock_uow_cls = make_tenant_config_uow(tenant)
 
         with patch("src.services.tmp_provider_sync.TenantConfigUoW", mock_uow_cls):
             with patch.dict("os.environ", {}, clear=False):
@@ -640,7 +640,7 @@ class TestResolveSellAgentUrl:
         tenant = MagicMock()
         tenant.virtual_host = None
         tenant.subdomain = None
-        mock_uow_cls = _make_tenant_config_uow(tenant)
+        mock_uow_cls = make_tenant_config_uow(tenant)
 
         with patch("src.services.tmp_provider_sync.TenantConfigUoW", mock_uow_cls):
             with patch.dict("os.environ", {}, clear=False):
@@ -656,7 +656,7 @@ class TestResolveSellAgentUrl:
         tenant = MagicMock()
         tenant.virtual_host = "tenant.salesagent.example.com"
         tenant.subdomain = None
-        mock_uow_cls = _make_tenant_config_uow(tenant)
+        mock_uow_cls = make_tenant_config_uow(tenant)
 
         with patch("src.services.tmp_provider_sync.TenantConfigUoW", mock_uow_cls):
             with patch.dict("os.environ", {}, clear=False):
@@ -677,7 +677,7 @@ class TestResolveSellAgentUrl:
         tenant = MagicMock()
         tenant.virtual_host = "tenant.sales-agent.localhost:8001"
         tenant.subdomain = None
-        mock_uow_cls = _make_tenant_config_uow(tenant)
+        mock_uow_cls = make_tenant_config_uow(tenant)
 
         with patch("src.services.tmp_provider_sync.TenantConfigUoW", mock_uow_cls):
             with patch.dict("os.environ", {}, clear=False):
@@ -697,7 +697,7 @@ class TestResolveSellAgentUrl:
         tenant = MagicMock()
         tenant.virtual_host = "my-localhost-mirror.example.com"
         tenant.subdomain = None
-        mock_uow_cls = _make_tenant_config_uow(tenant)
+        mock_uow_cls = make_tenant_config_uow(tenant)
 
         with patch("src.services.tmp_provider_sync.TenantConfigUoW", mock_uow_cls):
             with patch.dict("os.environ", {}, clear=False):
@@ -793,7 +793,7 @@ class TestPostPackagesSyncAuth:
 
     def test_fan_out_uses_provider_auth_credentials(self):
         """sync_packages_for_media_buy passes provider.auth_credentials to _post_packages_sync."""
-        pkg = _make_mock_package(package_id="pkg-1", package_config={"product_id": "prod-1"})
+        pkg = make_mock_package(package_id="pkg-1", package_config={"product_id": "prod-1"})
 
         provider = MagicMock()
         provider.name = "Credentialed Provider"
@@ -801,7 +801,7 @@ class TestPostPackagesSyncAuth:
         provider.auth_credentials = "provider-secret"
         provider.auth_type = "bearer"
 
-        mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = _make_sync_uow(packages=[pkg], providers=[provider])
+        mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = make_sync_uow(packages=[pkg], providers=[provider])
         with (
             patch("src.services.tmp_provider_sync._post_packages_sync") as mock_post,
             patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL),

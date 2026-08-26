@@ -44,7 +44,7 @@ from src.core.schemas.tmp_provider import TMPProviderDiscoveryEntry
 from src.routes.tmp_providers import DISCOVERY_ROUTE, PROVIDER_REGISTRATION_SCHEMA
 from tests.helpers.envelope_assertions import assert_envelope_shape
 from tests.helpers.pinned_schema import validate_against_pinned_schema
-from tests.unit._tmp_helpers import _make_provider, _make_tmp_uow, _mock_cm
+from tests.unit._tmp_helpers import make_provider, make_tmp_uow, mock_cm
 
 # A property RID is `format: uuid` in the pinned schema, so test fixtures must
 # use a real UUID rather than a readable placeholder.
@@ -101,11 +101,11 @@ class TestDiscoveryReturnsActiveProviders:
         """Two active providers are returned in the response via repository.list_syncable()."""
         tenant = _make_tenant()
         providers = [
-            _make_provider(provider_id="prov_1", name="Provider A", priority=0, countries=["US"]),
-            _make_provider(provider_id="prov_2", name="Provider B", priority=1, uid_types=["uid2"]),
+            make_provider(provider_id="prov_1", name="Provider A", priority=0, countries=["US"]),
+            make_provider(provider_id="prov_2", name="Provider B", priority=1, uid_types=["uid2"]),
         ]
 
-        mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
+        mock_tmp_uow_cls = make_tmp_uow(providers, tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
             response = client.get(_discovery_path("si-host"))
@@ -124,11 +124,11 @@ class TestDiscoveryReturnsActiveProviders:
         """Draining providers are included (router stops new requests but in-flight complete)."""
         tenant = _make_tenant()
         providers = [
-            _make_provider(provider_id="prov_1", status="active"),
-            _make_provider(provider_id="prov_2", status="draining"),
+            make_provider(provider_id="prov_1", status="active"),
+            make_provider(provider_id="prov_2", status="draining"),
         ]
 
-        mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
+        mock_tmp_uow_cls = make_tmp_uow(providers, tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
             response = client.get(_discovery_path("si-host"))
@@ -147,7 +147,7 @@ class TestDiscoveryEmptyProviders:
         """Valid tenant with no active providers returns empty providers array."""
         tenant = _make_tenant()
 
-        mock_tmp_uow_cls = _make_tmp_uow([], tenant=tenant)
+        mock_tmp_uow_cls = make_tmp_uow([], tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
             response = client.get(_discovery_path("si-host"))
@@ -165,13 +165,13 @@ class TestDiscoveryResponseShape:
         """Each provider entry contains all fields the TMP Router expects."""
         tenant = _make_tenant()
         providers = [
-            _make_provider(
+            make_provider(
                 countries=["US", "GB"],
                 uid_types=["publisher_first_party", "uid2"],
             ),
         ]
 
-        mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
+        mock_tmp_uow_cls = make_tmp_uow(providers, tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
             response = client.get(_discovery_path("si-host"))
@@ -204,9 +204,9 @@ class TestDiscoveryResponseShape:
         always emits ``provider_id``.
         """
         tenant = _make_tenant()
-        providers = [_make_provider(name="Admin Only Label")]
+        providers = [make_provider(name="Admin Only Label")]
 
-        mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
+        mock_tmp_uow_cls = make_tmp_uow(providers, tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
             response = client.get(_discovery_path("si-host"))
@@ -224,10 +224,10 @@ class TestDiscoveryResponseShape:
         """
         tenant = _make_tenant()
         providers = [
-            _make_provider(countries=None, uid_types=None, properties=None),
+            make_provider(countries=None, uid_types=None, properties=None),
         ]
 
-        mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
+        mock_tmp_uow_cls = make_tmp_uow(providers, tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
             response = client.get(_discovery_path("si-host"))
@@ -253,12 +253,12 @@ class TestDiscoveryOrdering:
         tenant = _make_tenant()
         # Simulate DB returning in correct order (priority 0 before 1, alpha within same priority)
         providers = [
-            _make_provider(provider_id="prov_a", name="Alpha", priority=0),
-            _make_provider(provider_id="prov_b", name="Beta", priority=0),
-            _make_provider(provider_id="prov_c", name="Gamma", priority=1),
+            make_provider(provider_id="prov_a", name="Alpha", priority=0),
+            make_provider(provider_id="prov_b", name="Beta", priority=0),
+            make_provider(provider_id="prov_c", name="Gamma", priority=1),
         ]
 
-        mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
+        mock_tmp_uow_cls = make_tmp_uow(providers, tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
             response = client.get(_discovery_path("si-host"))
@@ -299,7 +299,7 @@ class TestDiscoveryRepositoryUnavailable:
             )
         )
 
-        with patch("src.routes.tmp_providers.TMPProviderUoW", _mock_cm(mock_uow)):
+        with patch("src.routes.tmp_providers.TMPProviderUoW", mock_cm(mock_uow)):
             response = client.get(_discovery_path("si-host"))
 
         assert response.status_code == 503
@@ -367,7 +367,7 @@ class TestDiscoverySingleTransactionAndNoDetachedInstance:
 
     def test_tmp_provider_uow_constructed_exactly_once(self, client):
         """TMPProviderUoW is instantiated exactly once — not twice (no separate TenantConfigUoW)."""
-        mock_tmp_uow_cls = _make_tmp_uow([], tenant=_make_tenant())
+        mock_tmp_uow_cls = make_tmp_uow([], tenant=_make_tenant())
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
             response = client.get(_discovery_path("si-host"))
@@ -397,7 +397,7 @@ class TestDiscoverySingleTransactionAndNoDetachedInstance:
             closed_flag[0] = True
             return False
 
-        mock_uow_cls = _mock_cm(mock_uow, on_exit=_mark_closed)
+        mock_uow_cls = mock_cm(mock_uow, on_exit=_mark_closed)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_uow_cls):
             # Would raise DetachedInstanceError (→ 500) if from_row() ran after __exit__.
@@ -428,16 +428,16 @@ class TestDiscoverySkipsUnrepresentableRows:
     def test_bad_row_is_skipped_and_good_rows_still_publish(self, client, caplog):
         import logging
 
-        good = _make_provider(provider_id="prov_good", endpoint="https://good.example.com/tmp")
+        good = make_provider(provider_id="prov_good", endpoint="https://good.example.com/tmp")
         # Unrepresentable: identity_match with no countries/uid_types.
-        bad = _make_provider(
+        bad = make_provider(
             provider_id="prov_legacy",
             context_match=False,
             identity_match=True,
             countries=None,
             uid_types=None,
         )
-        mock_tmp_uow_cls = _make_tmp_uow([bad, good], tenant=_make_tenant())
+        mock_tmp_uow_cls = make_tmp_uow([bad, good], tenant=_make_tenant())
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
             with caplog.at_level(logging.ERROR, logger="src.routes.tmp_providers"):
@@ -466,7 +466,7 @@ class TestDiscoveryEntryIsTheSdkType:
         return TMPProviderDiscoveryEntry.from_row(provider).model_dump(mode="json", exclude_none=True)
 
     def test_context_only_row_converts_and_validates(self):
-        p = _make_provider(endpoint="https://ctx.example.com/tmp", context_match=True, identity_match=False)
+        p = make_provider(endpoint="https://ctx.example.com/tmp", context_match=True, identity_match=False)
         entry = self._entry_dict(p)
 
         validate_against_pinned_schema(PROVIDER_REGISTRATION_SCHEMA, entry)
@@ -476,7 +476,7 @@ class TestDiscoveryEntryIsTheSdkType:
         assert "name" not in entry, "the admin-only label must never reach the machine wire"
 
     def test_fully_populated_identity_row_converts_and_validates(self):
-        p = _make_provider(
+        p = make_provider(
             provider_id="prov_test",
             name="Test Provider",
             endpoint="https://example.com",
@@ -515,7 +515,7 @@ class TestDiscoveryEntryIsTheSdkType:
         appending. Asserted explicitly so the normalization is a stated property
         rather than a surprise to a router operator diffing stored vs published.
         """
-        p = _make_provider(endpoint="http://si-agent.localhost:3003")
+        p = make_provider(endpoint="http://si-agent.localhost:3003")
         entry = self._entry_dict(p)
 
         validate_against_pinned_schema(PROVIDER_REGISTRATION_SCHEMA, entry)
@@ -528,7 +528,7 @@ class TestDiscoveryEntryIsTheSdkType:
         ``-`` back and the entry cannot be built, rather than being built and
         rejected downstream by a router.
         """
-        p = _make_provider(provider_id="5f1c0e3a-9b7d-4e8f-a1c2-b3d4e5f60718")
+        p = make_provider(provider_id="5f1c0e3a-9b7d-4e8f-a1c2-b3d4e5f60718")
         with pytest.raises(ValidationError):
             TMPProviderDiscoveryEntry.from_row(p)
 
@@ -540,7 +540,7 @@ class TestDiscoveryEntryIsTheSdkType:
         row the wire rejects — previously accepted, because the vocabulary check
         lived inside ``if self.identity_match:`` (#1197 review).
         """
-        p = _make_provider(context_match=True, identity_match=False, uid_types=["not_a_uid_type"])
+        p = make_provider(context_match=True, identity_match=False, uid_types=["not_a_uid_type"])
         with pytest.raises(ValidationError):
             TMPProviderDiscoveryEntry.from_row(p)
 
@@ -551,7 +551,7 @@ class TestDiscoveryEntryIsTheSdkType:
         unrepresentable at any serialization; the route drops and logs it rather
         than publishing it (see TestDiscoverySkipsUnrepresentableRows).
         """
-        p = _make_provider(context_match=False, identity_match=True, countries=None, uid_types=None)
+        p = make_provider(context_match=False, identity_match=True, countries=None, uid_types=None)
         with pytest.raises(ValidationError):
             TMPProviderDiscoveryEntry.from_row(p)
 

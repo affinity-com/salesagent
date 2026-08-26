@@ -28,7 +28,7 @@ from src.admin.blueprints.tmp_providers import _form_render_context
 from src.core.database.models import TMPProvider
 from src.core.schemas.tmp_provider import VALID_STATUSES, VALID_UID_TYPES
 from tests.helpers.admin_client import make_super_admin_client
-from tests.unit._tmp_helpers import _make_blueprint_uow, _make_mock_provider
+from tests.unit._tmp_helpers import make_blueprint_uow, make_mock_provider
 
 
 def _make_tmp_provider_client():
@@ -87,7 +87,7 @@ class TestRejectedRegistrationIsFlashedAndNotWritten:
 
     @pytest.mark.parametrize("form_overrides", [pytest.param(o, id=name) for name, o in _REJECTED_ADD_FORMS])
     def test_rejected_add_flashes_bounces_and_does_not_write(self, form_overrides):
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow_cls, mock_uow = make_blueprint_uow()
 
         response = _post_add({**_VALID_ADD_FORM, **form_overrides}, mock_uow_cls)
 
@@ -103,7 +103,7 @@ class TestTMPProviderAddSSRF:
         """POST /tmp-providers/add with a safe public URL must proceed past SSRF check."""
         client = _make_tmp_provider_client()
 
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow_cls, mock_uow = make_blueprint_uow()
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
             with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
                 with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
@@ -154,9 +154,9 @@ class TestTMPProviderEditSSRF:
         """
         client = _make_tmp_provider_client()
 
-        existing_provider = _make_mock_provider()
+        existing_provider = make_mock_provider()
 
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow_cls, mock_uow = make_blueprint_uow()
         mock_uow.tmp_providers.get_by_id.return_value = existing_provider
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
             with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
@@ -189,9 +189,9 @@ class TestTMPProviderEditSSRF:
         """
         client = _make_tmp_provider_client()
 
-        existing_provider = _make_mock_provider()
+        existing_provider = make_mock_provider()
 
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow_cls, mock_uow = make_blueprint_uow()
         mock_uow.tmp_providers.get_by_id.return_value = existing_provider
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
             with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
@@ -236,7 +236,7 @@ class TestTMPProviderInputValidation:
         """POST /tmp-providers/add with explicit status passes it to create_from_fields."""
         client = _make_tmp_provider_client()
 
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow_cls, mock_uow = make_blueprint_uow()
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
             with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
                 with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
@@ -279,9 +279,9 @@ class TestTMPProviderDeactivate:
         """POST /tmp-providers/<id>/deactivate returns JSON success."""
         client = _make_tmp_provider_client()
 
-        existing_provider = _make_mock_provider()
+        existing_provider = make_mock_provider()
 
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow_cls, mock_uow = make_blueprint_uow()
         mock_uow.tmp_providers.deactivate.return_value = existing_provider
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
             with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
@@ -298,7 +298,7 @@ class TestTMPProviderDeactivate:
         """POST /tmp-providers/<id>/deactivate returns 404 when provider not found."""
         client = _make_tmp_provider_client()
 
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow_cls, mock_uow = make_blueprint_uow()
         mock_uow.tmp_providers.deactivate.return_value = None
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
             with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
@@ -318,9 +318,9 @@ class TestTMPProviderDelete:
         """DELETE /tmp-providers/<id>/delete returns JSON success."""
         client = _make_tmp_provider_client()
 
-        existing_provider = _make_mock_provider()
+        existing_provider = make_mock_provider()
 
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow_cls, mock_uow = make_blueprint_uow()
         mock_uow.tmp_providers.get_by_id.return_value = existing_provider
         mock_uow.tmp_providers.delete.return_value = True
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
@@ -338,7 +338,7 @@ class TestTMPProviderDelete:
         """DELETE /tmp-providers/<id>/delete returns 404 when provider not found."""
         client = _make_tmp_provider_client()
 
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow_cls, mock_uow = make_blueprint_uow()
         mock_uow.tmp_providers.get_by_id.return_value = None
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
             with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
@@ -358,11 +358,11 @@ class TestTMPProviderHealthCheck:
 
         client = _make_tmp_provider_client()
 
-        existing_provider = _make_mock_provider()
+        existing_provider = make_mock_provider()
         existing_provider.health_status = "healthy"
         existing_provider.last_health_checked_at = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
 
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow_cls, mock_uow = make_blueprint_uow()
         mock_uow.tmp_providers.get_by_id.return_value = existing_provider
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
             with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
@@ -382,11 +382,11 @@ class TestTMPProviderHealthCheck:
 
         client = _make_tmp_provider_client()
 
-        existing_provider = _make_mock_provider()
+        existing_provider = make_mock_provider()
         existing_provider.health_status = "unhealthy"
         existing_provider.last_health_checked_at = datetime(2026, 5, 25, 12, 0, 0, tzinfo=UTC)
 
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow_cls, mock_uow = make_blueprint_uow()
         mock_uow.tmp_providers.get_by_id.return_value = existing_provider
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
             with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
@@ -408,11 +408,11 @@ class TestTMPProviderHealthCheck:
         """GET /tmp-providers/<id>/health returns pending when health_status is None."""
         client = _make_tmp_provider_client()
 
-        existing_provider = _make_mock_provider()
+        existing_provider = make_mock_provider()
         existing_provider.health_status = None
         existing_provider.last_health_checked_at = None
 
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow_cls, mock_uow = make_blueprint_uow()
         mock_uow.tmp_providers.get_by_id.return_value = existing_provider
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
             with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
@@ -437,7 +437,7 @@ class TestTMPProviderAuthFields:
         """
         client = _make_tmp_provider_client()
 
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow_cls, mock_uow = make_blueprint_uow()
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
             with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
                 with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
@@ -477,11 +477,11 @@ class TestTMPProviderAuthFields:
         """POST /tmp-providers/<id>/edit with empty auth_credentials preserves existing value."""
         client = _make_tmp_provider_client()
 
-        existing_provider = _make_mock_provider()
+        existing_provider = make_mock_provider()
         existing_provider.auth_type = "bearer"
         existing_provider.auth_credentials = "existing-secret"
 
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow_cls, mock_uow = make_blueprint_uow()
         mock_uow.tmp_providers.get_by_id.return_value = existing_provider
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
             with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
@@ -526,11 +526,11 @@ class TestTMPProviderAuthFields:
         """POST /tmp-providers/<id>/edit with non-empty auth_credentials updates the value."""
         client = _make_tmp_provider_client()
 
-        existing_provider = _make_mock_provider()
+        existing_provider = make_mock_provider()
         existing_provider.auth_type = "bearer"
         existing_provider.auth_credentials = "old-secret"
 
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow_cls, mock_uow = make_blueprint_uow()
         mock_uow.tmp_providers.get_by_id.return_value = existing_provider
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
             with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
@@ -616,7 +616,7 @@ class TestListPageRendersTheRealTemplate:
 
     def _render_list(self, provider: TMPProvider) -> str:
         client = _make_tmp_provider_client()
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow_cls, mock_uow = make_blueprint_uow()
         mock_uow.tmp_providers.list_all.return_value = [provider]
 
         with (
@@ -711,7 +711,7 @@ class TestEditPageRendersTheRealTemplate:
             provider.auth_credentials = "stored-token"
 
             client = _make_tmp_provider_client()
-            mock_uow_cls, mock_uow = _make_blueprint_uow()
+            mock_uow_cls, mock_uow = make_blueprint_uow()
             mock_uow.tmp_providers.get_by_id.return_value = provider
 
             with (
@@ -751,7 +751,7 @@ class TestAddGetRendersTheEmptyForm:
         and only rendering shows that they reach the page (#1197 review).
         """
         client = _make_tmp_provider_client()
-        mock_uow_cls, _mock_uow = _make_blueprint_uow()
+        mock_uow_cls, _mock_uow = make_blueprint_uow()
 
         with (
             patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls),
@@ -816,7 +816,7 @@ class TestEditGetSurvivesAnUnreadableCredential:
         provider._auth_credentials = "not-a-valid-fernet-token"
 
         client = _make_tmp_provider_client()
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow_cls, mock_uow = make_blueprint_uow()
         mock_uow.tmp_providers.get_by_id.return_value = provider
 
         with (
@@ -845,7 +845,7 @@ class TestErrorHelpers:
     def test_json_route_failure_returns_500_with_the_action_in_the_body(self):
         """``_log_and_500``: JSON 500 naming the action, from the deactivate route."""
         client = _make_tmp_provider_client()
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow_cls, mock_uow = make_blueprint_uow()
         mock_uow.tmp_providers.deactivate.side_effect = RuntimeError("db exploded")
 
         with (
@@ -860,7 +860,7 @@ class TestErrorHelpers:
     def test_flash_route_failure_redirects_to_tenant_settings(self):
         """``_log_flash_and_redirect``: flash + redirect, from the list route."""
         client = _make_tmp_provider_client()
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
+        mock_uow_cls, mock_uow = make_blueprint_uow()
         mock_uow.tmp_providers.list_all.side_effect = RuntimeError("db exploded")
 
         with (

@@ -28,13 +28,15 @@ from adcp.types.generated_poc.protocol.get_adcp_capabilities_response import (
     SupportedProtocol,
     # FIXME(#1388): Targeting has a local subclass; import from src.core.schemas (Pattern #7/#4).
     Targeting,
+    TrustedMatch,
 )
 from fastmcp.server.context import Context
 from fastmcp.tools.tool import ToolResult
+from sqlalchemy.exc import SQLAlchemyError
 
 from src.core.auth import get_principal_object, require_identity
 from src.core.database.repositories.idempotency_attempt import DEFAULT_REPLAY_TTL
-from src.core.database.repositories.uow import TenantConfigUoW
+from src.core.database.repositories.uow import TenantConfigUoW, TMPProviderUoW
 from src.core.helpers import enum_value
 from src.core.helpers.activity_helpers import log_tool_activity
 from src.core.helpers.adapter_helpers import get_adapter
@@ -90,8 +92,13 @@ CHANNEL_MAPPING: dict[str, MediaChannel] = {
 }
 
 
-def _experimental_features(tenant_id: str) -> list[str] | None:
-    """The experimental surfaces this tenant actually has wired, or ``None``.
+def _has_syncable_providers(tenant_id: str) -> bool:
+    """Whether this tenant runs TMP — the one read both TMP declarations use.
+
+    Two things on the capabilities response mean "this seller has TMP": the
+    ``experimental_features`` entry (``trusted_match.core``) and the presence of
+    ``media_buy.execution.trusted_match``. Both come from this, so they cannot
+    disagree.
 
     Derived from the state that makes the surface real rather than from a
     constant: a tenant with no syncable TMP provider has nothing to sync, and a
@@ -104,9 +111,10 @@ def _experimental_features(tenant_id: str) -> list[str] | None:
     advertise ``trusted_match.core`` while discovery returned ``[]`` and the sync
     no-oped (#1197 review).
 
-    Returns ``None`` (the field omitted) rather than ``[]`` when there is nothing
-    to declare — the schema types this as an array and an empty one carries no
-    more information than absence.
+    The caller omits both declarations when this is false — for
+    ``experimental_features`` that means omitting the field rather than sending
+    ``[]``, since the schema types it as an array and an empty one carries no more
+    information than absence.
 
     Note what omission means: AdCP 3.1.1
     ``reference/experimental-status.mdx`` — "Sellers that do not list an
@@ -116,22 +124,16 @@ def _experimental_features(tenant_id: str) -> list[str] | None:
     either way. So only a *storage* failure is swallowed here; a programming
     error must surface rather than silently un-declare a live surface.
     """
-    from sqlalchemy.exc import SQLAlchemyError
-
-    from src.core.database.repositories.uow import TMPProviderUoW
-
     try:
         with TMPProviderUoW(tenant_id) as uow:
-            has_providers = uow.tmp_providers.has_syncable()
+            return uow.tmp_providers.has_syncable()
     except SQLAlchemyError as e:
         logger.warning(
-            "[TMP capabilities] Could not determine experimental features for tenant %s: %s",
+            "[TMP capabilities] Could not determine TMP deployment for tenant %s: %s",
             log_safe(tenant_id),
             e,
         )
-        return None
-
-    return [TRUSTED_MATCH_FEATURE_ID] if has_providers else None
+        return False
 
 
 def _get_adcp_capabilities_impl(
@@ -246,6 +248,9 @@ def _get_adcp_capabilities_impl(
         catalog_management=False,
     )
 
+    # One read of "does this tenant run TMP?", used by both declarations below.
+    tmp_is_deployed = _has_syncable_providers(tenant_id)
+
     # Build targeting capabilities from adapter
     targeting_caps = None
     if adapter and hasattr(adapter, "get_targeting_capabilities"):
@@ -302,9 +307,22 @@ def _get_adcp_capabilities_impl(
         geo_postal_areas=geo_postal_areas,
     )
 
-    # Build execution capabilities
+    # Build execution capabilities.
+    #
+    # `trusted_match`'s presence is itself the declaration — the schema says
+    # "Presence of this object indicates the seller has TMP infrastructure
+    # deployed" — so it comes from the SAME predicate as the experimental_features
+    # entry below. Emitting one and not the other would have the agent telling a
+    # buyer it implements trusted_match.core while the capability block that means
+    # "TMP is deployed here" was absent (#1197 review).
+    #
+    # `surfaces` is deliberately not populated: it enumerates which surface types
+    # (website, ctv_app, …) the seller supports via TMP, which this codebase does
+    # not model anywhere, and the property is optional. Declaring presence without
+    # inventing a surface list is the truthful shape. Populating it is #1993.
     execution = Execution(
         targeting=targeting,
+        trusted_match=TrustedMatch() if tmp_is_deployed else None,
     )
 
     # Build media_buy capabilities
@@ -335,7 +353,7 @@ def _get_adcp_capabilities_impl(
         # NOT added to supported_protocols: a stable protocol claim also commits
         # the agent to that protocol's baseline compliance storyboard. The
         # experimental declaration is the obligation the diff creates.
-        experimental_features=_experimental_features(tenant_id),
+        experimental_features=[TRUSTED_MATCH_FEATURE_ID] if tmp_is_deployed else None,
         media_buy=media_buy,
         last_updated=datetime.now(UTC),
     )

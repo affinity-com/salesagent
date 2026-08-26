@@ -47,7 +47,8 @@ from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 import httpx
-from adcp.types import AvailablePackage, SellerAgentReference
+from adcp.types import AvailablePackage, FormatId, SellerAgentReference
+from pydantic import ValidationError
 
 from src.core.database.models import MediaPackage, TMPProvider
 from src.core.database.repositories.uow import MediaBuyUoW, TenantConfigUoW, TMPProviderUoW
@@ -468,6 +469,7 @@ def _build_package_payload(
     error branch and a skip path on (#1197 review). The ``model_dump`` happens
     once, in ``_post_packages_sync``, where JSON is actually needed.
     """
+    format_ids = _package_format_ids(pkg_row)
     if not seller_agent_url.startswith("https://"):
         raise ValueError(
             f"seller_agent.agent_url must use https:// per seller-agent-ref.json, got {seller_agent_url!r}"
@@ -477,7 +479,60 @@ def _build_package_payload(
         media_buy_id=media_buy_id,
         # seller_agent is required by the schema; agent_url MUST be https.
         seller_agent=SellerAgentReference(agent_url=seller_agent_url),
+        format_ids=format_ids,
     )
+
+
+def _package_format_ids(pkg_row: MediaPackage) -> list[FormatId] | None:
+    """The package's eligible creative formats, for the sync body.
+
+    ``available-package.json`` types ``format_ids`` as the standard AdCP format-id
+    object (``core/format-id.json``), and the value is on the row: the create path
+    stores the request's ``format_ids`` in ``package_config``. Omitting it was not a
+    decision — the docstring named it as an optional member and then declined to
+    populate it with no reason — and the spec is explicit that package metadata "is
+    synced at media buy time, not sent per request", which is exactly why a router
+    needs the formats to have arrived (#1197 review).
+
+    Returns ``None`` (the member omitted) when the row carries none, since the
+    schema types it as an array and ``exclude_none=True`` drops it.
+    """
+    config = pkg_row.package_config or {}
+    # ``format_ids`` is the request's eligible formats for this package;
+    # ``format_ids_to_provide`` is the adapter's statement of which formats the
+    # buyer must supply creatives for. Either answers "which formats is this
+    # package eligible for", which is what the schema's ``format_ids`` means, so
+    # the request's value wins and the adapter's is the fallback.
+    raw = config.get("format_ids") or config.get("format_ids_to_provide")
+    if not raw:
+        return None
+
+    formats: list[FormatId] = []
+    for entry in raw:
+        # Stored either as the AdCP object (a dict after the JSONType round trip, or
+        # a FormatId if it was never persisted) or, on legacy rows, as a bare id
+        # string. Anything unconvertible is skipped rather than failing the whole
+        # sync: the formats are advisory to the router, the packages are not.
+        try:
+            if isinstance(entry, FormatId):
+                formats.append(entry)
+            elif isinstance(entry, dict):
+                formats.append(FormatId.model_validate(entry))
+            else:
+                logger.debug(
+                    "[TMP sync] Skipping non-object format_id %r on package %s — "
+                    "the wire requires the {agent_url, id} form",
+                    entry,
+                    pkg_row.package_id,
+                )
+        except ValidationError:
+            logger.warning(
+                "[TMP sync] Skipping unconvertible format_id %r on package %s",
+                entry,
+                pkg_row.package_id,
+                exc_info=True,
+            )
+    return formats or None
 
 
 def _post_packages_sync(

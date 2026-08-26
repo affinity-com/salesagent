@@ -1587,9 +1587,7 @@ async def update_media_buy(
     # Read identity and context_id pre-resolved by MCPAuthMiddleware
     identity = (await ctx.get_state("identity")) if isinstance(ctx, Context) else None
     _ctx_id = (await ctx.get_state("context_id")) if isinstance(ctx, Context) else None
-    response = _update_media_buy_impl(req=req, identity=identity, context_id=_ctx_id)
-
-    return mcp_result(response)
+    return mcp_result(_update_media_buy_impl(req=req, identity=identity, context_id=_ctx_id))
 
 
 def update_media_buy_raw(
@@ -1667,6 +1665,4 @@ def update_media_buy_raw(
         identity = resolve_identity_from_context(ctx, require_valid_token=True)
     # A2A/REST callers pass identity directly without a FastMCP Context, so there
     # is no workflow context_id to forward — _impl creates one if needed.
-    result = _update_media_buy_impl(req=req, identity=identity, context_id=None)
-
-    return result
+    return _update_media_buy_impl(req=req, identity=identity, context_id=None)

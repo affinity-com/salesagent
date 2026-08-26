@@ -23,6 +23,10 @@ from tests.bdd.steps.generic._dispatch import dispatch_request
 from tests.bdd.steps.generic.given_media_buy import _ensure_request_defaults
 from tests.helpers.pinned_schema import validate_against_pinned_schema
 
+#: The format the scenarios attach to the buy — the same reference catalog entry
+#: the harness's default product uses, so it resolves on the live server too.
+_EXPECTED_FORMAT_ID = {"agent_url": "https://creative.adcontextprotocol.org", "id": "display_300x250"}
+
 
 def _create_media_buy(ctx: dict, *, expect_delivery: bool = True) -> str:
     """Dispatch a real create through ctx['transport'] and return its media_buy_id.
@@ -36,6 +40,13 @@ def _create_media_buy(ctx: dict, *, expect_delivery: bool = True) -> str:
     env = ctx["env"]
     request_kwargs = dict(_ensure_request_defaults(ctx))
     request_kwargs["brand"] = {"domain": "tmp-package-sync.example.com"}
+    # The buy carries eligible formats, because "the package's formats travel with
+    # it" is one of the obligations the Then asserts. The spec syncs package
+    # metadata at media-buy time rather than per request, so a router that never
+    # received them cannot resolve creatives for the package (#1197 review).
+    request_kwargs["packages"] = [
+        {**package, "format_ids": [_EXPECTED_FORMAT_ID]} for package in request_kwargs["packages"]
+    ]
 
     dispatch_request(ctx, **request_kwargs)
     result = ctx["result"]
@@ -150,6 +161,19 @@ def _assert_delivery(ctx: dict, count: int) -> None:
         AvailablePackage.model_validate(package)
         assert package["media_buy_id"] == ctx["tmp_media_buy_id"]
         assert package["seller_agent"] == {"agent_url": env.tmp_seller_agent_url}
+        # The media buy's eligible formats travel with the package. The spec is
+        # explicit that package metadata is synced at media-buy time and NOT sent
+        # per request, so a router that never received the formats cannot resolve
+        # creatives for this package (#1197 review).
+        assert package.get("format_ids"), f"the delivered package carries no format_ids: {package}"
+        delivered_ids = {format_id["id"] for format_id in package["format_ids"]}
+        assert delivered_ids == {_EXPECTED_FORMAT_ID["id"]}, (
+            f"delivered formats {sorted(delivered_ids)} are not the buy's formats"
+        )
+        for format_id in package["format_ids"]:
+            # The AdCP format-id object, not a bare string: agent_url is what makes
+            # it resolvable across namespaces.
+            assert format_id.get("agent_url"), f"format_id missing its agent_url: {format_id}"
 
 
 @then("the provider receives nothing")

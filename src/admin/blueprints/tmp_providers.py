@@ -30,6 +30,7 @@ from werkzeug.wrappers import Response
 
 from src.admin.utils import require_tenant_access
 from src.admin.utils.audit_decorator import log_admin_action
+from src.admin.utils.helpers import tenant_not_found_redirect
 from src.core.database.models import TMPProvider
 from src.core.database.repositories.uow import TMPProviderUoW
 from src.core.schemas.tmp_provider import (
@@ -173,19 +174,6 @@ def _log_flash_and_redirect(action: str, exc: Exception, redirect_response: Resp
     logger.error("[TMP admin] Error %s: %s", action, exc, exc_info=True)
     flash(f"Error {action}", "error")
     return redirect_response
-
-
-def _tenant_not_found_redirect() -> Response:
-    """Flash an error and redirect to the index when a tenant cannot be found.
-
-    Returns the redirect response so callers can ``return`` it directly::
-
-        tenant = uow.tenant_config.get_tenant()
-        if not tenant:
-            return _tenant_not_found_redirect()
-    """
-    flash("Tenant not found", "error")
-    return redirect(url_for("core.index"))
 
 
 def _provider_not_found_json() -> tuple[Response, int]:
@@ -464,7 +452,7 @@ def list_tmp_providers(tenant_id):
         with TMPProviderUoW(tenant_id) as uow:
             tenant = uow.tenant_config.get_tenant()
             if not tenant:
-                return _tenant_not_found_redirect()
+                return tenant_not_found_redirect()
 
             providers = uow.tmp_providers.list_all()
 
@@ -502,7 +490,7 @@ def add_tmp_provider(tenant_id):
         with TMPProviderUoW(tenant_id) as uow:
             tenant = uow.tenant_config.get_tenant()
             if not tenant:
-                return _tenant_not_found_redirect()
+                return tenant_not_found_redirect()
 
             return render_template(
                 "tmp_provider_form.html",
@@ -518,7 +506,7 @@ def add_tmp_provider(tenant_id):
         with TMPProviderUoW(tenant_id) as uow:
             tenant = uow.tenant_config.get_tenant()
             if not tenant:
-                return _tenant_not_found_redirect()
+                return tenant_not_found_redirect()
 
             registration = _validated_registration_or_redirect(
                 request.form,
@@ -551,7 +539,7 @@ def edit_tmp_provider(tenant_id, provider_id):
         with TMPProviderUoW(tenant_id) as uow:
             tenant = uow.tenant_config.get_tenant()
             if not tenant:
-                return _tenant_not_found_redirect()
+                return tenant_not_found_redirect()
 
             provider = uow.tmp_providers.get_by_id(provider_id)
             if not provider:

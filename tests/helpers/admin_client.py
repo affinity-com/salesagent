@@ -16,8 +16,14 @@ from typing import Any
 def make_super_admin_client() -> Any:
     """Create a Flask test client authenticated as super admin.
 
-    The one implementation of the app-creation + session-setup block that admin
-    blueprint tests need.
+    The shared builder for the plain super-admin case: create the app, set the
+    test-user session keys, hand back the client.
+
+    Not "the one implementation for every admin test" — 13 other hand-rolled
+    super-admin blocks exist and differ materially (tenant-scoped session keys,
+    per-test DB patching), so they are not a mechanical re-point. Converging them
+    is a separate piece of work; this is here so new tests and the two suites that
+    do fit have one place to call (#1197 review).
     """
     from src.admin.app import create_app
 

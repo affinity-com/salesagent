@@ -26,8 +26,8 @@ from src.services.tmp_health_scheduler import (
     _check_provider_health,
     get_tmp_health_scheduler,
 )
-from tests.helpers.tmp_provider_http import make_mock_async_http_client as _make_async_http_client
-from tests.unit._tmp_helpers import _make_db_context, _make_mock_provider, _make_tmp_repo_uow
+from tests.helpers.tmp_provider_http import make_mock_async_http_client
+from tests.unit._tmp_helpers import make_db_context, make_mock_provider, make_tmp_repo_uow
 
 # ── Shared helpers ──────────────────────────────────────────────────
 
@@ -39,7 +39,7 @@ class TestCheckProviderHealth:
     async def test_returns_healthy_on_200(self):
         """200 response → 'healthy'."""
         mock_resp = MagicMock(status_code=200)
-        mock_client = _make_async_http_client(get_return=mock_resp)
+        mock_client = make_mock_async_http_client(get_return=mock_resp)
 
         with patch("src.services.tmp_health_scheduler.httpx.AsyncClient", return_value=mock_client):
             result = await _check_provider_health("https://provider.example.com/tmp")
@@ -51,7 +51,7 @@ class TestCheckProviderHealth:
     async def test_returns_unhealthy_on_non_200(self):
         """Non-200 response → 'unhealthy'."""
         mock_resp = MagicMock(status_code=503)
-        mock_client = _make_async_http_client(get_return=mock_resp)
+        mock_client = make_mock_async_http_client(get_return=mock_resp)
 
         with patch("src.services.tmp_health_scheduler.httpx.AsyncClient", return_value=mock_client):
             result = await _check_provider_health("https://provider.example.com/tmp")
@@ -61,7 +61,7 @@ class TestCheckProviderHealth:
     @pytest.mark.asyncio
     async def test_returns_error_on_connection_failure(self):
         """ConnectError → 'error'."""
-        mock_client = _make_async_http_client(get_side_effect=httpx.ConnectError("Connection refused"))
+        mock_client = make_mock_async_http_client(get_side_effect=httpx.ConnectError("Connection refused"))
 
         with patch("src.services.tmp_health_scheduler.httpx.AsyncClient", return_value=mock_client):
             result = await _check_provider_health("https://provider.example.com/tmp")
@@ -71,7 +71,7 @@ class TestCheckProviderHealth:
     @pytest.mark.asyncio
     async def test_returns_error_on_timeout(self):
         """TimeoutException → 'error'."""
-        mock_client = _make_async_http_client(get_side_effect=httpx.TimeoutException("Read timed out"))
+        mock_client = make_mock_async_http_client(get_side_effect=httpx.TimeoutException("Read timed out"))
 
         with patch("src.services.tmp_health_scheduler.httpx.AsyncClient", return_value=mock_client):
             result = await _check_provider_health("https://provider.example.com/tmp")
@@ -82,7 +82,7 @@ class TestCheckProviderHealth:
     async def test_strips_trailing_slash_from_endpoint(self):
         """Trailing slash on endpoint is stripped before appending /health."""
         mock_resp = MagicMock(status_code=200)
-        mock_client = _make_async_http_client(get_return=mock_resp)
+        mock_client = make_mock_async_http_client(get_return=mock_resp)
 
         with patch("src.services.tmp_health_scheduler.httpx.AsyncClient", return_value=mock_client):
             await _check_provider_health("https://provider.example.com/tmp/")
@@ -92,7 +92,7 @@ class TestCheckProviderHealth:
     @pytest.mark.asyncio
     async def test_returns_error_on_arbitrary_exception(self):
         """Any non-httpx exception (e.g. socket.gaierror) → 'error', not a raise."""
-        mock_client = _make_async_http_client(get_side_effect=OSError("Name or service not known"))
+        mock_client = make_mock_async_http_client(get_side_effect=OSError("Name or service not known"))
 
         with patch("src.services.tmp_health_scheduler.httpx.AsyncClient", return_value=mock_client):
             result = await _check_provider_health("https://bad-hostname.invalid")
@@ -103,7 +103,7 @@ class TestCheckProviderHealth:
     async def test_follow_redirects_false_prevents_ssrf(self):
         """follow_redirects=False is always passed to prevent SSRF via open-redirect."""
         mock_resp = MagicMock(status_code=200)
-        mock_client = _make_async_http_client(get_return=mock_resp)
+        mock_client = make_mock_async_http_client(get_return=mock_resp)
 
         with patch("src.services.tmp_health_scheduler.httpx.AsyncClient", return_value=mock_client) as mock_cls:
             await _check_provider_health("https://provider.example.com")
@@ -114,7 +114,7 @@ class TestCheckProviderHealth:
     @pytest.mark.asyncio
     async def test_logs_exception_on_error(self):
         """Exceptions are logged before mapping to 'error' — no silent failures."""
-        mock_client = _make_async_http_client(get_side_effect=OSError("DNS failure"))
+        mock_client = make_mock_async_http_client(get_side_effect=OSError("DNS failure"))
 
         with (
             patch("src.services.tmp_health_scheduler.httpx.AsyncClient", return_value=mock_client),
@@ -147,10 +147,10 @@ async def _run_tick(providers: list, *, probe: Any):
     with (
         patch(
             "src.services.tmp_health_scheduler.get_db_session",
-            return_value=_make_db_context(MagicMock()),
+            return_value=make_db_context(MagicMock()),
         ),
         patch("src.services.tmp_health_scheduler.TMPProviderRepository") as mock_repo_cls,
-        patch("src.services.tmp_health_scheduler.TMPProviderUoW", _make_tmp_repo_uow(mock_repo)),
+        patch("src.services.tmp_health_scheduler.TMPProviderUoW", make_tmp_repo_uow(mock_repo)),
         patch("src.services.tmp_health_scheduler._check_provider_health", new=probe_mock),
     ):
         mock_repo_cls.get_all_syncable.return_value = providers
@@ -164,8 +164,8 @@ class TestCheckAllProviders:
     @pytest.mark.asyncio
     async def test_updates_health_status_for_each_provider(self):
         """Each provider gets its health_status updated via UoW with correct values."""
-        provider_a = _make_mock_provider(provider_id="prov_a", tenant_id="tenant-1", endpoint="https://a.example.com")
-        provider_b = _make_mock_provider(provider_id="prov_b", tenant_id="tenant-2", endpoint="https://b.example.com")
+        provider_a = make_mock_provider(provider_id="prov_a", tenant_id="tenant-1", endpoint="https://a.example.com")
+        provider_b = make_mock_provider(provider_id="prov_b", tenant_id="tenant-2", endpoint="https://b.example.com")
 
         async with _run_tick([provider_a, provider_b], probe=["unhealthy", "error"]) as (mock_repo, mock_check):
             pass
@@ -190,7 +190,7 @@ class TestCheckAllProviders:
     @pytest.mark.asyncio
     async def test_healthy_status_written_on_200(self):
         """A provider returning 200 gets health_status='healthy' written."""
-        provider = _make_mock_provider(
+        provider = make_mock_provider(
             provider_id="prov_healthy", tenant_id="tenant-1", endpoint="https://healthy.example.com"
         )
 
@@ -208,7 +208,7 @@ class TestCheckAllProviders:
         with (
             patch(
                 "src.services.tmp_health_scheduler.get_db_session",
-                return_value=_make_db_context(mock_session),
+                return_value=make_db_context(mock_session),
             ),
             patch("src.services.tmp_health_scheduler.TMPProviderRepository") as mock_repo_cls,
             patch("src.services.tmp_health_scheduler.TMPProviderUoW", mock_uow_cls),
@@ -229,13 +229,13 @@ class TestCheckAllProviders:
     @pytest.mark.asyncio
     async def test_session_closed_before_probes(self):
         """DB session from the read phase is closed before HTTP probes run."""
-        provider = _make_mock_provider(provider_id="prov_x", tenant_id="tenant-1", endpoint="https://x.example.com")
+        provider = make_mock_provider(provider_id="prov_x", tenant_id="tenant-1", endpoint="https://x.example.com")
 
         call_order: list[str] = []
 
         mock_session_read = MagicMock()
         mock_repo = MagicMock()
-        mock_uow_cls = _make_tmp_repo_uow(mock_repo)
+        mock_uow_cls = make_tmp_repo_uow(mock_repo)
 
         def track_exit(*_args: object) -> bool:
             call_order.append("session_closed")
@@ -245,7 +245,7 @@ class TestCheckAllProviders:
             call_order.append("probe_called")
             return "healthy"
 
-        read_ctx = _make_db_context(mock_session_read)
+        read_ctx = make_db_context(mock_session_read)
         read_ctx.__exit__ = MagicMock(side_effect=track_exit)
 
         with (
@@ -268,14 +268,12 @@ class TestCheckAllProviders:
     @pytest.mark.asyncio
     async def test_bad_endpoint_does_not_cancel_other_probes(self):
         """return_exceptions=True: one probe raising does not cancel the rest."""
-        provider_a = _make_mock_provider(provider_id="prov_a", tenant_id="tenant-1", endpoint="https://bad.invalid")
-        provider_b = _make_mock_provider(
-            provider_id="prov_b", tenant_id="tenant-1", endpoint="https://good.example.com"
-        )
+        provider_a = make_mock_provider(provider_id="prov_a", tenant_id="tenant-1", endpoint="https://bad.invalid")
+        provider_b = make_mock_provider(provider_id="prov_b", tenant_id="tenant-1", endpoint="https://good.example.com")
 
         mock_session_read = MagicMock()
         mock_repo = MagicMock()
-        mock_uow_cls = _make_tmp_repo_uow(mock_repo)
+        mock_uow_cls = make_tmp_repo_uow(mock_repo)
 
         # _check_provider_health already maps all exceptions to "error",
         # but simulate a raw exception escaping to test the gather guard. This test
@@ -289,7 +287,7 @@ class TestCheckAllProviders:
         with (
             patch(
                 "src.services.tmp_health_scheduler.get_db_session",
-                return_value=_make_db_context(mock_session_read),
+                return_value=make_db_context(mock_session_read),
             ),
             patch("src.services.tmp_health_scheduler.TMPProviderRepository") as mock_repo_cls,
             patch("src.services.tmp_health_scheduler.TMPProviderUoW", mock_uow_cls),
@@ -310,9 +308,9 @@ class TestCheckAllProviders:
     @pytest.mark.asyncio
     async def test_providers_grouped_by_tenant_one_uow_per_tenant(self):
         """Providers from different tenants each get their own UoW (one commit per tenant)."""
-        provider_a = _make_mock_provider(provider_id="prov_a", tenant_id="tenant-1", endpoint="https://a.example.com")
-        provider_b = _make_mock_provider(provider_id="prov_b", tenant_id="tenant-2", endpoint="https://b.example.com")
-        provider_c = _make_mock_provider(provider_id="prov_c", tenant_id="tenant-1", endpoint="https://c.example.com")
+        provider_a = make_mock_provider(provider_id="prov_a", tenant_id="tenant-1", endpoint="https://a.example.com")
+        provider_b = make_mock_provider(provider_id="prov_b", tenant_id="tenant-2", endpoint="https://b.example.com")
+        provider_c = make_mock_provider(provider_id="prov_c", tenant_id="tenant-1", endpoint="https://c.example.com")
 
         mock_session_read = MagicMock()
         mock_repo = MagicMock()
@@ -331,7 +329,7 @@ class TestCheckAllProviders:
         with (
             patch(
                 "src.services.tmp_health_scheduler.get_db_session",
-                return_value=_make_db_context(mock_session_read),
+                return_value=make_db_context(mock_session_read),
             ),
             patch("src.services.tmp_health_scheduler.TMPProviderRepository") as mock_repo_cls,
             patch("src.services.tmp_health_scheduler.TMPProviderUoW", side_effect=make_uow),
@@ -362,8 +360,8 @@ class TestWritePhaseIsIsolatedPerTenant:
 
     @pytest.mark.asyncio
     async def test_later_tenants_are_still_written(self):
-        provider_a = _make_mock_provider(provider_id="prov_a", tenant_id="tenant-1", endpoint="https://a.example.com")
-        provider_b = _make_mock_provider(provider_id="prov_b", tenant_id="tenant-2", endpoint="https://b.example.com")
+        provider_a = make_mock_provider(provider_id="prov_a", tenant_id="tenant-1", endpoint="https://a.example.com")
+        provider_b = make_mock_provider(provider_id="prov_b", tenant_id="tenant-2", endpoint="https://b.example.com")
 
         mock_repo = MagicMock()
         # One UoW class whose __enter__ raises for tenant-1 and yields a working
@@ -386,7 +384,7 @@ class TestWritePhaseIsIsolatedPerTenant:
         with (
             patch(
                 "src.services.tmp_health_scheduler.get_db_session",
-                return_value=_make_db_context(MagicMock()),
+                return_value=make_db_context(MagicMock()),
             ),
             patch("src.services.tmp_health_scheduler.TMPProviderRepository") as mock_repo_cls,
             patch("src.services.tmp_health_scheduler.TMPProviderUoW", mock_uow_cls),

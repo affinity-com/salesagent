@@ -36,7 +36,7 @@ def _no_tmp_providers():
     uow.__enter__ = MagicMock(return_value=uow)
     uow.__exit__ = MagicMock(return_value=False)
     uow.tmp_providers.has_syncable.return_value = False
-    return patch("src.core.database.repositories.uow.TMPProviderUoW", return_value=uow)
+    return patch("src.core.tools.capabilities.TMPProviderUoW", return_value=uow)
 
 
 class TestMcpClientDispatch:
