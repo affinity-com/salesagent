@@ -791,6 +791,17 @@ class TMPSyncMixin:
                 )
             time.sleep(0.1)
 
+    def settle_tmp_sync(self) -> None:
+        """Wait out the settle window with no delivery expected.
+
+        The counterpart to :meth:`await_tmp_sync` for a scenario asserting that
+        NOTHING arrives: there is no arrival to wait for, so without a bounded wait
+        "no delivery" would pass merely because the request had not landed yet.
+        """
+        import time
+
+        time.sleep(self.TMP_SYNC_SETTLE_SECONDS)
+
     def join_tmp_syncs(self, timeout: float = 30.0) -> None:
         """Drain in-flight in-process syncs. No-op out-of-process (nothing local to join).
 

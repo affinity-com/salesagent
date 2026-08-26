@@ -341,7 +341,7 @@ class TestDiscoverySingleTransactionAndNoDetachedInstance:
 
         _VALUES = {
             "provider_id": "fake_uuid",
-            "endpoint": "http://fake:3000",
+            "endpoint": "https://fake.example.com:3000",
             "context_match": True,
             "identity_match": False,
             "countries": None,

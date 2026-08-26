@@ -193,8 +193,13 @@ class TestRegistrationInvariants:
 
         Mutation this pins: dropping ``check_url_ssrf`` from the model would let
         an internal-network endpoint register from *any* write surface.
+
+        Deliberately **https**, so the SSRF check is the only thing that can
+        reject it — an http URL would now be refused by the scheme rule first
+        (see TestEndpointSchemeIsConditional) and this test would pass without
+        the SSRF check running at all.
         """
-        message = _rejection_message(endpoint="http://host.docker.internal:9999/tmp")
+        message = _rejection_message(endpoint="https://host.docker.internal:9999/tmp")
 
         assert message.startswith("Endpoint URL is not allowed:")
         assert "host.docker.internal" in message
@@ -374,3 +379,59 @@ class TestRejectionMessagesNameTheOffendingInput:
             _rejection_message(context_match=False, identity_match=False)
             == "Provider must support at least one of context_match or identity_match"
         )
+
+
+class TestEndpointSchemeIsConditional:
+    """Non-https is permitted for a local dev host and rejected for a public one.
+
+    The divergence from the SDK codegen's https-only rule used to be a blanket
+    no-op justified by "local development against ``http://….localhost`` keeps
+    working" — while the SSRF check on the same write path rejected every local
+    host, so that reason was unreachable and the relaxation's only real effect was
+    to accept a **cleartext public** endpoint, which the pinned spec forbids
+    (#1197 review). Both halves now use ``is_local_host``.
+    """
+
+    def test_public_http_endpoint_is_rejected(self):
+        """The pinned spec's MUST: a public provider endpoint has to be https."""
+        message = _rejection_message(endpoint="http://provider.example.com/tmp")
+
+        assert "HTTPS" in message or "https" in message
+
+    def test_public_https_endpoint_is_accepted(self):
+        registration = TMPProviderRegistration.parse(_fields(endpoint="https://provider.example.com/tmp"))
+
+        assert registration.endpoint == "https://provider.example.com/tmp"
+
+    def test_local_http_endpoint_is_accepted(self):
+        """The documented dev form — and it must be registrable, not just documented."""
+        registration = TMPProviderRegistration.parse(_fields(endpoint="http://si-agent.localhost:3003"))
+
+        assert registration.endpoint == "http://si-agent.localhost:3003"
+
+    def test_loopback_literal_is_still_rejected(self):
+        """Relaxing the scheme for local hosts must not open the loopback IP.
+
+        ``is_local_host`` is true for ``127.0.0.1``, so this pins that the SSRF
+        check's literal-IP guard still runs — the relaxation skips DNS resolution,
+        not the blocked-range check.
+        """
+        assert _rejection_message(endpoint="http://127.0.0.1:3003")
+
+    def test_the_entry_type_applies_the_same_condition(self):
+        """The wire entry and the record agree, because both use one predicate."""
+        import pytest as _pytest
+        from pydantic import ValidationError as _ValidationError
+
+        from src.core.schemas.tmp_provider import TMPProviderDiscoveryEntry
+
+        payload = {
+            "provider_id": "prov_scheme",
+            "context_match": True,
+            "endpoint": "http://si-agent.localhost:3003",
+        }
+        # Local: permitted.
+        assert TMPProviderDiscoveryEntry.model_validate(payload) is not None
+        # Public cleartext: not permitted, by the mixin shared by both branches.
+        with _pytest.raises(_ValidationError):
+            TMPProviderDiscoveryEntry.model_validate({**payload, "endpoint": "http://provider.example.com/tmp"})

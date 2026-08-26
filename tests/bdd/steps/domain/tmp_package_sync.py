@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 from adcp.types import AvailablePackage
-from pytest_bdd import given, then, when
+from pytest_bdd import given, parsers, then, when
 
 from src.services.tmp_provider_sync import AVAILABLE_PACKAGE_SCHEMA
 from tests.bdd.steps._outcome_helpers import wire_field
@@ -24,7 +24,7 @@ from tests.bdd.steps.generic.given_media_buy import _ensure_request_defaults
 from tests.helpers.pinned_schema import validate_against_pinned_schema
 
 
-def _create_media_buy(ctx: dict) -> str:
+def _create_media_buy(ctx: dict, *, expect_delivery: bool = True) -> str:
     """Dispatch a real create through ctx['transport'] and return its media_buy_id.
 
     The request comes from ``_ensure_request_defaults`` — the BDD layer's one
@@ -49,9 +49,16 @@ def _create_media_buy(ctx: dict) -> str:
     assert media_buy_id, "create_media_buy returned no media_buy_id on the wire"
     ctx["tmp_media_buy_id"] = media_buy_id
 
-    # The seam owns the wait; without it the assertion races the fire-and-forget
-    # thread (in-process) or the server's own thread (e2e_rest).
-    env.await_tmp_sync(count=1)
+    if expect_delivery:
+        # The seam owns the wait; without it the assertion races the
+        # fire-and-forget thread (in-process) or the server's own thread (e2e_rest).
+        env.await_tmp_sync(count=1)
+    else:
+        # Nothing is expected, so there is no arrival to wait for — drain the
+        # in-flight sync instead, then let the collector settle. Without both, "no
+        # delivery" would pass simply because nothing had happened yet.
+        env.join_tmp_syncs()
+        env.settle_tmp_sync()
     return str(media_buy_id)
 
 
@@ -59,6 +66,22 @@ def _create_media_buy(ctx: dict) -> str:
 def given_tmp_provider_registered(ctx: dict) -> None:
     """Register one active provider pointed at the env's collector."""
     ctx["env"].register_tmp_provider()
+
+
+@given(parsers.parse('a TMP provider is registered for the tenant with status "{status}"'))
+def given_tmp_provider_with_status(ctx: dict, status: str) -> None:
+    """Register one provider in *status*, to grade the syncable-status axis.
+
+    The sync fans out to ``list_syncable()`` — active + draining — so an operator
+    setting a provider inactive must stop its package data (and its Bearer
+    credential) reaching that provider. The sibling capability feature graded this
+    axis on the wire; the sync did not, because every scenario here registered an
+    active provider (#1197 review).
+    """
+    ctx["env"].register_tmp_provider(status=status)
+    # `inactive` is excluded from list_syncable(), so no delivery is expected and
+    # the When step must drain-and-settle rather than wait for an arrival.
+    ctx["tmp_expects_delivery"] = status != "inactive"
 
 
 @given("a TMP provider with a credential is registered for the tenant")
@@ -81,7 +104,7 @@ def given_created_media_buy_already_synced(ctx: dict) -> None:
 
 @when("the Buyer Agent creates a media buy")
 def when_buyer_creates_media_buy(ctx: dict) -> None:
-    _create_media_buy(ctx)
+    _create_media_buy(ctx, expect_delivery=ctx.get("tmp_expects_delivery", True))
 
 
 @when("the Buyer Agent updates that media buy")
@@ -127,6 +150,17 @@ def _assert_delivery(ctx: dict, count: int) -> None:
         AvailablePackage.model_validate(package)
         assert package["media_buy_id"] == ctx["tmp_media_buy_id"]
         assert package["seller_agent"] == {"agent_url": env.tmp_seller_agent_url}
+
+
+@then("the provider receives nothing")
+def then_provider_receives_nothing(ctx: dict) -> None:
+    """An inactive provider is excluded from the fan-out entirely.
+
+    Not merely "no packages": no request at all, so the provider never sees the
+    tenant's package set OR the Bearer credential that would have accompanied it.
+    """
+    deliveries = ctx["env"].tmp_sync_deliveries()
+    assert deliveries == [], f"an inactive provider must receive nothing, got {deliveries}"
 
 
 @then("the provider receives the packages for that media buy")

@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING, Annotated, TypedDict, cast
+from urllib.parse import urlparse
 from uuid import UUID
 
 from adcp.types.generated_poc.enums.uid_type import UidType
@@ -75,6 +76,7 @@ from pydantic import (
     model_validator,
 )
 
+from src.core.domain_config import is_local_host
 from src.core.logging_config import log_safe
 from src.core.schemas._base import SalesAgentBaseModel
 from src.core.security.url_validator import check_url_ssrf
@@ -212,41 +214,42 @@ class TMPProviderFields(TypedDict):
     auth_credentials: str | None
 
 
-def _permit_local_http_endpoint(value: AnyUrl) -> AnyUrl:
-    """Replace the SDK's https-only endpoint validator with the schema's rule.
+class _LocalHttpEndpointMixin:
+    """Relax the SDK's https-only ``endpoint`` rule for local dev hosts ONLY.
 
-    The authority is the pinned schema, which types ``endpoint`` as
-    ``{"type": "string", "format": "uri"}`` — the HTTPS requirement is prose in
-    the field ``description`` ("MUST be HTTPS in production"), not a constraint
-    the schema expresses. The SDK codegen hard-rejects any non-https scheme, so
-    inheriting it unchanged would make the discovery endpoint 500 in local
-    development against an ``http://…​.localhost`` provider, which this feature
-    supports deliberately.
+    The divergence from the codegen is stated as a CONDITION, in one place, mixed
+    into both ``anyOf`` branch classes. It was a blanket no-op copied verbatim into
+    each branch, which had two problems: the only reachable effect was that a
+    tenant could register and publish a **cleartext public** endpoint — against
+    the pinned spec's MUST (``trusted-match/specification`` §"Provider
+    registration security", repeated in the schema's ``endpoint.description``) —
+    and a future narrowing would have had to be made twice or the two branches
+    would accept different endpoints (#1197 review).
 
-    Overriding by re-declaring the parent's validator name is what pydantic
-    offers for "inherit the model, drop this one rule"; it is the single
-    documented divergence from the SDK type, and it diverges toward the schema
-    rather than away from it.
+    What the schema itself says: ``endpoint`` is ``{"type": "string", "format":
+    "uri"}``. The HTTPS requirement is prose in the field description, so relaxing
+    it for a host that cannot serve https is a conformant reading; relaxing it for
+    a public host is not.
+
+    ``is_local_host`` is the codebase's single local-host predicate
+    (``src/core/domain_config.py``) — the same one that answers "can this host
+    serve https?" for the advertised agent URLs and the seller-agent resolution.
     """
-    return value
+
+    @field_validator("endpoint")
+    @classmethod
+    def _require_https_endpoint(cls, value: AnyUrl) -> AnyUrl:
+        if value.scheme == "https" or is_local_host(value.host):
+            return value
+        raise ValueError("endpoint must use https (non-https is permitted only for local dev hosts)")
 
 
-class _ContextMatchEntry(LibraryContextMatchRegistration):
+class _ContextMatchEntry(_LocalHttpEndpointMixin, LibraryContextMatchRegistration):
     """The ``context_match: true`` branch of the pinned schema's ``anyOf``."""
 
-    @field_validator("endpoint")
-    @classmethod
-    def _require_https_endpoint(cls, value: AnyUrl) -> AnyUrl:
-        return _permit_local_http_endpoint(value)
 
-
-class _IdentityMatchEntry(LibraryIdentityMatchRegistration):
+class _IdentityMatchEntry(_LocalHttpEndpointMixin, LibraryIdentityMatchRegistration):
     """The ``identity_match: true`` branch of the pinned schema's ``anyOf``."""
-
-    @field_validator("endpoint")
-    @classmethod
-    def _require_https_endpoint(cls, value: AnyUrl) -> AnyUrl:
-        return _permit_local_http_endpoint(value)
 
 
 class TMPProviderDiscoveryEntry(RootModel[_ContextMatchEntry | _IdentityMatchEntry]):
@@ -414,7 +417,22 @@ class TMPProviderRegistration(SalesAgentBaseModel):
         if self.status not in VALID_STATUSES:
             raise ValueError(f"Invalid status '{self.status}'. Valid values: {', '.join(sorted(VALID_STATUSES))}")
 
-        is_safe, ssrf_error = check_url_ssrf(self.endpoint)
+        # The two halves of the write path use ONE predicate, so they cannot
+        # contradict each other. A public endpoint must be https (the pinned spec's
+        # MUST) and is DNS-checked against private ranges; a local dev host may be
+        # http and skips the resolution check, which is what makes the
+        # ``http://…​.localhost`` form the route documents actually registrable.
+        # Before this, `require_https` was left at its default (so a cleartext
+        # PUBLIC endpoint was accepted) while `resolve_dns` rejected every local
+        # host — the relaxation's stated reason was unreachable and its only real
+        # effect was the thing the spec forbids (#1197 review).
+        endpoint_host = urlparse(self.endpoint).hostname
+        local_endpoint = is_local_host(endpoint_host)
+        is_safe, ssrf_error = check_url_ssrf(
+            self.endpoint,
+            require_https=not local_endpoint,
+            resolve_dns=not local_endpoint,
+        )
         if not is_safe:
             # Tagged `[TMP …]` so an operator grepping `[TMP` for this feature's
             # logs sees SSRF rejections from every write surface, not just the
