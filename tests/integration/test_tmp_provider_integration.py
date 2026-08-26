@@ -349,6 +349,40 @@ class TestDiscoveryAuth:
         assert response.status_code == 200, response.text
         assert len(response.json()["providers"]) == 1
 
+    def test_non_ascii_credential_is_rejected_not_a_server_error(self, integration_db):
+        """A malformed credential header is a 401, never a 500.
+
+        The tenant here has an ``admin_token``, which is what puts the request on
+        the constant-time compare branch of ``get_principal_from_token``: the
+        principal lookup misses, then the presented token is compared against the
+        stored admin token — where a non-ASCII operand used to make
+        ``hmac.compare_digest`` raise ``TypeError``.
+
+        The endpoint's own copy of that compare is gone (it authenticates through
+        the shared resolver now), and the raise is gone too
+        (``credentials_equal``), but this pins the wire contract independently of
+        both: whatever a hostile header does inside the resolver, this surface
+        answers 401/AUTH_INVALID. Routers poll it every 30 s, so a 500 here is an
+        alarm, not a rejection (#1197 review).
+        """
+        with _TMPEnv() as env:
+            tenant = TenantFactory(tenant_id="tmp_int_auth_nonascii", admin_token="tmp-admin-token-2")
+            TMPProviderFactory(tenant=tenant, name="Provider", status="active")
+            env._commit_factory_data()
+            tenant_id = tenant.tenant_id
+
+        # Sent as raw bytes, which is what a real client puts on the wire: the
+        # 0xE9 byte reaches the app as latin-1-decoded "é". Passing a str here
+        # instead fails inside httpx's own ASCII header encoding, before the
+        # request exists — that would grade the test client, not the endpoint.
+        response = _discovery_client().get(
+            DISCOVERY_ROUTE.format(tenant_id=tenant_id),
+            headers={"x-adcp-auth": "tmp-admin-tokén-2".encode("latin-1")},
+        )
+
+        assert response.status_code == 401, response.text
+        assert_envelope_shape(response.json(), "AUTH_INVALID", recovery="terminal")
+
     def test_unknown_tenant_is_not_found_for_an_authenticated_caller(self, integration_db):
         """A credential cannot resolve in a tenant that does not exist → 401, never 404.
 
