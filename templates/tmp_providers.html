@@ -113,13 +113,14 @@ Sales Agent Admin{% endblock %} {% block content %}
         </td>
         <td>{{ provider.timeout_ms }} ms</td>
         <td>
-          {% if provider.status == 'active' %}
-          <span style="color: #059669; font-weight: 600">✓ Active</span>
-          {% elif provider.status == 'draining' %}
-          <span style="color: #d97706; font-weight: 600">⏳ Draining</span>
-          {% else %}
-          <span style="color: #9ca3af">Inactive</span>
-          {% endif %}
+          {# Rendered from status_presentation, which is keyed off VALID_STATUSES —
+             the hand-written active/draining/else branch rendered any NEW lifecycle
+             status the SDK enum grew as "Inactive", while the edit form (rendering
+             from that same enum) offered it (#1197 review). #}
+          {% set presented = status_presentation.get(provider.status) %}
+          <span style="{{ presented.style if presented else 'color: #6b7280' }}"
+            >{{ presented.label if presented else provider.status }}</span
+          >
           {% if provider.auth_type %}
           <span class="badge" style="background: #d1fae5; color: #065f46; margin-left: 0.25rem">🔑 Auth</span>
           {% else %}
@@ -139,7 +140,9 @@ Sales Agent Admin{% endblock %} {% block content %}
             >
               Health
             </button>
-            {% if provider.status == 'active' %}
+            {# Whether a status can be deactivated is a domain statement, so it comes
+               from the same mapping rather than a hand-typed status comparison. #}
+            {% if presented and presented.deactivatable %}
             <button
               onclick="deactivateProvider('{{ provider.provider_id }}', '{{ provider.name }}')"
               class="btn btn-warning btn-sm"

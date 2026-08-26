@@ -48,7 +48,7 @@ Usage::
 from __future__ import annotations
 
 from collections.abc import Callable
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, PropertyMock
 
 from src.core.database.models import TMPProvider
 
@@ -86,7 +86,7 @@ def _mock_cm(inner: MagicMock, *, on_exit: Callable[..., bool] | None = None) ->
     return mock_cls
 
 
-def _make_mock_provider(**overrides) -> MagicMock:
+def _make_mock_provider(*, credential: object = _UNSET, **overrides) -> MagicMock:
     """Return a ``MagicMock`` provider carrying the full TMPProvider field superset.
 
     The single mock-provider factory for every TMP test file.  Both
@@ -99,6 +99,12 @@ def _make_mock_provider(**overrides) -> MagicMock:
     when the test exercises ``TMPProviderDiscoveryEntry.from_row()`` or the admin
     layer's ``_admin_view``/``_form_view`` — those need the real ORM model so the
     production mapper, not a mock reimplementation, is what runs.
+
+    ``credential`` sets ``auth_credentials``, and an ``Exception`` instance makes
+    reading it RAISE — the rotated-ciphertext state the sync must isolate per
+    provider. That capability lived in a third private builder in
+    ``test_tmp_provider_sync.py``, which is the one file this factory names as its
+    reason for existing (#1197 review).
     """
     fields: dict = {
         "provider_id": "prov_test_1234",
@@ -122,6 +128,13 @@ def _make_mock_provider(**overrides) -> MagicMock:
     provider = MagicMock()
     for key, value in fields.items():
         setattr(provider, key, value)
+    if credential is not _UNSET:
+        if isinstance(credential, Exception):
+            # PropertyMock on the TYPE: reading the attribute raises, which is what
+            # the decrypting `auth_credentials` getter does on a rotated ciphertext.
+            type(provider).auth_credentials = PropertyMock(side_effect=credential)
+        else:
+            provider.auth_credentials = credential
     return provider
 
 

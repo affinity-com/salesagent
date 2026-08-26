@@ -28,7 +28,12 @@ from src.services.tmp_provider_sync import (
 )
 from tests.helpers.pinned_schema import validate_against_pinned_schema
 from tests.helpers.tmp_provider_http import make_mock_http_client
-from tests.unit._tmp_helpers import _make_mock_package, _make_sync_uow, _make_tenant_config_uow
+from tests.unit._tmp_helpers import (
+    _make_mock_package,
+    _make_mock_provider,
+    _make_sync_uow,
+    _make_tenant_config_uow,
+)
 
 # The only shape ``_resolve_seller_agent_url`` can return besides ``None``: it
 # rejects a non-https override and builds the virtual_host branch as
@@ -231,9 +236,7 @@ class TestSyncSessionClosedBeforeHTTP:
         """The TMPProviderUoW session is closed before _post_packages_sync is called."""
         call_order: list[str] = []
 
-        pkg = MagicMock()
-        pkg.package_id = "pkg-1"
-        pkg.package_config = {"product_id": "prod-1"}
+        pkg = _make_mock_package(package_id="pkg-1", package_config={"product_id": "prod-1"})
 
         provider = MagicMock()
         provider.name = "Provider A"
@@ -310,9 +313,7 @@ class TestProviderMaterializedBeforeSessionCloses:
     @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
     def test_provider_attributes_read_before_uow_exits(self, mock_resolve, mock_post):
         """Provider fields are captured inside the `with` block, not after."""
-        pkg = MagicMock()
-        pkg.package_id = "pkg-1"
-        pkg.package_config = {"product_id": "prod-1"}
+        pkg = _make_mock_package(package_id="pkg-1", package_config={"product_id": "prod-1"})
 
         closed_flag = [False]
         provider = self._DetachAfterCloseProvider("Provider A", "http://provider-a:3000", "secret", closed_flag)
@@ -353,9 +354,7 @@ class TestSyncPackagesFanOut:
     @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
     def test_fans_out_to_all_providers(self, mock_resolve, mock_post):
         """Packages are POSTed to every syncable provider."""
-        pkg = MagicMock()
-        pkg.package_id = "pkg-1"
-        pkg.package_config = {"product_id": "prod-1", "name": "Test"}
+        pkg = _make_mock_package(package_id="pkg-1", package_config={"product_id": "prod-1", "name": "Test"})
 
         provider1 = MagicMock()
         provider1.name = "Provider A"
@@ -401,9 +400,7 @@ class TestSyncPackagesFanOut:
     @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
     def test_skips_when_no_providers(self, mock_resolve, mock_post):
         """No HTTP calls when tenant has no syncable providers."""
-        pkg = MagicMock()
-        pkg.package_id = "pkg-1"
-        pkg.package_config = {}
+        pkg = _make_mock_package(package_id="pkg-1", package_config={})
 
         mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = _make_sync_uow(packages=[pkg], providers=[])
         with (
@@ -418,9 +415,7 @@ class TestSyncPackagesFanOut:
     @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
     def test_one_provider_failure_does_not_block_others(self, mock_resolve, mock_post):
         """If one provider fails, the others still get called."""
-        pkg = MagicMock()
-        pkg.package_id = "pkg-1"
-        pkg.package_config = {}
+        pkg = _make_mock_package(package_id="pkg-1", package_config={})
 
         provider1 = MagicMock()
         provider1.name = "Failing Provider"
@@ -475,32 +470,19 @@ class TestOneUnreadableCredentialDoesNotSkipTheRest:
     (#1197 review).
     """
 
-    @staticmethod
-    def _provider(name: str, endpoint: str, *, credential: object) -> MagicMock:
-        """A provider mock whose ``auth_credentials`` returns or RAISES *credential*."""
-        provider = MagicMock()
-        provider.name = name
-        provider.endpoint = endpoint
-        if isinstance(credential, Exception):
-            type(provider).auth_credentials = mock.PropertyMock(side_effect=credential)
-        else:
-            provider.auth_credentials = credential
-        return provider
-
     @patch("src.services.tmp_provider_sync._post_packages_sync")
     @patch("src.services.tmp_provider_sync._resolve_seller_agent_url", return_value=_SELLER_AGENT_URL)
     def test_healthy_providers_still_receive_packages(self, mock_resolve, mock_post):
         from src.core.exceptions import AdCPConfigurationError
 
-        pkg = MagicMock()
-        pkg.package_id = "pkg-1"
+        pkg = _make_mock_package(package_id="pkg-1")
 
-        rotated = self._provider(
-            "Rotated Provider",
-            "http://rotated:3000",
+        rotated = _make_mock_provider(
+            name="Rotated Provider",
+            endpoint="http://rotated:3000",
             credential=AdCPConfigurationError("Failed to decrypt auth credentials for TMP provider p1"),
         )
-        healthy = self._provider("Healthy Provider", "http://healthy:3000", credential="tok")
+        healthy = _make_mock_provider(name="Healthy Provider", endpoint="http://healthy:3000", credential="tok")
 
         mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = _make_sync_uow(packages=[pkg], providers=[rotated, healthy])
         with (
@@ -521,11 +503,10 @@ class TestOneUnreadableCredentialDoesNotSkipTheRest:
 
         from src.core.exceptions import AdCPConfigurationError
 
-        pkg = MagicMock()
-        pkg.package_id = "pkg-1"
-        rotated = self._provider(
-            "Rotated Provider",
-            "http://rotated:3000",
+        pkg = _make_mock_package(package_id="pkg-1")
+        rotated = _make_mock_provider(
+            name="Rotated Provider",
+            endpoint="http://rotated:3000",
             credential=AdCPConfigurationError("boom"),
         )
 
@@ -812,9 +793,7 @@ class TestPostPackagesSyncAuth:
 
     def test_fan_out_uses_provider_auth_credentials(self):
         """sync_packages_for_media_buy passes provider.auth_credentials to _post_packages_sync."""
-        pkg = MagicMock()
-        pkg.package_id = "pkg-1"
-        pkg.package_config = {"product_id": "prod-1"}
+        pkg = _make_mock_package(package_id="pkg-1", package_config={"product_id": "prod-1"})
 
         provider = MagicMock()
         provider.name = "Credentialed Provider"

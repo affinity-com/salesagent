@@ -24,13 +24,21 @@ from tests.bdd.steps.generic._dispatch import dispatch_request
 from tests.helpers.pinned_schema import load as load_pinned_schema
 
 
-@given(parsers.parse('a TMP provider is registered for the tenant with status "{status}"'))
+@given(parsers.parse('the tenant\'s only TMP provider has status "{status}"'))
 def given_provider_with_status(ctx: dict, status: str) -> None:
-    """Register exactly one provider in *status* for the scenario's tenant."""
-    from tests.factories.tmp_provider import TMPProviderFactory
+    """Make the tenant have EXACTLY one provider, in *status*.
 
-    TMPProviderFactory(
-        tenant=ctx["tenant"],
+    Through ``replace_tmp_providers`` rather than ``TMPProviderFactory`` directly:
+    the scenarios assert on "a tenant whose only provider is …", and calling the
+    factory made that precondition true only because the harness happens to hand
+    each scenario a clean database — which is not something this step states or
+    controls (#1197 review). "Replace" states it.
+    """
+    from tests.factories import replace_tmp_providers
+
+    replace_tmp_providers(
+        ctx["env"],
+        ctx["env"]._tenant_id,
         name=f"Capability Declaration Provider ({status})",
         status=status,
     )

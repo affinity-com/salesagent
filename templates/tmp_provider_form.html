@@ -198,8 +198,12 @@ block content %}
         id="priority"
         name="priority"
         class="form-control"
-        value="{{ provider.priority if provider else 0 }}"
-        min="0"
+        value="{{ provider.priority if provider else field_bounds.priority.default }}"
+        {# From the record, like timeout_ms above — field_bounds.priority was being
+           computed and then ignored in favour of a hand-typed attribute. `max` is
+           emitted only when the record actually bounds it (#1197 review). #}
+        min="{{ field_bounds.priority.min }}"
+        {% if field_bounds.priority.max is not none %}max="{{ field_bounds.priority.max }}"{% endif %}
         style="max-width: 200px"
       />
       <small class="form-text text-muted">

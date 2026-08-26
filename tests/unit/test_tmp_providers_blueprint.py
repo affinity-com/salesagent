@@ -653,10 +653,36 @@ class TestListPageRendersTheRealTemplate:
         assert "Listed Provider" in html
         assert _SAFE_ENDPOINT in html
         assert "Draining" in html
-        # The Deactivate action is offered only for an active provider. Asserted on
-        # the button's onclick, not the function name — the JS helper is always
-        # defined; only its invocation is conditional.
-        assert 'onclick="deactivateProvider(' not in html
+
+    def test_deactivate_is_offered_per_the_status_mapping(self):
+        """Which statuses can be deactivated comes from the mapping, not the template.
+
+        A draining provider IS deactivatable (draining → inactive is a real
+        transition the repository accepts); an inactive one is not, because there is
+        nothing to deactivate. Asserted on the button's onclick, not the function
+        name — the JS helper is always defined, only its invocation is conditional.
+        """
+        from src.admin.blueprints.tmp_providers import _status_presentation
+
+        presentation = _status_presentation()
+        for status, presented in presentation.items():
+            html = self._render_list(self._provider(status=status))
+            offered = 'onclick="deactivateProvider(' in html
+            assert offered is bool(presented["deactivatable"]), (
+                f"status {status!r}: Deactivate offered={offered}, mapping says {presented['deactivatable']}"
+            )
+
+    def test_an_unrecognized_status_renders_as_itself(self):
+        """A status the SDK enum grows renders as its own value, not as "Inactive".
+
+        The hand-written active/draining/else branch labelled every unknown status
+        "Inactive" while the edit form — rendering from the same enum — offered it
+        (#1197 review).
+        """
+        html = self._render_list(self._provider(status="quiescing"))
+
+        assert "quiescing" in html
+        assert "Inactive" not in html
 
 
 class TestEditPageRendersTheRealTemplate:

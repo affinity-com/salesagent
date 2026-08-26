@@ -332,6 +332,43 @@ def _form_render_context() -> dict[str, object]:
     }
 
 
+def _list_render_context() -> dict[str, object]:
+    """The vocabularies the list view renders — see :func:`_status_presentation`."""
+    return {"status_presentation": _status_presentation()}
+
+
+#: How each lifecycle status is presented, and whether it can be deactivated.
+#:
+#: Keyed off ``VALID_STATUSES`` so a spec bump that widens the SDK enum cannot
+#: leave the list view rendering a new status as "Inactive" — which is what the
+#: template's hand-written ``active`` / ``draining`` / else branch did, while the
+#: edit form (rendering from the same enum) offered it. An unrecognized status
+#: renders as itself rather than as a wrong label (#1197 review).
+#:
+#: "Can this be deactivated?" is a domain statement too: the template gated the
+#: button on ``status == 'active'`` while ``TMPProviderRepository.deactivate``
+#: accepts any status, in a view the render context did not even pass the
+#: vocabulary to.
+_STATUS_PRESENTATION: dict[str, dict[str, object]] = {
+    "active": {"label": "Active", "style": "color: #059669; font-weight: 600", "deactivatable": True},
+    "draining": {"label": "⏳ Draining", "style": "color: #d97706; font-weight: 600", "deactivatable": True},
+    "inactive": {"label": "Inactive", "style": "color: #9ca3af", "deactivatable": False},
+}
+
+
+def _status_presentation() -> dict[str, dict[str, object]]:
+    """Presentation for every status in the vocabulary, including unrecognized ones.
+
+    A status the SDK enum grows but this table does not know is rendered as its own
+    value with neutral styling and treated as deactivatable — visible and
+    actionable, rather than silently mislabelled.
+    """
+    presentation = dict(_STATUS_PRESENTATION)
+    for status in VALID_STATUSES:
+        presentation.setdefault(status, {"label": status, "style": "color: #6b7280", "deactivatable": True})
+    return presentation
+
+
 def _numeric_field_bounds() -> dict[str, dict[str, int | None]]:
     """The numeric input bounds, read off the record rather than typed into the form.
 
@@ -445,6 +482,7 @@ def list_tmp_providers(tenant_id):
                 tenant_id=tenant_id,
                 tenant_name=tenant.name,
                 providers=providers_list,
+                **_list_render_context(),
             )
 
     except Exception as e:

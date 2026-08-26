@@ -20,19 +20,19 @@ Feature: TMP capability declaration — the agent declares the surface it implem
 
   @T-TMP-CAPS-declared @trusted_match @experimental
   Scenario: a tenant with a syncable provider declares the trusted match surface
-    Given a TMP provider is registered for the tenant with status "active"
+    Given the tenant's only TMP provider has status "active"
     When the Buyer Agent asks for the seller's capabilities
     Then experimental_features includes "trusted_match.core"
 
   @T-TMP-CAPS-draining @trusted_match @experimental
   Scenario: a draining provider still counts as implemented
-    Given a TMP provider is registered for the tenant with status "draining"
+    Given the tenant's only TMP provider has status "draining"
     When the Buyer Agent asks for the seller's capabilities
     Then experimental_features includes "trusted_match.core"
 
   @T-TMP-CAPS-inactive @trusted_match @experimental
   Scenario: a tenant whose only provider is inactive does not declare the surface
-    Given a TMP provider is registered for the tenant with status "inactive"
+    Given the tenant's only TMP provider has status "inactive"
     When the Buyer Agent asks for the seller's capabilities
     Then experimental_features does not include "trusted_match.core"
 
