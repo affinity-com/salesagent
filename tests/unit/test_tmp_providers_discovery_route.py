@@ -198,7 +198,7 @@ class TestDiscoveryResponseShape:
     def test_name_is_not_on_the_machine_wire(self, client):
         """`name` is not in the closed schema, so the discovery wire must not carry it.
 
-        It stays on the admin serialization (``to_admin_dict``) — see
+        It stays on the admin view shape (``_admin_view``) — see
         ``TestTMPProviderSerializers``.  The TMP Router uses ``name`` only as a
         fallback identifier when ``provider_id`` is empty, and this endpoint
         always emits ``provider_id``.
@@ -453,7 +453,7 @@ class TestDiscoverySkipsUnrepresentableRows:
 class TestDiscoveryEntryIsTheSdkType:
     """The wire entry is the pinned SDK model, so the schema's rules are its rules.
 
-    These used to grade a hand-written ``to_discovery_dict()`` against the schema.
+    These used to grade a hand-written serializer against the schema.
     The entry is now :class:`TMPProviderDiscoveryEntry`, which extends the pinned
     codegen — so the tests that remain are the ones that can still fail: that a
     row converts, that the conversion enforces what the schema says, and that the

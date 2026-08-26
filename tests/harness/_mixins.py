@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TypedDict
 from unittest.mock import MagicMock
 
 from src.adapters.mock_ad_server import simulate_breakdowns
@@ -656,6 +656,24 @@ class ProductMixin:
         return await _get_products_impl(req, identity)
 
 
+class TMPSyncDelivery(TypedDict):
+    """One request a stub TMP provider received.
+
+    Typed rather than described in prose because a prose key list has no consumer:
+    the mixin's docstring said the record was ``{"path", "body"}`` while
+    ``record()`` returned four keys and the Then-steps read all four — including
+    ``headers``, the only credential-bearing observable in the feature (#1197
+    review). A renamed or dropped key is now a type error at the reader.
+    """
+
+    method: str
+    path: str
+    #: Lower-cased header names — the wire is case-insensitive, so the steps assert
+    #: on one spelling.
+    headers: dict[str, str]
+    body: Any
+
+
 class TMPSyncMixin:
     """The TMP package-sync observable, owned by the env instead of by each test.
 
@@ -672,9 +690,10 @@ class TMPSyncMixin:
     One implementation serves every transport because nothing here depends on
     which process the sync thread runs in:
 
-    * **The collector is a real HTTP receiver.** No client stubbing, so the URL
-      construction, the auth header and the JSON body are production's, and the
-      arrival IS the observable whether the thread ran in this process
+    * **The collector is a real HTTP receiver**, recording the whole request as a
+      :class:`TMPSyncDelivery` (method, path, headers, body). No client stubbing,
+      so the URL construction, the auth header and the JSON body are production's,
+      and the arrival IS the observable whether the thread ran in this process
       (a2a/mcp/rest) or in the server container (e2e_rest).
     * **Completion is the production registry**, via
       :func:`src.services.tmp_provider_sync.join_active_syncs` in-process and by
@@ -734,12 +753,14 @@ class TMPSyncMixin:
             self.get_session().commit()  # type: ignore[attr-defined]
         return str(fields["endpoint"])
 
-    def tmp_sync_deliveries(self) -> list[dict[str, Any]]:
+    def tmp_sync_deliveries(self) -> list[TMPSyncDelivery]:
         """Every ``POST /packages/sync`` the collector has received, in order.
 
-        Entries are ``{"path", "body"}``. The path is carried because "the server
-        POSTed *something*" and "the server POSTed to /packages/sync" are
-        different claims, and only the second one grades ``provider_url()``.
+        Entries are :class:`TMPSyncDelivery`. The path is carried because "the
+        server POSTed *something*" and "the server POSTed to /packages/sync" are
+        different claims, and only the second one grades ``provider_url()``; the
+        headers because the Bearer credential is the third thing that must be
+        identical across transports.
         """
         if self._tmp_collector is None:
             return []
@@ -751,7 +772,7 @@ class TMPSyncMixin:
     #: have landed yet (#1197 review).
     TMP_SYNC_SETTLE_SECONDS = 0.75
 
-    def await_tmp_sync(self, count: int = 1, timeout: float = 30.0) -> dict[str, Any]:
+    def await_tmp_sync(self, count: int = 1, timeout: float = 30.0) -> TMPSyncDelivery:
         """Block until *count* package-sync deliveries have arrived; return the *count*-th.
 
         This is the LIVENESS signal, so it waits for "at least count" — the
@@ -842,15 +863,15 @@ class TMPSyncMixin:
 
             received_webhooks: list[Any] = []
 
-            def record(self, payload: Any) -> dict[str, Any]:
-                return {
-                    "method": self.command,
-                    "path": self.path,
+            def record(self, payload: Any) -> TMPSyncDelivery:
+                return TMPSyncDelivery(
+                    method=self.command,
+                    path=self.path,
                     # Header names are case-insensitive on the wire; normalize so a
                     # step asserts on one spelling.
-                    "headers": {name.lower(): value for name, value in self.headers.items()},
-                    "body": payload,
-                }
+                    headers={name.lower(): value for name, value in self.headers.items()},
+                    body=payload,
+                )
 
         # Loopback is enough in-process; the e2e server runs in a container and
         # reaches the host via ADCP_WEBHOOK_HOST (in-network) or

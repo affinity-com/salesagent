@@ -1,7 +1,7 @@
 """TMP Provider package sync service.
 
-Pushes package definitions from the Sales Agent to all active TMP Providers
-for a tenant whenever a media buy is created or updated.
+Pushes package definitions from the Sales Agent to every syncable (active or
+draining) TMP Provider for a tenant whenever a media buy is created or updated.
 
 Per the AdCP TMP spec (Package Sync section):
   "Package metadata is synced from seller agents to TMP providers at media buy
@@ -10,17 +10,28 @@ Per the AdCP TMP spec (Package Sync section):
 Each synced AvailablePackage includes a seller_agent reference so the TMP
 Provider can attribute offers back to the originating seller agent.
 
-Design principles (AdCP Pattern compliance):
-- Triggered from **every transport** (MCP, A2A, REST) via ``fire_tmp_sync()``,
-  which spawns a daemon thread so the caller is never blocked.
-- Never called from _impl functions (which must remain transport-agnostic).
+Design principles:
+- Triggered ONCE per media-buy write, by ``@fires_tmp_sync`` on
+  ``_create_media_buy_impl`` / ``_update_media_buy_impl``. The sync is a
+  transport-agnostic consequence of a write — it takes the ``_impl`` return value
+  and an already-resolved ``ResolvedIdentity`` — so it belongs at the one place
+  every transport passes through, not at the four transport edges it used to sit
+  at, where a fifth entry point could silently forget it. Do not add a trigger
+  anywhere else: a second one (a transport wrapper, a route-layer
+  ``BackgroundTasks``) would double-fire, and the decorator already covers every
+  caller of both impls.
+- Spawns a daemon thread so the caller is never blocked, registered in
+  ``_active_syncs`` (the shared ``ThreadRegistry``) so two writes to the same media
+  buy serialize and callers have a deterministic drain
+  (``join_active_syncs()``) instead of patching ``threading.Thread``.
 - Reads packages and provider endpoints via **repositories** (UoW pattern) —
   no raw get_db_session() / select() calls.
 - HTTP calls are made **after** the DB session is closed — no open transaction
   during network I/O.
-- Failures are **logged with full context** and re-raised as warnings so the
-  background task runner records them.  The media buy operation itself is
-  unaffected (fire-and-forget at the transport boundary).
+- Failures are per item, never per batch, and are **swallowed after logging**:
+  nothing is re-raised out of the fan-out, because the media buy is already
+  committed and one provider's failure must not affect another's delivery or the
+  buyer's response.
 
 beads: salesagent-tmp-sync
 """
@@ -100,11 +111,12 @@ _PREDECESSOR_JOIN_TIMEOUT_SECONDS = 60
 def fire_tmp_sync(response: MediaBuyWriteResult, identity: ResolvedIdentity | None) -> None:
     """Spawn a daemon thread to sync TMP packages after a successful media buy operation.
 
-    Transport-agnostic entry point shared by MCP, A2A, and REST transports —
-    the sole trigger for ``sync_packages_for_media_buy``.  There is deliberately
-    no route-layer trigger: adding one (e.g. FastAPI ``BackgroundTasks`` in
-    ``api_v1.py``) would double-fire the sync on REST, since REST already reaches
-    this function through the ``_raw`` wrapper.
+    The sole trigger for ``sync_packages_for_media_buy``, invoked by
+    ``@fires_tmp_sync`` on the two media-buy ``_impl`` functions — which every
+    transport reaches, so this fires exactly once per write on all of them. Do not
+    call it from anywhere else: a transport-wrapper or route-layer
+    (``BackgroundTasks``) trigger would double-fire, since the decorated impl has
+    already fired by the time either of those runs.
 
     ``response`` is whatever the two ``_impl`` functions return:
     ``CreateMediaBuyResult`` (create path) or
@@ -118,9 +130,8 @@ def fire_tmp_sync(response: MediaBuyWriteResult, identity: ResolvedIdentity | No
     ``UpdateMediaBuyResult | UpdateMediaBuySubmitted``), which ``response: Any``
     would have swallowed.
 
-    ``identity`` is a ``ResolvedIdentity`` — ``tenant_id`` is extracted here so
-    callers don't need to repeat ``identity.tenant_id if identity else None`` at
-    every call site (four transport wrappers).
+    ``identity`` is a ``ResolvedIdentity`` — ``tenant_id`` is extracted here so the
+    caller (the decorator) does not have to.
 
     Two rapid operations on the SAME media buy are **serialized**, not raced:
     each sync joins the one already in flight for that media_buy_id before
@@ -556,11 +567,11 @@ def _readable_providers(provider_rows: list[TMPProvider], tenant_id: str) -> lis
 
 
 def sync_packages_for_media_buy(tenant_id: str, media_buy_id: str) -> None:
-    """Background task: push all packages for a media buy to active TMP providers.
+    """Background task: push all packages for a media buy to syncable TMP providers.
 
-    Called from the four transport entry points (MCP create/update wrappers and
-    A2A+REST ``_raw`` wrappers) via ``fire_tmp_sync()``, which spawns a daemon
-    thread so the caller is never blocked.
+    Reached from ``fire_tmp_sync()`` on a daemon thread, so the buyer's request is
+    never blocked by it. That is fired by ``@fires_tmp_sync`` at the return of
+    either media-buy ``_impl`` — one trigger, every transport.
 
     Steps:
       1. Resolve seller_agent URL from tenant config (its own UoW, opened and

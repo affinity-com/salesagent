@@ -96,9 +96,9 @@ def _make_mock_provider(**overrides) -> MagicMock:
     divergent field sets; the superset here serves both.
 
     Use this when the test only needs attribute access.  Use :func:`_make_provider`
-    when the test exercises ``to_discovery_dict()`` / ``to_admin_dict()`` — those
-    need the real ORM model so the production serializer, not a mock
-    reimplementation, is what runs.
+    when the test exercises ``TMPProviderDiscoveryEntry.from_row()`` or the admin
+    layer's ``_admin_view``/``_form_view`` — those need the real ORM model so the
+    production mapper, not a mock reimplementation, is what runs.
     """
     fields: dict = {
         "provider_id": "prov_test_1234",
@@ -179,8 +179,9 @@ def _make_provider(
 ) -> TMPProvider:
     """Create a real TMPProvider ORM instance (no DB session required).
 
-    Uses the real model so that ``to_discovery_dict()`` / ``to_admin_dict()`` are
-    exercised against the production implementation rather than a MagicMock
+    Uses the real model so the production mappers
+    (``TMPProviderDiscoveryEntry.from_row``, and the admin layer's
+    ``_admin_view``/``_form_view``) are exercised rather than a MagicMock
     reimplementation that can silently diverge (e.g. the missing-properties
     regression that was caught in review).
 

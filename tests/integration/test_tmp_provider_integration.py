@@ -381,7 +381,7 @@ class TestSyncPackagesPostsToProviders:
         """With two active providers and one package, httpx.Client.post is called twice.
 
         Stubs httpx.Client (not _post_packages_sync) so the full sync path is
-        graded: URL construction via provider_url(), auth header via bearer_headers(),
+        graded: URL construction via provider_url(), auth header via provider_auth_headers(),
         and JSON body shape from _build_package_payload().
 
         Deliberately does NOT set ADCP_AGENT_URL: that env-var branch returns

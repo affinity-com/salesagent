@@ -12,7 +12,9 @@ of that file's path (#1197 review):
   - uid_types (JSONB, conditional on identity_match)
   - properties (JSONB, optional property RIDs)
   - priority (integer, default 0)
-  - auth_type (string, e.g. "bearer", "api_key") — nullable
+  - auth_type (string) — nullable; constrained by the registration record to the
+    schemes an outbound call actually implements (``VALID_AUTH_SCHEMES``, today
+    just "bearer"), so the column accepts no others through any write surface
   - auth_credentials (text, stores token/key value) — nullable
   - health_status (string, written by background scheduler) — nullable
   - last_health_checked_at (datetime, written by background scheduler) — nullable

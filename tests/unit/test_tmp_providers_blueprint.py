@@ -883,7 +883,7 @@ class TestAdminViewShape:
 
         view = _admin_view(provider)
 
-        # The badge inputs — the keys the model's to_admin_dict() omitted.
+        # The badge inputs — the keys the ORM-side mapper used to omit.
         assert view["auth_type"] == "bearer"
         assert view["has_auth_credentials"] is False
         # `name` is carried here (it is NOT on the machine wire), and the three

@@ -77,7 +77,7 @@ class _TMPProviderAdminScalars(TypedDict):
 
 
 class TMPProviderAdminDict(_TMPProviderAdminScalars, total=False):
-    """What :meth:`TMPProvider.to_admin_dict` returns — the admin list view's row.
+    """What :func:`_admin_view` returns — the admin list view's row.
 
     Typed rather than a bare ``dict`` because its consumer
     (``templates/tmp_providers.html``) breaks on a renamed key. It lives HERE,
@@ -360,7 +360,7 @@ def _admin_view(provider: TMPProvider) -> TMPProviderAdminDict:
     row→view mappers, and a mapper has to sit where it can name BOTH types: on
     ``models.py`` this one could only return ``dict[str, Any]`` (the ORM module
     must not import the admin package), and the consequence shipped — the list
-    template reads ``provider.auth_type`` for its 🔑/⚠️ badge, ``to_admin_dict()``
+    template reads ``provider.auth_type`` for its 🔑/⚠️ badge, the ORM-side mapper
     deliberately omitted the auth fields, and Jinja's falsy ``Undefined`` rendered
     "⚠️ No Auth" on every row, credentialed or not (#1197 review).
 

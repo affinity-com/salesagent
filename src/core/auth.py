@@ -226,7 +226,8 @@ def get_principal_from_context(
 
     # If x-adcp-auth not present, try Authorization: Bearer (for Anthropic, standard MCP clients).
     # parse_bearer_token() is the single canonical Bearer parser shared across
-    # auth.py, auth_middleware.py, resolved_identity.py, and routes/tmp_providers.py.
+    # auth.py, auth_middleware.py and resolved_identity.py. Routes never parse the
+    # header themselves — they read the token UnifiedAuthMiddleware extracted.
     if not auth_token:
         authorization_header = _get_header_case_insensitive(headers, "Authorization") or ""
         bearer_token = _parse_bearer_token(authorization_header)

@@ -121,3 +121,66 @@ def test_discovery_path_is_spelled_only_where_it_is_declared():
         "The discovery path is spelled outside "
         f"{_DISCOVERY_PATH_OWNER}. Reference DISCOVERY_ROUTE instead:\n  " + "\n  ".join(offenders)
     )
+
+
+# The TMP feature's modules and suites. Scoped rather than tree-wide: the point is
+# that THIS feature's renames stop leaving prose behind, and a tree-wide symbol
+# check would need an allowlist for every legitimately-external name.
+_TMP_FILES = (
+    "src/routes/tmp_providers.py",
+    "src/services/tmp_provider_sync.py",
+    "src/services/tmp_health_scheduler.py",
+    "src/services/_provider_http.py",
+    "src/core/schemas/tmp_provider.py",
+    "src/admin/blueprints/tmp_providers.py",
+    "src/core/database/repositories/tmp_provider.py",
+    "tests/unit/_tmp_helpers.py",
+    "tests/unit/test_tmp_provider_registration.py",
+    "tests/unit/test_tmp_provider_sync.py",
+    "tests/unit/test_tmp_providers_blueprint.py",
+    "tests/unit/test_tmp_providers_discovery_route.py",
+    "tests/unit/test_tmp_health_scheduler.py",
+    "tests/unit/test_fire_tmp_sync.py",
+    "tests/integration/test_tmp_provider_integration.py",
+    "tests/integration/test_tmp_provider_repository.py",
+    "tests/e2e/test_tmp_discovery_e2e.py",
+    "tests/harness/_mixins.py",
+    "tests/bdd/steps/domain/tmp_package_sync.py",
+    "tests/bdd/steps/domain/tmp_capability_declaration.py",
+)
+
+#: Symbols this feature has renamed or deleted, and what they became. A citation of
+#: a dead name is prose that describes a design the code no longer has — which is
+#: how `to_discovery_dict` came to have six citations and zero definitions
+#: (#1197 review). Add an entry whenever a TMP symbol is renamed.
+_RETIRED_SYMBOLS: dict[str, str] = {
+    "to_discovery_dict": "TMPProviderDiscoveryEntry.from_row",
+    "to_admin_dict": "_admin_view (admin layer)",
+    "TMPProviderDiscoveryDict": "TMPProviderDiscoveryEntry",
+    "bearer_headers": "provider_auth_headers",
+    "PROVIDER_AUTH_SCHEMES": "VALID_AUTH_SCHEMES (src.core.schemas.tmp_provider)",
+    "sanitize_for_log": "log_safe (src.core.logging_config)",
+    "_parse_interval_env": "parse_interval_env",
+    "schedule_tmp_sync": "fires_tmp_sync",
+}
+
+
+def test_no_citation_of_a_retired_tmp_symbol():
+    """A renamed TMP symbol leaves no citation behind.
+
+    Prose has no consumer, so nothing fails when it stops being true — a rename
+    updates the code and leaves the comments describing the design it replaced.
+    This makes the next rename fail a test instead.
+    """
+    this_file = pathlib.Path(__file__).resolve()
+    offenders: list[str] = []
+    for rel in _TMP_FILES:
+        path = REPO_ROOT / rel
+        if not path.is_file() or path.resolve() == this_file:
+            continue
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            for dead, replacement in _RETIRED_SYMBOLS.items():
+                if dead in line:
+                    offenders.append(f"{rel}:{lineno} cites retired {dead!r} (now: {replacement})")
+
+    assert not offenders, "Citations of retired TMP symbols:\n  " + "\n  ".join(offenders)

@@ -50,7 +50,7 @@ key set of the pinned ``provider-registration.json``
 the provider restricts nothing: the schema types all three ``array`` with
 ``minItems: 1``.  ``name`` is not on this wire at all (it is not in the closed
 schema); it lives on the admin serialization.  See
-``TMPProvider.to_discovery_dict``.
+``TMPProviderDiscoveryEntry.from_row``.
 
 Only providers whose status is 'active' or 'draining' are returned.
 Providers with status 'inactive' are excluded entirely.
