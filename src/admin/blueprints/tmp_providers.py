@@ -85,11 +85,9 @@ class TMPProviderAdminDict(_TMPProviderAdminScalars, total=False):
     it is a Jinja view shape with no counterpart in the AdCP schema, and the
     machine wire is the SDK type ``TMPProviderDiscoveryEntry`` (#1197 review).
 
-    ``created_at`` is declared here because the list handler adds it to the
-    returned mapping: a key a caller writes is part of this shape whether or not
-    the serializer emits it, and declaring it is what makes that write a checked
-    one.  ``total=False`` covers exactly that — the serializer always emits the
-    other keys.
+    Built by :func:`_admin_view`, which is annotated with it — so a key the
+    template reads and the mapper does not build is a type error rather than a
+    silently blank badge.
 
     The three conditional arrays are ``list[str] | None`` (never omitted):
     unlike the discovery wire, which omits them, the list view distinguishes
@@ -101,6 +99,12 @@ class TMPProviderAdminDict(_TMPProviderAdminScalars, total=False):
     uid_types: list[str] | None
     properties: list[str] | None
     created_at: datetime
+    #: The badge the list template renders. It reads ``provider.auth_type``, and
+    #: this shape not carrying it is what made every row say "⚠️ No Auth"
+    #: (#1197 review).
+    auth_type: str | None
+    #: Presence only — the credential itself is never put in a view shape.
+    has_auth_credentials: bool
 
 
 class TMPProviderFormDict(_TMPProviderAdminScalars, total=False):
@@ -117,7 +121,10 @@ class TMPProviderFormDict(_TMPProviderAdminScalars, total=False):
     uid_types: str
     properties: str
     auth_type: str | None
-    auth_credentials: str
+    #: Presence, not a value. The template branches on this to show "(set — leave
+    #: blank to keep)"; it previously received a ``"••••••••"`` string that nothing
+    #: rendered and that existed only to be truthy (#1197 review).
+    has_auth_credentials: bool
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +353,40 @@ def _numeric_field_bounds() -> dict[str, dict[str, int | None]]:
     return bounds
 
 
+def _admin_view(provider: TMPProvider) -> TMPProviderAdminDict:
+    """Turn a provider row into the list view's shape.
+
+    Lives here, next to :func:`_form_view`, rather than on the ORM model. Both are
+    row→view mappers, and a mapper has to sit where it can name BOTH types: on
+    ``models.py`` this one could only return ``dict[str, Any]`` (the ORM module
+    must not import the admin package), and the consequence shipped — the list
+    template reads ``provider.auth_type`` for its 🔑/⚠️ badge, ``to_admin_dict()``
+    deliberately omitted the auth fields, and Jinja's falsy ``Undefined`` rendered
+    "⚠️ No Auth" on every row, credentialed or not (#1197 review).
+
+    With the annotation on the return, a missing key the template reads is a type
+    error instead of a blank badge. ``auth_type`` is carried; the CREDENTIAL never
+    is — presence only, via :attr:`TMPProvider.has_auth_credentials`, which does
+    not decrypt.
+    """
+    return TMPProviderAdminDict(
+        provider_id=provider.provider_id,
+        name=provider.name,
+        endpoint=provider.endpoint,
+        context_match=provider.context_match,
+        identity_match=provider.identity_match,
+        timeout_ms=provider.timeout_ms,
+        priority=provider.priority,
+        status=provider.status,
+        countries=provider.countries,
+        uid_types=provider.uid_types,
+        properties=provider.properties,
+        created_at=provider.created_at,
+        auth_type=provider.auth_type,
+        has_auth_credentials=provider.has_auth_credentials,
+    )
+
+
 def _form_view(provider: TMPProvider) -> TMPProviderFormDict:
     """Turn a provider into the edit form's shape.
 
@@ -354,28 +395,27 @@ def _form_view(provider: TMPProvider) -> TMPProviderFormDict:
     (:class:`TMPProviderFormDict`) so a renamed key is a type error rather than a
     silently blank input.
 
-    ``auth_credentials`` is a mask, never the value: the POST side preserves the
-    stored credential when the field comes back empty. ``has_auth_credentials``
-    is the model's presence accessor — it answers "is a credential set?" without
-    decrypting (the decrypting getter raises on a rotated ciphertext, turning a
-    form render into a 500) and without reaching past the property API into the
-    private column (#1197 review).
+    The credential is never carried, in any form — only whether one is set, via
+    :attr:`TMPProvider.has_auth_credentials`. That accessor answers "is a
+    credential set?" without decrypting (the decrypting getter raises on a rotated
+    ciphertext, turning a form render into a 500) and without reaching past the
+    property API into the private column. The POST side preserves the stored value
+    when the field comes back empty (#1197 review).
     """
-    admin = provider.to_admin_dict()
     return TMPProviderFormDict(
-        provider_id=admin["provider_id"],
-        name=admin["name"],
-        endpoint=admin["endpoint"],
-        context_match=admin["context_match"],
-        identity_match=admin["identity_match"],
-        timeout_ms=admin["timeout_ms"],
-        priority=admin["priority"],
-        status=admin["status"],
+        provider_id=provider.provider_id,
+        name=provider.name,
+        endpoint=provider.endpoint,
+        context_match=provider.context_match,
+        identity_match=provider.identity_match,
+        timeout_ms=provider.timeout_ms,
+        priority=provider.priority,
+        status=provider.status,
         countries=",".join(provider.countries or []),
         uid_types=",".join(provider.uid_types or []),
         properties=",".join(provider.properties or []),
         auth_type=provider.auth_type,
-        auth_credentials="••••••••" if provider.has_auth_credentials else "",
+        has_auth_credentials=provider.has_auth_credentials,
     )
 
 
@@ -391,16 +431,13 @@ def list_tmp_providers(tenant_id):
 
             providers = uow.tmp_providers.list_all()
 
-            providers_list = []
-            for p in providers:
-                # to_admin_dict(): the UI serialization — carries `name` for the
-                # table and always emits countries/uid_types/properties (None
-                # means "accepts all"). The discovery wire uses
-                # to_discovery_dict() instead, which omits absent conditionals
-                # and drops `name` to stay inside the closed AdCP schema.
-                entry = p.to_admin_dict()
-                entry["created_at"] = p.created_at
-                providers_list.append(entry)
+            # _admin_view(): the UI serialization — carries `name` for the table,
+            # `auth_type` for the badge, and always emits
+            # countries/uid_types/properties (None means "accepts all"). The
+            # machine wire is TMPProviderDiscoveryEntry.from_row() instead, which
+            # omits absent conditionals and drops `name` to stay inside the closed
+            # AdCP schema.
+            providers_list = [_admin_view(p) for p in providers]
 
             return render_template(
                 "tmp_providers.html",

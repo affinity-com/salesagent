@@ -1,4 +1,11 @@
-"""Guard: every ``adcp/_schemas/...`` citation names a file that actually exists.
+"""Guards on the TMP feature's two declared contracts: the pinned schema path, and
+the discovery route path.
+
+Both exist so a contract has ONE definition; both were previously re-typed at call
+sites with nothing pinning the copies equal. A declaration only ends drift if
+declining to use it fails, which is what these guards make true (#1197 review).
+
+Guard 1 — every ``adcp/_schemas/...`` citation names a file that actually exists.
 
 A citation is only worth writing if it can be checked. Comments and docstrings
 across the TMP surfaces cited ``dist/schemas/3.1.1/...`` — a path that resolves
@@ -20,6 +27,7 @@ would make it network-dependent.
 
 from __future__ import annotations
 
+import pathlib
 import re
 
 from tests.helpers.pinned_schema import schema_root
@@ -70,3 +78,46 @@ def test_the_guard_actually_finds_citations():
     """A guard that matched nothing would pass vacuously forever."""
     found = list(_citations())
     assert found, "no adcp/_schemas/... citations found — the citation regex or the scan roots regressed"
+
+
+# The one place the discovery path may be spelled: the module that declares it and
+# registers the route from that declaration.
+_DISCOVERY_PATH_FRAGMENT = "tmp-providers/discovery"
+_DISCOVERY_PATH_OWNER = "src/routes/tmp_providers.py"
+# src/app.py's include_router comment names the mounted path for an operator
+# reading the app wiring; it is a comment beside the mount, not a second consumer.
+_DISCOVERY_PATH_ALLOWED = frozenset({_DISCOVERY_PATH_OWNER, "src/app.py"})
+
+
+def test_discovery_path_is_spelled_only_where_it_is_declared():
+    """No hand-typed discovery path outside the route module.
+
+    ``DISCOVERY_ROUTE`` is declared in ``src/routes/tmp_providers.py`` and the route
+    is registered from it. Every other site — tests, prose, other modules — must
+    reference the constant (``DISCOVERY_ROUTE.format(tenant_id=...)``), so editing
+    the path cannot leave a stale copy behind. Two suites previously carried 15
+    executable literals plus prose restatements of it (#1197 review).
+    """
+    offenders: list[str] = []
+    for path in iter_git_tracked_files(REPO_ROOT):
+        if path.suffix not in _TEXT_SUFFIXES:
+            continue
+        rel = path.relative_to(REPO_ROOT)
+        if str(rel) in _DISCOVERY_PATH_ALLOWED:
+            continue
+        if rel.parts and rel.parts[0] not in ("src", "tests"):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        if str(rel) == str(pathlib.Path(__file__).relative_to(REPO_ROOT)):
+            continue  # this guard names the fragment on purpose
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if _DISCOVERY_PATH_FRAGMENT in line:
+                offenders.append(f"{rel}:{lineno}: {line.strip()[:90]}")
+
+    assert not offenders, (
+        "The discovery path is spelled outside "
+        f"{_DISCOVERY_PATH_OWNER}. Reference DISCOVERY_ROUTE instead:\n  " + "\n  ".join(offenders)
+    )

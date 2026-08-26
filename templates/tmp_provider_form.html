@@ -248,8 +248,8 @@ block content %}
     <div class="form-group">
       <label for="auth_credentials">API Key / Token</label>
       <input type="password" name="auth_credentials" id="auth_credentials" class="form-control"
-             placeholder="{% if provider and provider.auth_credentials %}(set — leave blank to keep){% else %}Paste API key here{% endif %}">
-      {% if provider and provider.auth_credentials %}
+             placeholder="{% if provider and provider.has_auth_credentials %}(set — leave blank to keep){% else %}Paste API key here{% endif %}">
+      {% if provider and provider.has_auth_credentials %}
       <small class="form-text text-muted">Credentials are set. Leave blank to keep existing value.</small>
       {% endif %}
     </div>

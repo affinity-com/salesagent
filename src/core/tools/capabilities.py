@@ -191,7 +191,6 @@ def _get_adcp_capabilities_impl(
     publisher_domains: list[PublisherDomain] = []
     try:
         with TenantConfigUoW(tenant_id) as uow:
-            assert uow.tenant_config is not None
             partners = uow.tenant_config.list_publisher_partners()
             for partner in partners:
                 if partner.publisher_domain:

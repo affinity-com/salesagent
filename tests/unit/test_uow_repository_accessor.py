@@ -17,8 +17,6 @@ from __future__ import annotations
 
 import pytest
 
-from src.core.database.repositories.tenant_config import TenantConfigRepository
-from src.core.database.repositories.tmp_provider import TMPProviderRepository
 from src.core.database.repositories.uow import TenantConfigUoW, TMPProviderUoW
 from src.core.exceptions import AdCPServiceUnavailableError
 
@@ -63,7 +61,14 @@ class TestOutsideAnOpenSession:
 
 
 class TestInsideAnOpenSession:
-    """Inside the block the accessor hands back the concrete repository."""
+    """Inside the block the accessor hands back the concrete repository.
+
+    The real-session counterpart — that an open UoW yields the concrete
+    repository TYPES — lives in ``tests/integration/test_tmp_provider_repository.py``.
+    It needs Postgres, and the tier boundary decides placement: it was the only
+    ``requires_db`` test under ``tests/unit/``, so the Unit Tests job (which runs
+    without a database service) errored on it (#1197 review).
+    """
 
     def test_returns_the_repository_with_no_narrowing(self):
         uow = TMPProviderUoW("tenant_x")
@@ -73,9 +78,3 @@ class TestInsideAnOpenSession:
         # No `assert ... is not None`, no `if ... is None: raise` — the read is
         # the whole call site.
         assert uow.tmp_providers is sentinel
-
-    @pytest.mark.requires_db
-    def test_real_session_yields_the_concrete_repository_types(self, integration_db):
-        with TMPProviderUoW("tenant_x") as uow:
-            assert isinstance(uow.tmp_providers, TMPProviderRepository)
-            assert isinstance(uow.tenant_config, TenantConfigRepository)

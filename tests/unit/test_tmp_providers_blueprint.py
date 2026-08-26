@@ -473,80 +473,6 @@ class TestTMPProviderAuthFields:
             auth_credentials="my-secret-token",
         )
 
-    def test_edit_get_includes_auth_fields_in_provider_dict(self):
-        """GET /tmp-providers/<id>/edit includes auth_type and auth_credentials in template context.
-
-        Uses a real TMPProvider instance (not a MagicMock) so that to_admin_dict()
-        and has_auth_credentials are exercised against the production implementation —
-        avoids the missing-properties regression that was caught in review (same
-        pattern as test_tmp_providers_discovery_route.py).
-        """
-        client = _make_tmp_provider_client()
-
-        # Real TMPProvider instance — to_admin_dict() is the production implementation.
-        existing_provider = TMPProvider(
-            provider_id="prov_test_1234",
-            tenant_id="default",
-            name="Test Provider",
-            endpoint="https://provider.example.com/tmp",
-            context_match=True,
-            identity_match=True,
-            countries=["US", "GB"],
-            uid_types=["uid2", "id5"],
-            properties=None,
-            timeout_ms=50,
-            priority=0,
-            status="active",
-            auth_type="bearer",
-        )
-        # Set auth_credentials via the property so the encryption path is exercised.
-        from cryptography.fernet import Fernet
-
-        _key = Fernet.generate_key().decode()
-        with patch.dict(os.environ, {"ENCRYPTION_KEY": _key}):
-            existing_provider.auth_credentials = "stored-token"
-
-            mock_uow_cls, mock_uow = _make_blueprint_uow()
-            mock_tenant = mock_uow.tenant_config.get_tenant.return_value
-            mock_uow.tmp_providers.get_by_id.return_value = existing_provider
-            with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
-                with patch("src.admin.blueprints.tmp_providers.render_template") as mock_render:
-                    mock_render.return_value = "<html/>"
-                    with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                        response = client.get(
-                            "/tenant/default/tmp-providers/prov_test_1234/edit",
-                        )
-
-        assert response.status_code == 200
-        # Production calls to_admin_dict() then overwrites
-        # list fields with comma-separated strings and adds auth fields with
-        # placeholder masking (credentials are never echoed back to the browser).
-        mock_render.assert_called_once_with(
-            "tmp_provider_form.html",
-            tenant=mock_tenant,
-            tenant_id="default",
-            tenant_name="Default Tenant",
-            provider={
-                "provider_id": "prov_test_1234",
-                "name": "Test Provider",
-                "endpoint": "https://provider.example.com/tmp",
-                "context_match": True,
-                "identity_match": True,
-                "countries": "US,GB",
-                "uid_types": "uid2,id5",
-                "properties": "",
-                "timeout_ms": 50,
-                "priority": 0,
-                "status": "active",
-                "auth_type": "bearer",
-                "auth_credentials": "••••••••",
-            },
-            # Through the production helper, not a hand-listed copy: the form
-            # context is one thing the blueprint owns, and re-typing its keys per
-            # test is how the template's own vocabularies drifted (#1197 review).
-            **_form_render_context(),
-        )
-
     def test_edit_post_preserves_existing_credentials_when_empty_submitted(self):
         """POST /tmp-providers/<id>/edit with empty auth_credentials preserves existing value."""
         client = _make_tmp_provider_client()
@@ -652,70 +578,135 @@ class TestTMPProviderAuthFields:
 # change and one copy would inevitably drift (CLAUDE.md DRY invariant).
 
 
-class TestListRouteRenderKwargs:
-    """``list_tmp_providers`` builds the table rows the list template reads.
+class TestListPageRendersTheRealTemplate:
+    """The list page is graded by rendering it, not by asserting render kwargs.
 
-    The list branch was reworked twice in this PR with nothing grading it —
-    deleting the ``created_at`` line failed no test, and neither did dropping a
-    provider from the list (#1197 review).
+    Every HTML-rendering route here used to be tested with
+    ``patch("…tmp_providers.render_template")``, so the assertions were on the
+    mapping handed to a stand-in renderer and ``templates/tmp_providers.html``
+    was rendered by no test at all. That is how the auth badge shipped broken: the
+    template reads ``provider.auth_type``, the view shape did not carry it, and an
+    exact-kwargs assertion with ``auth_type`` visibly absent passed. The sibling
+    admin suites already assert on ``response.data`` (#1197 review).
     """
 
-    def test_rows_carry_the_admin_shape_plus_created_at(self):
+    @staticmethod
+    def _provider(**overrides) -> TMPProvider:
         from datetime import UTC, datetime
 
-        created = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
-        provider = TMPProvider(
-            provider_id="prov_list_1",
-            tenant_id="default",
-            name="Listed Provider",
-            endpoint=_SAFE_ENDPOINT,
-            context_match=True,
-            identity_match=False,
-            countries=None,
-            uid_types=None,
-            properties=None,
-            timeout_ms=50,
-            priority=0,
-            status="active",
-        )
-        provider.created_at = created
+        fields = {
+            "provider_id": "prov_list_1",
+            "tenant_id": "default",
+            "name": "Listed Provider",
+            "endpoint": _SAFE_ENDPOINT,
+            "context_match": True,
+            "identity_match": False,
+            "countries": None,
+            "uid_types": None,
+            "properties": None,
+            "timeout_ms": 50,
+            "priority": 0,
+            "status": "active",
+            "auth_type": None,
+        }
+        fields.update(overrides)
+        provider = TMPProvider(**fields)
+        provider.created_at = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
+        return provider
 
+    def _render_list(self, provider: TMPProvider) -> str:
         client = _make_tmp_provider_client()
         mock_uow_cls, mock_uow = _make_blueprint_uow()
-        mock_tenant = mock_uow.tenant_config.get_tenant.return_value
         mock_uow.tmp_providers.list_all.return_value = [provider]
 
         with (
             patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls),
-            patch("src.admin.blueprints.tmp_providers.render_template") as mock_render,
             patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}),
         ):
-            mock_render.return_value = "<html/>"
             response = client.get("/tenant/default/tmp-providers/")
 
         assert response.status_code == 200
-        mock_render.assert_called_once_with(
-            "tmp_providers.html",
-            tenant=mock_tenant,
+        return response.data.decode()
+
+    def test_credentialed_provider_renders_the_auth_badge(self):
+        """The defect this test exists for: a provider WITH auth must not read "No Auth"."""
+        html = self._render_list(self._provider(auth_type="bearer"))
+
+        assert "🔑 Auth" in html
+        assert "No Auth" not in html
+
+    def test_uncredentialed_provider_renders_the_no_auth_badge(self):
+        html = self._render_list(self._provider(auth_type=None))
+
+        assert "No Auth" in html
+        assert "🔑 Auth" not in html
+
+    def test_active_provider_is_offered_the_deactivate_action(self):
+        html = self._render_list(self._provider(status="active"))
+
+        assert 'onclick="deactivateProvider(' in html
+
+    def test_row_values_reach_the_page(self):
+        """The row the operator reads — name, endpoint, status — is on the page."""
+        html = self._render_list(self._provider(status="draining"))
+
+        assert "Listed Provider" in html
+        assert _SAFE_ENDPOINT in html
+        assert "Draining" in html
+        # The Deactivate action is offered only for an active provider. Asserted on
+        # the button's onclick, not the function name — the JS helper is always
+        # defined; only its invocation is conditional.
+        assert 'onclick="deactivateProvider(' not in html
+
+
+class TestEditPageRendersTheRealTemplate:
+    """The edit form is graded by rendering it too."""
+
+    def test_selected_status_and_credential_mask_are_rendered(self):
+        provider = TMPProvider(
+            provider_id="prov_edit_1",
             tenant_id="default",
-            tenant_name="Default Tenant",
-            providers=[
-                {
-                    "provider_id": "prov_list_1",
-                    "name": "Listed Provider",
-                    "endpoint": _SAFE_ENDPOINT,
-                    "context_match": True,
-                    "identity_match": False,
-                    "timeout_ms": 50,
-                    "priority": 0,
-                    "status": "active",
-                    "countries": None,
-                    "uid_types": None,
-                    "properties": None,
-                    "created_at": created,
-                }
-            ],
+            name="Edit Provider",
+            endpoint=_SAFE_ENDPOINT,
+            context_match=True,
+            identity_match=True,
+            countries=["US", "GB"],
+            uid_types=["uid2"],
+            properties=None,
+            timeout_ms=250,
+            priority=1,
+            status="draining",
+            auth_type="bearer",
         )
+        from cryptography.fernet import Fernet
+
+        key = Fernet.generate_key().decode()
+        with patch.dict(os.environ, {"ENCRYPTION_KEY": key}):
+            provider.auth_credentials = "stored-token"
+
+            client = _make_tmp_provider_client()
+            mock_uow_cls, mock_uow = _make_blueprint_uow()
+            mock_uow.tmp_providers.get_by_id.return_value = provider
+
+            with (
+                patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls),
+                patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}),
+            ):
+                response = client.get("/tenant/default/tmp-providers/prov_edit_1/edit")
+
+        assert response.status_code == 200
+        html = response.data.decode()
+
+        # The stored status is the selected option — rendered from VALID_STATUSES.
+        assert 'value="draining" selected' in html
+        # A stored credential is reported as PRESENT and never echoed.
+        assert "(set — leave blank to keep)" in html
+        assert "stored-token" not in html
+        # CSV round-trip of the conditional arrays.
+        assert "US,GB" in html
+        # The numeric bounds come from the record, not from hand-typed attributes.
+        assert 'min="5"' in html
+        assert 'max="5000"' in html
 
 
 class TestAddGetRendersTheEmptyForm:
@@ -726,31 +717,35 @@ class TestAddGetRendersTheEmptyForm:
     hand-typed copies the template used to carry (#1197 review).
     """
 
-    def test_renders_with_no_provider_and_the_enum_vocabularies(self):
+    def test_renders_the_empty_form_with_the_enum_vocabularies(self):
+        """The add page renders, with every uid type and status offered.
+
+        A real render, not an assertion on the mapping handed to a patched
+        renderer: the vocabularies exist to keep the UI in step with the SDK enums,
+        and only rendering shows that they reach the page (#1197 review).
+        """
         client = _make_tmp_provider_client()
-        mock_uow_cls, mock_uow = _make_blueprint_uow()
-        mock_tenant = mock_uow.tenant_config.get_tenant.return_value
+        mock_uow_cls, _mock_uow = _make_blueprint_uow()
 
         with (
             patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls),
-            patch("src.admin.blueprints.tmp_providers.render_template") as mock_render,
             patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}),
         ):
-            mock_render.return_value = "<html/>"
             response = client.get("/tenant/default/tmp-providers/add")
 
         assert response.status_code == 200
-        mock_render.assert_called_once_with(
-            "tmp_provider_form.html",
-            tenant=mock_tenant,
-            tenant_id="default",
-            tenant_name="Default Tenant",
-            provider=None,
-            # Through the production helper, not a hand-listed copy: the form
-            # context is one thing the blueprint owns, and re-typing its keys per
-            # test is how the template's own vocabularies drifted (#1197 review).
-            **_form_render_context(),
-        )
+        html = response.data.decode()
+
+        # Every SDK uid type is documented on the page — including the two the
+        # hand-written template list had gone stale on.
+        for uid_type in VALID_UID_TYPES:
+            assert uid_type in html, f"{uid_type} is missing from the add form"
+        assert "rampid_derived" in html
+        assert "world_id_nullifier" in html
+        # Only the schemes the outbound call implements are offered.
+        assert "api_key" not in html
+        # An add form has no provider, so no credential-present hint.
+        assert "(set — leave blank to keep)" not in html
 
     def test_the_rendered_vocabularies_cover_the_whole_enum(self):
         """Every SDK uid type and status reaches the template context.
@@ -774,7 +769,7 @@ class TestEditGetSurvivesAnUnreadableCredential:
     rotated — and until this test, that swap failed nothing (#1197 review).
     """
 
-    def test_edit_get_renders_the_mask_for_a_corrupt_credential(self):
+    def test_edit_get_renders_for_a_corrupt_credential(self):
         provider = TMPProvider(
             provider_id="prov_corrupt_1",
             tenant_id="default",
@@ -800,16 +795,16 @@ class TestEditGetSurvivesAnUnreadableCredential:
 
         with (
             patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls),
-            patch("src.admin.blueprints.tmp_providers.render_template") as mock_render,
             patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}),
         ):
-            mock_render.return_value = "<html/>"
             response = client.get("/tenant/default/tmp-providers/prov_corrupt_1/edit")
 
+        # The page renders rather than 500ing, and reports the credential as set
+        # without ever decrypting it.
         assert response.status_code == 200
-        rendered_provider = mock_render.call_args.kwargs["provider"]
-        assert rendered_provider["auth_credentials"] == "••••••••"
-        assert "not-a-valid-fernet-token" not in str(rendered_provider)
+        html = response.data.decode()
+        assert "(set — leave blank to keep)" in html
+        assert "not-a-valid-fernet-token" not in html
 
 
 class TestErrorHelpers:
@@ -853,3 +848,49 @@ class TestErrorHelpers:
         assert response.status_code == 302
         assert "/settings" in response.headers["Location"]
         assert ("error", "Error loading TMP providers") in flashes
+
+
+class TestAdminViewShape:
+    """``_admin_view`` builds every key the list template reads.
+
+    The direct counterpart to the rendered-page tests above: those prove the badge
+    and the row values reach the HTML, this pins the mapping itself — including the
+    two keys whose absence produced the "⚠️ No Auth" defect on every row
+    (#1197 review).
+    """
+
+    def test_carries_the_auth_badge_inputs_and_the_null_conditionals(self):
+        from datetime import UTC, datetime
+
+        from src.admin.blueprints.tmp_providers import _admin_view
+
+        provider = TMPProvider(
+            provider_id="prov_view_1",
+            tenant_id="default",
+            name="Viewed Provider",
+            endpoint=_SAFE_ENDPOINT,
+            context_match=True,
+            identity_match=False,
+            countries=None,
+            uid_types=None,
+            properties=None,
+            timeout_ms=50,
+            priority=0,
+            status="active",
+            auth_type="bearer",
+        )
+        provider.created_at = datetime(2026, 3, 1, tzinfo=UTC)
+
+        view = _admin_view(provider)
+
+        # The badge inputs — the keys the model's to_admin_dict() omitted.
+        assert view["auth_type"] == "bearer"
+        assert view["has_auth_credentials"] is False
+        # `name` is carried here (it is NOT on the machine wire), and the three
+        # conditional arrays are present as None rather than omitted: the list view
+        # distinguishes "no restriction" from "not shown".
+        assert view["name"] == "Viewed Provider"
+        assert view["countries"] is None
+        assert view["uid_types"] is None
+        assert view["properties"] is None
+        assert view["created_at"] == datetime(2026, 3, 1, tzinfo=UTC)

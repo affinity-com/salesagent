@@ -43,6 +43,11 @@ def given_no_provider(ctx: dict) -> None:
 @when("the Buyer Agent asks for the seller's capabilities")
 def when_buyer_asks_for_capabilities(ctx: dict) -> None:
     dispatch_request(ctx)
+    # `dispatch_request` sets ctx["result"] only when the dispatch RETURNED; a
+    # dispatch that raised leaves only ctx["error"]. Reading ctx["result"] blindly
+    # turned that into a bare KeyError that hid the actual failure.
+    if "result" not in ctx:
+        raise AssertionError(f"get_adcp_capabilities did not dispatch on {ctx['transport']}: {ctx.get('error')!r}")
     result = ctx["result"]
     assert result.is_success, f"get_adcp_capabilities failed on {ctx['transport']}: {result.error}"
 

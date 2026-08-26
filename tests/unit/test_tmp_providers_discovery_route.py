@@ -1,21 +1,24 @@
 """Unit tests for the FastAPI TMP provider discovery route and TMPProvider model.
 
 Tests the endpoint:
-    GET /tenant/{tenant_id}/tmp-providers/discovery
+    GET (the path declared by src.routes.tmp_providers.DISCOVERY_ROUTE)
 
 This is the FastAPI route in src/routes/tmp_providers.py — the canonical
 machine-to-machine discovery endpoint polled by the TMP Router every 30 s.
 
 Covers:
 - Returns active + draining providers via repository.list_syncable()
-- Returns 404 for unknown tenant
+- An unknown tenant is a 401 on the real path (the credential cannot resolve in a
+  tenant that does not exist), pinned in the integration suite — not graded here,
+  where the credential gate is stubbed
 - Returns empty list when tenant has no active providers
 - Response shape matches TMP Router contract
 - Providers ordered by priority ASC, name ASC
 - Handles legacy rows with null countries/uid_types
 - uow.tenant_config is None → 500 (not an assert)
-- TMPProviderDiscoveryEntry (the pinned SDK type) is what the wire carries, and
-  TMPProvider.to_admin_dict() is the separate Jinja-facing shape
+- TMPProviderDiscoveryEntry (the pinned SDK type) is what the wire carries; the
+  Jinja-facing shapes and their mappers live with the admin layer that owns them
+  and are graded in tests/unit/test_tmp_providers_blueprint.py
 
 Every request here goes through the PRODUCTION app (``src.app.app``) — its
 router mount, its middleware stack and its ``AdCPError`` handler — rather than a
@@ -38,7 +41,7 @@ from sqlalchemy.orm.exc import DetachedInstanceError
 from src.core.database.models import TMPProvider
 from src.core.exceptions import AdCPServiceUnavailableError
 from src.core.schemas.tmp_provider import TMPProviderDiscoveryEntry
-from src.routes.tmp_providers import PROVIDER_REGISTRATION_SCHEMA
+from src.routes.tmp_providers import DISCOVERY_ROUTE, PROVIDER_REGISTRATION_SCHEMA
 from tests.helpers.envelope_assertions import assert_envelope_shape
 from tests.helpers.pinned_schema import validate_against_pinned_schema
 from tests.unit._tmp_helpers import _make_provider, _make_tmp_uow, _mock_cm
@@ -56,6 +59,17 @@ def _make_tenant(tenant_id="si-host"):
 
 
 _STUB_PRINCIPAL = "tmp-router-principal"
+
+
+def _discovery_path(tenant_id: str) -> str:
+    """The polled path, formatted from the route's own declaration.
+
+    Never a hand-typed literal: ``DISCOVERY_ROUTE`` exists so the path has one
+    definition, and a suite that re-types it is a second definition nothing pins
+    equal (#1197 review). ``test_architecture_pinned_schema_citations`` fails a
+    hand-typed discovery path outside the route module.
+    """
+    return DISCOVERY_ROUTE.format(tenant_id=tenant_id)
 
 
 @pytest.fixture
@@ -81,7 +95,7 @@ def client():
 
 
 class TestDiscoveryReturnsActiveProviders:
-    """GET /tenant/{tenant_id}/tmp-providers/discovery returns active + draining providers."""
+    """The discovery contract returns active + draining providers."""
 
     def test_returns_two_active_providers(self, client):
         """Two active providers are returned in the response via repository.list_syncable()."""
@@ -94,7 +108,7 @@ class TestDiscoveryReturnsActiveProviders:
         mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            response = client.get("/tenant/si-host/tmp-providers/discovery")
+            response = client.get(_discovery_path("si-host"))
 
         assert response.status_code == 200
         data = response.json()
@@ -117,7 +131,7 @@ class TestDiscoveryReturnsActiveProviders:
         mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            response = client.get("/tenant/si-host/tmp-providers/discovery")
+            response = client.get(_discovery_path("si-host"))
 
         assert response.status_code == 200
         data = response.json()
@@ -126,24 +140,8 @@ class TestDiscoveryReturnsActiveProviders:
         assert statuses == {"active", "draining"}
 
 
-class TestDiscoveryTenantNotFound:
-    """GET /tenant/{tenant_id}/tmp-providers/discovery returns 404 for unknown tenant."""
-
-    def test_returns_404_for_unknown_tenant(self, client):
-        """Unknown tenant_id returns 404 so the router can distinguish from 'no providers'."""
-        mock_tmp_uow_cls = _make_tmp_uow([], tenant=None)
-
-        with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            response = client.get("/tenant/nonexistent/tmp-providers/discovery")
-
-        assert response.status_code == 404
-        envelope = response.json()
-        assert_envelope_shape(envelope, "ACCOUNT_NOT_FOUND", recovery="terminal", message_substr="not found")
-        assert envelope["errors"][0]["suggestion"] == "Provide a valid tenant ID."
-
-
 class TestDiscoveryEmptyProviders:
-    """GET /tenant/{tenant_id}/tmp-providers/discovery returns empty list when no providers."""
+    """The discovery contract returns an empty list when the tenant has no providers."""
 
     def test_returns_empty_providers_list(self, client):
         """Valid tenant with no active providers returns empty providers array."""
@@ -152,7 +150,7 @@ class TestDiscoveryEmptyProviders:
         mock_tmp_uow_cls = _make_tmp_uow([], tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            response = client.get("/tenant/si-host/tmp-providers/discovery")
+            response = client.get(_discovery_path("si-host"))
 
         assert response.status_code == 200
         data = response.json()
@@ -176,7 +174,7 @@ class TestDiscoveryResponseShape:
         mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            response = client.get("/tenant/si-host/tmp-providers/discovery")
+            response = client.get(_discovery_path("si-host"))
 
         assert response.status_code == 200
         entry = response.json()["providers"][0]
@@ -211,7 +209,7 @@ class TestDiscoveryResponseShape:
         mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            response = client.get("/tenant/si-host/tmp-providers/discovery")
+            response = client.get(_discovery_path("si-host"))
 
         assert response.status_code == 200
         assert "name" not in response.json()["providers"][0]
@@ -232,7 +230,7 @@ class TestDiscoveryResponseShape:
         mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            response = client.get("/tenant/si-host/tmp-providers/discovery")
+            response = client.get(_discovery_path("si-host"))
 
         assert response.status_code == 200
         entry = response.json()["providers"][0]
@@ -263,7 +261,7 @@ class TestDiscoveryOrdering:
         mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            response = client.get("/tenant/si-host/tmp-providers/discovery")
+            response = client.get(_discovery_path("si-host"))
 
         assert response.status_code == 200
         provider_ids = [p["provider_id"] for p in response.json()["providers"]]
@@ -302,7 +300,7 @@ class TestDiscoveryRepositoryUnavailable:
         )
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", _mock_cm(mock_uow)):
-            response = client.get("/tenant/si-host/tmp-providers/discovery")
+            response = client.get(_discovery_path("si-host"))
 
         assert response.status_code == 503
         envelope = response.json()
@@ -372,7 +370,7 @@ class TestDiscoverySingleTransactionAndNoDetachedInstance:
         mock_tmp_uow_cls = _make_tmp_uow([], tenant=_make_tenant())
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            response = client.get("/tenant/si-host/tmp-providers/discovery")
+            response = client.get(_discovery_path("si-host"))
 
         assert response.status_code == 200
         # The class must have been called (constructed) exactly once.
@@ -403,7 +401,7 @@ class TestDiscoverySingleTransactionAndNoDetachedInstance:
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_uow_cls):
             # Would raise DetachedInstanceError (→ 500) if from_row() ran after __exit__.
-            response = client.get("/tenant/si-host/tmp-providers/discovery")
+            response = client.get(_discovery_path("si-host"))
 
         assert response.status_code == 200
         data = response.json()
@@ -443,7 +441,7 @@ class TestDiscoverySkipsUnrepresentableRows:
 
         with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
             with caplog.at_level(logging.ERROR, logger="src.routes.tmp_providers"):
-                response = client.get("/tenant/si-host/tmp-providers/discovery")
+                response = client.get(_discovery_path("si-host"))
 
         assert response.status_code == 200
         returned = [p["provider_id"] for p in response.json()["providers"]]
@@ -556,45 +554,6 @@ class TestDiscoveryEntryIsTheSdkType:
         p = _make_provider(context_match=False, identity_match=True, countries=None, uid_types=None)
         with pytest.raises(ValidationError):
             TMPProviderDiscoveryEntry.from_row(p)
-
-
-class TestAdminSerializer:
-    """``to_admin_dict()`` is the Jinja-facing shape and must not adopt the wire's rules."""
-
-    def test_admin_dict_keeps_name_and_null_conditionals(self):
-        """The admin shape carries `name` and all three conditional keys, `None` included.
-
-        The edit template renders those three fields unconditionally, so the
-        admin serialization must not adopt the wire's omission rule.
-        """
-        p = _make_provider(name="Test Provider", countries=None, uid_types=None, properties=None)
-        result = p.to_admin_dict()
-        assert result["name"] == "Test Provider"
-        assert result["countries"] is None
-        assert result["uid_types"] is None
-        assert result["properties"] is None
-
-    def test_discovery_endpoint_emits_the_wire_entry_not_the_admin_shape(self, client):
-        """The route publishes the SDK entry, so `name` is absent from the response."""
-        tenant = _make_tenant()
-        providers = [_make_provider(name="Admin Only Label", countries=None, uid_types=None, properties=None)]
-
-        mock_tmp_uow_cls = _make_tmp_uow(providers, tenant=tenant)
-
-        with patch("src.routes.tmp_providers.TMPProviderUoW", mock_tmp_uow_cls):
-            response = client.get("/tenant/si-host/tmp-providers/discovery")
-
-        assert response.status_code == 200
-        entry = response.json()["providers"][0]
-        assert "name" not in entry
-        assert "countries" not in entry
-        assert "uid_types" not in entry
-        assert "properties" not in entry
-
-
-# ---------------------------------------------------------------------------
-# TMPProvider.auth_credentials encryption round-trip and error contract
-# ---------------------------------------------------------------------------
 
 
 class TestTMPProviderAuthCredentials:

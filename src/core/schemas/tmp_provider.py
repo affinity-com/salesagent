@@ -52,7 +52,7 @@ SDK enums and pinned against the library model by
 from __future__ import annotations
 
 import logging
-from typing import Annotated, TypedDict, cast
+from typing import TYPE_CHECKING, Annotated, TypedDict, cast
 from uuid import UUID
 
 from adcp.types.generated_poc.enums.uid_type import UidType
@@ -79,6 +79,12 @@ from src.core.logging_config import log_safe
 from src.core.schemas._base import SalesAgentBaseModel
 from src.core.security.url_validator import check_url_ssrf
 from src.services._provider_http import PROVIDER_AUTH_SCHEMES
+
+if TYPE_CHECKING:
+    # Type-only: gives from_row() a checked contract with the ORM row without
+    # creating a runtime schemas -> models edge (models.py imports nothing from
+    # this package, and a future models -> schemas import would otherwise cycle).
+    from src.core.database.models import TMPProvider
 
 logger = logging.getLogger(__name__)
 
@@ -275,7 +281,7 @@ class TMPProviderDiscoveryEntry(RootModel[_ContextMatchEntry | _IdentityMatchEnt
     model_config = ConfigDict(frozen=True)
 
     @classmethod
-    def from_row(cls, row: object) -> TMPProviderDiscoveryEntry:
+    def from_row(cls, row: TMPProvider) -> TMPProviderDiscoveryEntry:
         """Build the wire entry from a ``TMPProvider`` ORM row.
 
         The row→entry mapping lives here rather than on the ORM model so that
@@ -292,25 +298,39 @@ class TMPProviderDiscoveryEntry(RootModel[_ContextMatchEntry | _IdentityMatchEnt
 
         ``name`` is deliberately not carried: it is not in the closed schema. It
         lives on the admin view shapes, which the admin layer owns.
+
+        *row* is typed ``TMPProvider`` through a ``TYPE_CHECKING`` import — no
+        runtime edge, so ``models.py`` still imports nothing from this package and
+        there is no cycle (``src/core/schemas/_base.py`` is the in-repo
+        precedent). It was ``object``, which cost seven attr-defined suppressions
+        and a ``getattr`` loop: the one function that decides whether a stored row
+        can be published had no checked contract with the row it reads
+        (#1197 review). The pragma is named rather than quoted here because the
+        ratchet hook counts it by regex over ``src/``.
         """
         payload: dict[str, object] = {
-            "provider_id": row.provider_id,  # type: ignore[attr-defined]
-            "endpoint": row.endpoint,  # type: ignore[attr-defined]
-            "context_match": row.context_match,  # type: ignore[attr-defined]
-            "identity_match": row.identity_match,  # type: ignore[attr-defined]
-            "timeout_ms": row.timeout_ms,  # type: ignore[attr-defined]
-            "priority": row.priority,  # type: ignore[attr-defined]
-            "status": row.status,  # type: ignore[attr-defined]
+            "provider_id": row.provider_id,
+            "endpoint": row.endpoint,
+            "context_match": row.context_match,
+            "identity_match": row.identity_match,
+            "timeout_ms": row.timeout_ms,
+            "priority": row.priority,
+            "status": row.status,
         }
-        for key in ("countries", "uid_types", "properties"):
-            value = getattr(row, key, None)
+        # Checked attribute access, not getattr(): omit-don't-null for the three
+        # conditional arrays (the schema types each with minItems: 1).
+        for key, value in (
+            ("countries", row.countries),
+            ("uid_types", row.uid_types),
+            ("properties", row.properties),
+        ):
             if value:
                 payload[key] = value
         return cls.model_validate(payload)
 
 
 class TMPDiscoveryResponse(SalesAgentBaseModel):
-    """Body of ``GET /tenant/{tenant_id}/tmp-providers/discovery``.
+    """Body of the discovery contract (``GET`` :data:`src.routes.tmp_providers.DISCOVERY_ROUTE`).
 
     Used as the route's ``response_model`` so FastAPI publishes an OpenAPI
     schema for the discovery contract and validates the outgoing keys, instead

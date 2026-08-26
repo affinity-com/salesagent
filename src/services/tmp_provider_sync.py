@@ -554,7 +554,6 @@ def sync_packages_for_media_buy(tenant_id: str, media_buy_id: str) -> None:
     # HTTP calls happen after this block — no open transaction during network I/O.
     try:
         with MediaBuyUoW(tenant_id) as uow:
-            assert uow.media_buys is not None
             pkg_rows = uow.media_buys.get_packages(media_buy_id)
 
             if not pkg_rows:

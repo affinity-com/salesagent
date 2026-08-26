@@ -272,7 +272,15 @@ class RestE2EDispatcher:
 
         with httpx.Client(base_url=base_url, timeout=30) as client:
             method = getattr(env, "REST_METHOD", "post")
-            response = getattr(client, method)(endpoint, json=body, headers=headers)
+            # httpx's get() takes no `json`, and a GET route takes no body — so the
+            # body is passed only for the verbs that carry one. Passing it
+            # unconditionally raised TypeError before the request was ever sent,
+            # which surfaced as a dispatch failure rather than a wire result
+            # (#1197 review).
+            if method == "get":
+                response = client.get(endpoint, headers=headers)
+            else:
+                response = getattr(client, method)(endpoint, json=body, headers=headers)
 
         envelope = {
             "transport": "e2e_rest",

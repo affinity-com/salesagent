@@ -171,3 +171,23 @@ class TestUpdateFieldsSurvivesCorruptCredential:
 
             assert updated is not None
             assert updated.auth_credentials == "new-plaintext-secret"
+
+
+class TestUoWYieldsConcreteRepositories:
+    """An open UoW hands back the concrete repository types, with no narrowing.
+
+    The real-session half of ``tests/unit/test_uow_repository_accessor.py``:
+    that file grades ``RepositoryAccessor``'s raise-when-closed behavior with no
+    database, and this grades what an actually-open session yields. Here rather
+    than there because it needs Postgres — the tier decides placement, not the
+    subject (#1197 review).
+    """
+
+    def test_open_uow_yields_the_concrete_repository_types(self, integration_db):
+        from src.core.database.repositories.tenant_config import TenantConfigRepository
+        from src.core.database.repositories.uow import TMPProviderUoW
+
+        with TMPProviderUoW("tenant_x") as uow:
+            # Read with no `assert ... is not None` — that is the accessor's point.
+            assert isinstance(uow.tmp_providers, TMPProviderRepository)
+            assert isinstance(uow.tenant_config, TenantConfigRepository)

@@ -3,7 +3,7 @@
 End-to-end scenarios exercised against a real PostgreSQL database:
 
 1. test_discovery_returns_active_providers / TestDiscoveryAuth
-   The discovery contract (GET /tenant/{id}/tmp-providers/discovery) served by
+   The discovery contract (GET, at src.routes.tmp_providers.DISCOVERY_ROUTE) served by
    the PRODUCTION app: returns active/draining providers and excludes inactive
    ones, every entry validated against the pinned provider-registration schema,
    and the credential gate graded for real — no credential, another tenant's
@@ -42,7 +42,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from starlette.testclient import TestClient
 
-from src.routes.tmp_providers import PROVIDER_REGISTRATION_SCHEMA
+from src.routes.tmp_providers import DISCOVERY_ROUTE, PROVIDER_REGISTRATION_SCHEMA
 from tests.factories import MediaBuyFactory, MediaPackageFactory, PrincipalFactory, TenantFactory, TMPProviderFactory
 from tests.harness._base import IntegrationEnv
 from tests.helpers.admin_client import make_super_admin_client
@@ -79,11 +79,11 @@ def _discovery_client() -> TestClient:
 def _get_discovery(tenant_id: str, token: str | None) -> object:
     """GET the discovery contract as *token*'s owner (or unauthenticated)."""
     headers = {"x-adcp-auth": token} if token else {}
-    return _discovery_client().get(f"/tenant/{tenant_id}/tmp-providers/discovery", headers=headers)
+    return _discovery_client().get(DISCOVERY_ROUTE.format(tenant_id=tenant_id), headers=headers)
 
 
 class TestDiscoveryReturnsActiveProviders:
-    """GET /tenant/{id}/tmp-providers/discovery returns active+draining, excludes inactive."""
+    """The discovery contract returns active+draining providers and excludes inactive."""
 
     def test_discovery_returns_active_providers(self, integration_db):
         """Active and draining providers appear in the discovery response; inactive do not.
@@ -339,7 +339,7 @@ class TestDiscoveryAuth:
             tenant_id = tenant.tenant_id
 
         response = _discovery_client().get(
-            f"/tenant/{tenant_id}/tmp-providers/discovery",
+            DISCOVERY_ROUTE.format(tenant_id=tenant_id),
             headers={"Authorization": "Bearer tmp-admin-token-1"},
         )
 
@@ -494,7 +494,6 @@ class TestHealthSchedulerTickPersistsStatus:
         # grades that the scheduler's write is visible through the same repository
         # method the admin UI reads.
         with TMPProviderUoW(tenant_id) as uow:
-            assert uow.tmp_providers is not None
             updated = uow.tmp_providers.get_by_id(provider_id)
 
             assert updated is not None

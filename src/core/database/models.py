@@ -3,7 +3,6 @@
 import logging
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
 from uuid import uuid4
 
 from adcp.types import BrandReference
@@ -1510,43 +1509,6 @@ class TMPProvider(Base):
         (#1197 review).
         """
         return self._auth_credentials is not None
-
-    def to_admin_dict(self) -> dict[str, Any]:
-        """Serialize for the admin UI (list + edit views).
-
-        Not the machine wire — see :meth:`to_discovery_dict` for that.  This
-        shape is what the Jinja templates read, so it carries ``name`` and it
-        always includes ``countries`` / ``uid_types`` / ``properties`` (``None``
-        for a row that restricts nothing) rather than omitting them: the edit
-        template renders those three fields unconditionally and the list view
-        distinguishes "no restriction" from "not shown".
-
-        Auth fields are deliberately absent — the edit handler adds
-        ``auth_type`` plus a masked ``auth_credentials`` placeholder itself, so
-        a credential is never serialized here by accident.
-
-        The machine wire is NOT built here: the discovery entry is the pinned
-        SDK type, constructed by
-        ``TMPProviderDiscoveryEntry.from_row`` in the schema layer. This module
-        deliberately imports nothing from ``src.core.schemas`` — persistence must
-        not depend on the protocol-schema package, or a future
-        ``schemas → models`` import becomes a circular-import failure rather than
-        a design question (#1197 review). The typed admin/form view shapes live
-        with the admin layer that consumes them.
-        """
-        return {
-            "provider_id": self.provider_id,
-            "name": self.name,
-            "endpoint": self.endpoint,
-            "context_match": self.context_match,
-            "identity_match": self.identity_match,
-            "timeout_ms": self.timeout_ms,
-            "priority": self.priority,
-            "status": self.status,
-            "countries": self.countries,
-            "uid_types": self.uid_types,
-            "properties": self.properties,
-        }
 
 
 class GAMInventory(Base):

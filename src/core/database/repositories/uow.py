@@ -167,11 +167,11 @@ class MediaBuyUoW(BaseUoW):
         tenant_id: Tenant scope for all repository queries.
     """
 
-    media_buys: MediaBuyRepository | None
-    products: ProductRepository | None
-    creatives: CreativeRepository | None
-    currency_limits: CurrencyLimitRepository | None
-    idempotency_attempts: IdempotencyAttemptRepository | None
+    media_buys: RepositoryAccessor[MediaBuyRepository] = RepositoryAccessor()
+    products: RepositoryAccessor[ProductRepository] = RepositoryAccessor()
+    creatives: RepositoryAccessor[CreativeRepository] = RepositoryAccessor()
+    currency_limits: RepositoryAccessor[CurrencyLimitRepository] = RepositoryAccessor()
+    idempotency_attempts: RepositoryAccessor[IdempotencyAttemptRepository] = RepositoryAccessor()
 
     def _init_repos(self) -> None:
         assert self._session is not None
@@ -199,7 +199,7 @@ class ProductUoW(BaseUoW):
         tenant_id: Tenant scope for all repository queries.
     """
 
-    products: ProductRepository | None
+    products: RepositoryAccessor[ProductRepository] = RepositoryAccessor()
 
     def _init_repos(self) -> None:
         assert self._session is not None
@@ -219,7 +219,7 @@ class WorkflowUoW(BaseUoW):
         tenant_id: Tenant scope for all repository queries.
     """
 
-    workflows: WorkflowRepository | None
+    workflows: RepositoryAccessor[WorkflowRepository] = RepositoryAccessor()
 
     def _init_repos(self) -> None:
         assert self._session is not None
@@ -262,7 +262,7 @@ class AccountUoW(BaseUoW):
     beads: salesagent-m44
     """
 
-    accounts: AccountRepository | None
+    accounts: RepositoryAccessor[AccountRepository] = RepositoryAccessor()
 
     def _init_repos(self) -> None:
         assert self._session is not None
@@ -283,7 +283,7 @@ class PushNotificationConfigUoW(BaseUoW):
         tenant_id: Tenant scope for all repository queries.
     """
 
-    push_notification_configs: PushNotificationConfigRepository | None
+    push_notification_configs: RepositoryAccessor[PushNotificationConfigRepository] = RepositoryAccessor()
 
     def _init_repos(self) -> None:
         assert self._session is not None
@@ -303,8 +303,8 @@ class CreativeUoW(BaseUoW):
         tenant_id: Tenant scope for all repository queries.
     """
 
-    creatives: CreativeRepository | None
-    assignments: CreativeAssignmentRepository | None
+    creatives: RepositoryAccessor[CreativeRepository] = RepositoryAccessor()
+    assignments: RepositoryAccessor[CreativeAssignmentRepository] = RepositoryAccessor()
 
     def _init_repos(self) -> None:
         assert self._session is not None
@@ -332,12 +332,12 @@ class AdminCreativeUoW(BaseUoW):
     beads: salesagent-4tb, salesagent-p6i
     """
 
-    creatives: CreativeRepository | None
-    assignments: CreativeAssignmentRepository | None
-    media_buys: MediaBuyRepository | None
-    products: ProductRepository | None
-    workflows: WorkflowRepository | None
-    tenant_config: TenantConfigRepository | None
+    creatives: RepositoryAccessor[CreativeRepository] = RepositoryAccessor()
+    assignments: RepositoryAccessor[CreativeAssignmentRepository] = RepositoryAccessor()
+    media_buys: RepositoryAccessor[MediaBuyRepository] = RepositoryAccessor()
+    products: RepositoryAccessor[ProductRepository] = RepositoryAccessor()
+    workflows: RepositoryAccessor[WorkflowRepository] = RepositoryAccessor()
+    tenant_config: RepositoryAccessor[TenantConfigRepository] = RepositoryAccessor()
 
     def _init_repos(self) -> None:
         assert self._session is not None
