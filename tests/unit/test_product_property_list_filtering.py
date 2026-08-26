@@ -341,7 +341,7 @@ class TestCapabilitiesPropertyListFiltering:
         with (
             patch("src.core.tools.capabilities.get_principal_object", return_value=None),
             patch("src.core.tools.capabilities.TenantConfigUoW", return_value=mock_uow),
-            patch("src.core.database.repositories.uow.TMPProviderUoW", return_value=mock_tmp_uow),
+            patch("src.core.tools.capabilities.TMPProviderUoW", return_value=mock_tmp_uow),
         ):
             response = _get_adcp_capabilities_impl(None, identity)
 

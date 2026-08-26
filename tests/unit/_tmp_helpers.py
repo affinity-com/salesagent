@@ -3,7 +3,7 @@
 The helpers are NOT underscore-prefixed: the module name is the privacy boundary,
 and every one of them is imported by a sibling suite, so a leading underscore
 advertised "private" about names with four external consumers. This PR retired the
-same naming one directory over (``_parse_interval_env`` → ``parse_interval_env``)
+same naming one directory over, in ``src/services/_scheduler_base.py``
 (#1197 review).
 
 Extracted from test_tmp_providers_discovery_route.py to avoid duplicating the

@@ -45,6 +45,14 @@ RecoveryHint = Literal["transient", "correctable", "terminal"]
 _SPEC_SUPPLEMENT_CODES: dict[str, dict[str, str]] = {
     "CREATIVE_NOT_FOUND": {"recovery": "correctable", "message": "Creative not found"},
     "CONFIGURATION_ERROR": {"recovery": "terminal", "message": "Configuration error"},
+    # The 3.1.1 replacements for the now-deprecated AUTH_REQUIRED. Their recovery
+    # values are the point of the split and come straight from the pinned enum:
+    # AUTH_MISSING is correctable ("provide credentials when missing") while
+    # AUTH_INVALID is terminal ("do NOT auto-retry — credentials were rejected;
+    # rotate keys … or escalate"). A polling consumer told a rejected credential is
+    # correctable retries forever (#1197 review).
+    "AUTH_MISSING": {"recovery": "correctable", "message": "Authentication required"},
+    "AUTH_INVALID": {"recovery": "terminal", "message": "Authentication failed"},
 }
 
 # The authoritative wire-code table: SDK baseline + pinned-spec supplement.

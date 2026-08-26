@@ -47,7 +47,7 @@ from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 import httpx
-from adcp.types import AvailablePackage, FormatId, SellerAgentReference
+from adcp.types import AvailablePackage, SellerAgentReference
 from pydantic import ValidationError
 
 from src.core.database.models import MediaPackage, TMPProvider
@@ -55,6 +55,7 @@ from src.core.database.repositories.uow import MediaBuyUoW, TenantConfigUoW, TMP
 from src.core.domain_config import is_local_host
 from src.core.exceptions import AdCPConfigurationError
 from src.core.logging_config import log_safe
+from src.core.schemas import FormatId
 from src.core.schemas._base import (
     CreateMediaBuyResult,
     CreateMediaBuySuccess,
