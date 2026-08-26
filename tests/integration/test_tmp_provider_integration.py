@@ -282,14 +282,15 @@ class TestDiscoveryAuth:
         return own.tenant_id, own_principal.access_token, other.tenant_id, other_principal.access_token
 
     def test_no_credential_is_rejected(self, integration_db):
-        """An unauthenticated poll gets the production AUTH_REQUIRED envelope."""
+        """An unauthenticated poll gets the production AUTH_MISSING envelope."""
         with _TMPEnv() as env:
             own_id, _own_token, _other_id, _other_token = self._two_tenants(env)
 
         response = _get_discovery(own_id, None)
 
         assert response.status_code == 401
-        assert_envelope_shape(response.json(), "AUTH_REQUIRED", recovery="correctable")
+        # Nothing presented: correctable — the caller can send a credential and retry.
+        assert_envelope_shape(response.json(), "AUTH_MISSING", recovery="correctable")
 
     def test_another_tenants_credential_cannot_read_this_tenant(self, integration_db):
         """The isolation case: a valid credential from tenant B is nothing on tenant A's path.
@@ -303,7 +304,9 @@ class TestDiscoveryAuth:
         response = _get_discovery(own_id, other_token)
 
         assert response.status_code == 401, response.text
-        assert_envelope_shape(response.json(), "AUTH_REQUIRED", recovery="correctable")
+        # A credential WAS presented and rejected: terminal. The router polls every
+        # 30 s, so `correctable` here would mean retrying forever.
+        assert_envelope_shape(response.json(), "AUTH_INVALID", recovery="terminal")
 
     def test_unknown_token_is_rejected(self, integration_db):
         """A token that belongs to nobody is rejected, not treated as anonymous access."""
@@ -313,7 +316,7 @@ class TestDiscoveryAuth:
         response = _get_discovery(own_id, "not-a-real-token")
 
         assert response.status_code == 401
-        assert_envelope_shape(response.json(), "AUTH_REQUIRED", recovery="correctable")
+        assert_envelope_shape(response.json(), "AUTH_INVALID", recovery="terminal")
 
     def test_tenants_own_principal_token_is_accepted(self, integration_db):
         """The credential the operator issues the router is the one that works."""
@@ -359,7 +362,11 @@ class TestDiscoveryAuth:
         response = _get_discovery("tmp_int_auth_missing", own_token)
 
         assert response.status_code == 401
-        assert_envelope_shape(response.json(), "AUTH_REQUIRED", recovery="correctable")
+        # 401, never 404: the credential is resolved inside the path's tenant, and a
+        # tenant that does not exist cannot resolve one — so an unknown tenant is
+        # indistinguishable from a rejected credential, which is what stops a caller
+        # enumerating tenant ids off the status code.
+        assert_envelope_shape(response.json(), "AUTH_INVALID", recovery="terminal")
 
 
 # ---------------------------------------------------------------------------

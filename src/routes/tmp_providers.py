@@ -54,6 +54,13 @@ schema); it lives on the admin serialization.  See
 
 Only providers whose status is 'active' or 'draining' are returned.
 Providers with status 'inactive' are excluded entirely.
+
+Denials, per the pinned ``enums/error-code.json`` @3.1.1: no credential →
+``AUTH_MISSING`` (correctable, 401); a credential that does not resolve in the
+tenant → ``AUTH_INVALID`` (terminal, 401).  An unknown tenant is therefore a 401
+too, not a 404 — the credential is resolved first, and a tenant that does not
+exist cannot resolve one.  The 404 (``ACCOUNT_NOT_FOUND``) is reachable only for
+an authenticated caller whose tenant row disappeared between the two reads.
 """
 
 from __future__ import annotations
@@ -67,7 +74,7 @@ from pydantic import ValidationError
 from src.core.auth_context import AuthContext, get_auth_context
 from src.core.auth_utils import get_principal_from_token
 from src.core.database.repositories.uow import TMPProviderUoW
-from src.core.exceptions import AdCPAccountNotFoundError, AdCPAuthRequiredError
+from src.core.exceptions import AdCPAccountNotFoundError, AdCPAuthInvalidError, AdCPAuthMissingError
 from src.core.logging_config import log_safe
 from src.core.schemas.tmp_provider import TMPDiscoveryResponse, TMPProviderDiscoveryEntry
 
@@ -116,13 +123,30 @@ def _require_tenant_credential(tenant_id: str, auth_ctx: AuthContext = get_auth_
     unauthenticated callers never reach the route body.
     """
     token = (auth_ctx.auth_token or "").strip()
-    principal_id = get_principal_from_token(token, tenant_id)[0] if token else None
-    if not principal_id:
-        raise AdCPAuthRequiredError(
+    if not token:
+        # Nothing was presented: correctable — send a credential and retry.
+        raise AdCPAuthMissingError(
             "Authentication required.",
             suggestion=(
-                f"Provide a valid access token for tenant '{tenant_id}' via x-adcp-auth "
-                "or Authorization: Bearer <token>."
+                f"Provide an access token for tenant '{tenant_id}' via x-adcp-auth or Authorization: Bearer <token>."
+            ),
+        )
+
+    principal_id = get_principal_from_token(token, tenant_id)[0]
+    if not principal_id:
+        # A credential WAS presented and did not resolve in this tenant: terminal.
+        # The router polls every 30 s, so calling this correctable would have it
+        # retry a credential that cannot start working — the pinned enum's
+        # AUTH_INVALID metadata says "do NOT auto-retry … rotate keys … or escalate"
+        # (adcp/_schemas/3.1/enums/error-code.json @3.1.1). Deliberately does not
+        # distinguish "unknown token" from "token belonging to another tenant": that
+        # difference is what a cross-tenant prober would enumerate.
+        raise AdCPAuthInvalidError(
+            "Authentication failed.",
+            suggestion=(
+                f"The presented credential is not valid for tenant '{tenant_id}'. "
+                "Issue the router a principal access token for that tenant "
+                "(Admin UI → Advertisers → API Token) rather than retrying."
             ),
         )
     return principal_id

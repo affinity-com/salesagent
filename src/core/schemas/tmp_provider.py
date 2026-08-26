@@ -78,7 +78,6 @@ from pydantic import (
 from src.core.logging_config import log_safe
 from src.core.schemas._base import SalesAgentBaseModel
 from src.core.security.url_validator import check_url_ssrf
-from src.services._provider_http import PROVIDER_AUTH_SCHEMES
 
 if TYPE_CHECKING:
     # Type-only: gives from_row() a checked contract with the ORM row without
@@ -93,6 +92,7 @@ logger = logging.getLogger(__name__)
 # ``check_url_ssrf``, ``ValidationError``, …) into ``src.core.schemas``, where
 # generic names like ``logger`` can shadow a sibling module's.
 __all__ = [
+    "VALID_AUTH_SCHEMES",
     "VALID_STATUSES",
     "VALID_UID_TYPES",
     "AuthScheme",
@@ -109,6 +109,23 @@ __all__ = [
 # adds a uid type or a lifecycle status widens these automatically.
 VALID_UID_TYPES: frozenset[str] = frozenset(t.value for t in UidType)
 VALID_STATUSES: frozenset[str] = frozenset(s.value for s in ProviderStatus)
+
+#: The provider auth schemes a registration may declare.
+#:
+#: Beside the other two registration vocabularies, because this module owns
+#: registration VALIDITY. It previously lived in ``src/services/_provider_http.py``
+#: — the module that consumes it — which made this package import upward into the
+#: outbound-HTTP service layer (the only ``from src.services`` import in
+#: ``src/core/schemas``), and the repository layer transitively pulled that module
+#: in just to build a ``TMPProviderFields``. No cycle existed only because
+#: ``_provider_http`` imported nothing from ``src`` (#1197 review).
+#:
+#: Not SDK-derived, unlike its two neighbours: the AdCP schema does not describe
+#: how a seller authenticates to a provider, so the vocabulary is what
+#: ``provider_auth_headers`` implements. Adding a scheme means adding a branch
+#: there and an entry here, and that function imports this constant so the two
+#: cannot disagree.
+VALID_AUTH_SCHEMES: frozenset[str] = frozenset({"bearer"})
 
 
 def _require_uuid(value: str) -> str:
@@ -138,8 +155,8 @@ PropertyRid = Annotated[str, AfterValidator(_require_uuid)]
 
 def _known_auth_scheme(value: str) -> str:
     """Reject an auth scheme no outbound call can actually make."""
-    if value not in PROVIDER_AUTH_SCHEMES:
-        raise ValueError(f"Invalid auth_type '{value}'. Valid values: {', '.join(sorted(PROVIDER_AUTH_SCHEMES))}")
+    if value not in VALID_AUTH_SCHEMES:
+        raise ValueError(f"Invalid auth_type '{value}'. Valid values: {', '.join(sorted(VALID_AUTH_SCHEMES))}")
     return value
 
 
@@ -377,7 +394,7 @@ class TMPProviderRegistration(SalesAgentBaseModel):
     # Constrained from the vocabulary of the code that ACTS on it. An
     # unconstrained ``str`` let the admin form offer "API Key" while
     # ``provider_auth_headers`` emitted Bearer regardless, so the selected scheme
-    # changed nothing (#1197 review). ``PROVIDER_AUTH_SCHEMES`` is the set that
+    # changed nothing (#1197 review). ``VALID_AUTH_SCHEMES`` is the set that
     # function implements, so the field and the behaviour cannot disagree.
     auth_type: AuthScheme | None = None
     auth_credentials: str | None = None

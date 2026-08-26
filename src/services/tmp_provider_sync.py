@@ -32,8 +32,8 @@ import inspect
 import logging
 import os
 import threading
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING, Any, cast
 
 import httpx
 from adcp.types import AvailablePackage, SellerAgentReference
@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from src.core.resolved_identity import ResolvedIdentity
 
 logger = logging.getLogger(__name__)
+
 
 #: The sync body's authority, declared once next to the builder that produces it.
 #:
@@ -96,10 +97,7 @@ _active_syncs = ThreadRegistry()
 _PREDECESSOR_JOIN_TIMEOUT_SECONDS = 60
 
 
-def fire_tmp_sync(
-    response: CreateMediaBuyResult | UpdateMediaBuyResult | UpdateMediaBuySubmitted | None,
-    identity: ResolvedIdentity | None,
-) -> None:
+def fire_tmp_sync(response: MediaBuyWriteResult, identity: ResolvedIdentity | None) -> None:
     """Spawn a daemon thread to sync TMP packages after a successful media buy operation.
 
     Transport-agnostic entry point shared by MCP, A2A, and REST transports —
@@ -165,7 +163,47 @@ def fire_tmp_sync(
     t.start()
 
 
-def fires_tmp_sync(impl: Callable[..., Any]) -> Callable[..., Any]:
+#: What a media-buy write returns — the union ``fire_tmp_sync`` accepts and
+#: ``_extract_media_buy_id`` narrows. Naming it once bounds the decorator's return
+#: TypeVar, so ``@fires_tmp_sync`` can only be applied to a function that actually
+#: returns a media-buy result (and the wrapper keeps that exact type rather than
+#: widening it to ``Any``).
+type MediaBuyWriteResult = CreateMediaBuyResult | UpdateMediaBuyResult | UpdateMediaBuySubmitted | None
+
+
+def _write_result(result: object) -> MediaBuyWriteResult:
+    """Narrow a decorated ``_impl``'s return value to the media-buy write union.
+
+    The decorator is generic over its wrapped function's return type (so the
+    wrapper preserves that type rather than widening it to ``Any``), and for the
+    async impl that type is a ``Coroutine`` — which is why the bound cannot simply
+    be this union. ``fire_tmp_sync`` then handles an unrecognised member by logging
+    it, so a wrong type here is reported rather than silently skipped.
+    """
+    return cast("MediaBuyWriteResult", result)
+
+
+def _identity_of(kwargs: Mapping[str, Any]) -> ResolvedIdentity | None:
+    """Read the ``identity`` keyword a decorated ``_impl`` was called with.
+
+    Exhaustive by construction: both decorated functions declare ``identity``
+    keyword-only, so it cannot arrive positionally. Cast rather than suppressed —
+    ``ParamSpec`` types the kwargs mapping as ``object``-valued, and a cast states
+    the narrowing where a pragma would only silence it.
+    """
+    return cast("ResolvedIdentity | None", kwargs.get("identity"))
+
+
+#: Stamped on every wrapper :func:`fires_tmp_sync` produces.
+#:
+#: A test asserting ``__wrapped__`` is set only proves SOME ``functools.wraps``
+#: decorator is applied — swap this one for any other and the assertion still
+#: passes while package sync is dead on every transport. The marker is specific to
+#: this decorator, so the guard can fail (#1197 review).
+FIRES_TMP_SYNC_MARKER = "__fires_tmp_sync__"
+
+
+def fires_tmp_sync[**P, R](impl: Callable[P, R]) -> Callable[P, R]:
     """Fire the package sync once, on the return of a media-buy ``_impl``.
 
     Package sync is a transport-agnostic consequence of a media-buy write: it
@@ -189,26 +227,36 @@ def fires_tmp_sync(impl: Callable[..., Any]) -> Callable[..., Any]:
     sibling post-write side effects (Slack notification, activity feed, push
     notifications) from inside the business logic.
 
-    ``identity`` is read from the keyword arguments — every caller passes it by
-    keyword — and a call without one still reaches ``fire_tmp_sync``, which logs
-    the no-op rather than guessing.
+    ``identity`` is read from the keyword arguments, and that is exhaustive by
+    CONSTRUCTION rather than by convention: both decorated ``_impl`` functions
+    declare ``identity`` keyword-only, so there is no call shape that passes it
+    positionally. It used to be positional-or-keyword with the contract stated in
+    this docstring — changing one caller to pass it positionally would have
+    silently stopped the sync on every transport, and no unit double could catch it
+    because every double was already keyword-only (#1197 review).
+
+    Typed with ``ParamSpec``/``TypeVar`` so the wrapper preserves the wrapped
+    signature and return type instead of widening both to ``Any`` — the result
+    union is what ``_extract_media_buy_id`` narrows.
     """
     if inspect.iscoroutinefunction(impl):
 
         @functools.wraps(impl)
-        async def _async_wrapper(*args: Any, **kwargs: Any) -> Any:
+        async def _async_wrapper(*args: P.args, **kwargs: P.kwargs) -> Any:
             result = await impl(*args, **kwargs)
-            fire_tmp_sync(result, kwargs.get("identity"))
+            fire_tmp_sync(_write_result(result), _identity_of(kwargs))
             return result
 
-        return _async_wrapper
+        setattr(_async_wrapper, FIRES_TMP_SYNC_MARKER, True)
+        return cast(Callable[P, R], _async_wrapper)
 
     @functools.wraps(impl)
-    def _sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+    def _sync_wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
         result = impl(*args, **kwargs)
-        fire_tmp_sync(result, kwargs.get("identity"))
+        fire_tmp_sync(_write_result(result), _identity_of(kwargs))
         return result
 
+    setattr(_sync_wrapper, FIRES_TMP_SYNC_MARKER, True)
     return _sync_wrapper
 
 
@@ -265,9 +313,7 @@ def join_active_syncs(timeout: float = 30.0) -> list[str]:
     return stragglers
 
 
-def _extract_media_buy_id(
-    response: CreateMediaBuyResult | UpdateMediaBuyResult | UpdateMediaBuySubmitted | None,
-) -> str | None:
+def _extract_media_buy_id(response: MediaBuyWriteResult) -> str | None:
     """Read ``media_buy_id`` off a media-buy result as a *typed* attribute.
 
     The union is narrowed with ``isinstance`` and the id is read from the

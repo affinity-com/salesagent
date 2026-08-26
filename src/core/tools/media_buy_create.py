@@ -1998,6 +1998,7 @@ def _resolve_idempotency_race_or_raise(
 @fires_tmp_sync
 async def _create_media_buy_impl(
     req: CreateMediaBuyRequest,
+    *,
     push_notification_config: dict[str, Any] | None = None,
     identity: ResolvedIdentity | None = None,
     context_id: str | None = None,

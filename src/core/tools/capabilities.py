@@ -58,6 +58,11 @@ logger = logging.getLogger(__name__)
 #: is no "silently experimental" mode (#1197 review).
 TRUSTED_MATCH_FEATURE_ID = "trusted_match.core"
 
+#: The response contract this tool serves, declared once so tests grade the emitted
+#: array against the schema's own item pattern rather than re-typing it. Resolved
+#: by ``tests/helpers/pinned_schema`` and kept resolvable by the citation guard.
+CAPABILITIES_RESPONSE_SCHEMA = "protocol/get-adcp-capabilities-response.json"
+
 
 # Mapping from adapter channel names to MediaChannel enum values
 CHANNEL_MAPPING: dict[str, MediaChannel] = {

@@ -337,7 +337,7 @@ class TestProviderMaterializedBeforeSessionCloses:
             "http://provider-a:3000",
             mock.ANY,  # payload correctness pinned by TestBuildPackagePayload
             "secret",
-            mock.ANY,  # auth_type — its dispatch is pinned by TestProviderAuthHeaders
+            "bearer",  # the provider's scheme, passed through — not mock.ANY
         )
 
 
@@ -820,6 +820,7 @@ class TestPostPackagesSyncAuth:
         provider.name = "Credentialed Provider"
         provider.endpoint = "http://provider:3000"
         provider.auth_credentials = "provider-secret"
+        provider.auth_type = "bearer"
 
         mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = _make_sync_uow(packages=[pkg], providers=[provider])
         with (
@@ -834,5 +835,50 @@ class TestPostPackagesSyncAuth:
             "http://provider:3000",
             mock.ANY,  # payload correctness pinned by TestBuildPackagePayload
             "provider-secret",
-            mock.ANY,  # auth_type — its dispatch is pinned by TestProviderAuthHeaders
+            "bearer",  # the provider's scheme, passed through — not mock.ANY
         )
+
+
+class TestProviderAuthHeaders:
+    """``provider_auth_headers`` — the function that turns a stored scheme into a header.
+
+    It had no direct test: the fan-out assertions used ``mock.ANY`` for
+    ``auth_type`` and excused it by citing a class that did not exist, so passing a
+    hardcoded scheme would have kept both green (#1197 review).
+    """
+
+    def test_bearer_scheme_emits_the_authorization_header(self):
+        from src.services._provider_http import provider_auth_headers
+
+        assert provider_auth_headers("bearer", "tok") == {"Authorization": "Bearer tok"}
+
+    def test_no_credential_emits_no_headers(self):
+        """An unauthenticated provider is a supported registration."""
+        from src.services._provider_http import provider_auth_headers
+
+        assert provider_auth_headers("bearer", "") == {}
+        assert provider_auth_headers(None, "") == {}
+
+    def test_a_credential_without_a_scheme_defaults_to_bearer(self):
+        """What every previously-stored registration already got."""
+        from src.services._provider_http import provider_auth_headers
+
+        assert provider_auth_headers(None, "tok") == {"Authorization": "Bearer tok"}
+
+    def test_an_unimplemented_scheme_raises(self):
+        """No silent fallback — that would reinstate "the selected scheme is ignored".
+
+        Unreachable from a write surface (the record types the field from
+        ``VALID_AUTH_SCHEMES``), so it is a programming error.
+        """
+        from src.services._provider_http import provider_auth_headers
+
+        with pytest.raises(ValueError, match="api_key"):
+            provider_auth_headers("api_key", "tok")
+
+    def test_the_vocabulary_is_what_the_record_constrains(self):
+        """The field and the behaviour cannot disagree — same frozenset."""
+        from src.core.schemas.tmp_provider import VALID_AUTH_SCHEMES, _known_auth_scheme
+
+        for scheme in VALID_AUTH_SCHEMES:
+            assert _known_auth_scheme(scheme) == scheme

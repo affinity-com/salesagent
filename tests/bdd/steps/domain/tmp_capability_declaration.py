@@ -14,11 +14,14 @@ review).
 
 from __future__ import annotations
 
+import re
+
 from pytest_bdd import given, parsers, then, when
 
-from src.core.tools.capabilities import TRUSTED_MATCH_FEATURE_ID
+from src.core.tools.capabilities import CAPABILITIES_RESPONSE_SCHEMA
 from tests.bdd.steps._outcome_helpers import wire_dict
 from tests.bdd.steps.generic._dispatch import dispatch_request
+from tests.helpers.pinned_schema import load as load_pinned_schema
 
 
 @given(parsers.parse('a TMP provider is registered for the tenant with status "{status}"'))
@@ -66,8 +69,19 @@ def _declared_features(ctx: dict) -> list[str]:
 def then_features_include(ctx: dict, feature_id: str) -> None:
     declared = _declared_features(ctx)
     assert feature_id in declared, f"{ctx['transport']}: expected {feature_id} in {declared}"
-    # The id the production constant emits is the id the spec pattern grades.
-    assert feature_id == TRUSTED_MATCH_FEATURE_ID
+
+    # Every declared id must satisfy the pinned schema's item pattern — the same
+    # "grade against the authority" move the sibling sync step makes with
+    # AVAILABLE_PACKAGE_SCHEMA. The previous line here asserted
+    # `feature_id == TRUSTED_MATCH_FEATURE_ID`, which no edit could redden while
+    # the line above stayed green (#1197 review).
+    item_pattern = load_pinned_schema(CAPABILITIES_RESPONSE_SCHEMA)["properties"]["experimental_features"]["items"][
+        "pattern"
+    ]
+    for declared_id in declared:
+        assert re.fullmatch(item_pattern, declared_id), (
+            f"{declared_id!r} does not match the schema's experimental-feature id pattern {item_pattern}"
+        )
 
 
 @then(parsers.parse('experimental_features does not include "{feature_id}"'))

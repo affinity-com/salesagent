@@ -346,6 +346,7 @@ def _verify_principal(
 @fires_tmp_sync
 def _update_media_buy_impl(
     req: UpdateMediaBuyRequest,
+    *,
     identity: ResolvedIdentity | None = None,
     context_id: str | None = None,
 ) -> UpdateMediaBuyResult | UpdateMediaBuySubmitted:

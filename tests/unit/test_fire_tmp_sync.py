@@ -77,17 +77,61 @@ class TestFiresTmpSyncDecorator:
     def test_both_media_buy_impls_are_decorated(self):
         """The structural claim: the sync cannot be forgotten by a new entry point.
 
-        Asserted on the wrapped functions themselves, so deleting a decorator
-        fails here rather than silently switching the feature off on every
-        transport at once.
+        Asserted on the marker ``fires_tmp_sync`` stamps, not on ``__wrapped__``:
+        every ``functools.wraps`` decorator sets ``__wrapped__``, so that assertion
+        stayed green if this decorator were swapped for any other while package
+        sync went dead on all four transports (#1197 review).
         """
+        from src.core.tools.media_buy_create import _create_media_buy_impl
+        from src.core.tools.media_buy_update import _update_media_buy_impl
+        from src.services.tmp_provider_sync import FIRES_TMP_SYNC_MARKER
+
+        for impl in (_create_media_buy_impl, _update_media_buy_impl):
+            assert getattr(impl, FIRES_TMP_SYNC_MARKER, False) is True, (
+                f"{impl.__name__} is not decorated with @fires_tmp_sync — the sync would "
+                "no longer fire on any transport"
+            )
+
+    def test_the_marker_is_specific_to_this_decorator(self):
+        """The falsifiability of the test above: another wraps-decorator must not pass."""
+        import functools
+
+        from src.services.tmp_provider_sync import FIRES_TMP_SYNC_MARKER
+
+        def _other_decorator(fn):
+            @functools.wraps(fn)
+            def _w(*a, **k):
+                return fn(*a, **k)
+
+            return _w
+
+        @_other_decorator
+        def _impl(*, identity):
+            return None
+
+        # A different wraps-decorator sets __wrapped__ ...
+        assert getattr(_impl, "__wrapped__", None) is not None
+        # ... and does NOT set the marker, which is why the guard can fail.
+        assert getattr(_impl, FIRES_TMP_SYNC_MARKER, False) is False
+
+    def test_doubles_use_the_production_signature_shape(self):
+        """``identity`` is keyword-only on both impls, so the decorator's read is exhaustive.
+
+        The contract used to be a convention stated in a docstring: ``identity``
+        was positional-or-keyword, so a caller passing it positionally would have
+        silently stopped the sync, and no double could see it because every double
+        was already keyword-only (#1197 review).
+        """
+        import inspect
+
         from src.core.tools.media_buy_create import _create_media_buy_impl
         from src.core.tools.media_buy_update import _update_media_buy_impl
 
         for impl in (_create_media_buy_impl, _update_media_buy_impl):
-            assert getattr(impl, "__wrapped__", None) is not None, (
-                f"{impl.__name__} is not decorated with @fires_tmp_sync — the sync would "
-                "no longer fire on any transport"
+            params = inspect.signature(inspect.unwrap(impl)).parameters
+            assert params["identity"].kind is inspect.Parameter.KEYWORD_ONLY, (
+                f"{impl.__name__}.identity must be keyword-only — fires_tmp_sync reads it "
+                "from kwargs, so a positional call would silently disable the sync"
             )
 
     def test_fires_with_the_impl_result_and_identity_on_success(self):

@@ -33,13 +33,13 @@ from src.admin.utils.audit_decorator import log_admin_action
 from src.core.database.models import TMPProvider
 from src.core.database.repositories.uow import TMPProviderUoW
 from src.core.schemas.tmp_provider import (
+    VALID_AUTH_SCHEMES,
     VALID_STATUSES,
     VALID_UID_TYPES,
     TMPProviderFields,
     TMPProviderRegistration,
     TMPProviderValidationError,
 )
-from src.services._provider_http import PROVIDER_AUTH_SCHEMES
 
 logger = logging.getLogger(__name__)
 
@@ -327,7 +327,7 @@ def _form_render_context() -> dict[str, object]:
     return {
         "valid_uid_types": sorted(VALID_UID_TYPES),
         "valid_statuses": sorted(VALID_STATUSES),
-        "valid_auth_schemes": sorted(PROVIDER_AUTH_SCHEMES),
+        "valid_auth_schemes": sorted(VALID_AUTH_SCHEMES),
         "field_bounds": _numeric_field_bounds(),
     }
 

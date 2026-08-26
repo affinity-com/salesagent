@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from typing import TypedDict
 
+from src.core.schemas.tmp_provider import VALID_AUTH_SCHEMES
+
 # Default timeout for synchronous package-sync calls (seconds).
 # Kept short — TMP Provider is an internal service on the same network.
 # Named with the *_SECONDS suffix (matching HEALTH_CHECK_TIMEOUT_SECONDS,
@@ -33,18 +35,6 @@ def provider_url(endpoint: str, path: str) -> str:
     return endpoint.rstrip("/") + path
 
 
-#: The auth schemes an outbound TMP Provider call can actually make.
-#:
-#: One entry, and that is the point: the registration's ``auth_type`` used to be
-#: an unconstrained ``str`` whose admin form offered "API Key" while this module
-#: always emitted ``Authorization: Bearer`` regardless — selecting a scheme
-#: changed nothing (#1197 review). The vocabulary now lives where the behaviour
-#: is, ``TMPProviderRegistration.auth_type`` is typed from it, and
-#: :func:`provider_auth_headers` dispatches on it, so adding a scheme means adding
-#: a branch here rather than an option to a template.
-PROVIDER_AUTH_SCHEMES: frozenset[str] = frozenset({"bearer"})
-
-
 def provider_auth_headers(auth_type: str | None, auth_credentials: str) -> dict[str, str]:
     """Build the auth headers for one outbound TMP Provider request.
 
@@ -53,7 +43,7 @@ def provider_auth_headers(auth_type: str | None, auth_credentials: str) -> dict[
     explicit ``auth_type`` is sent as Bearer: that is the only scheme implemented,
     and it is what every previously-stored registration already got.
 
-    An ``auth_type`` outside :data:`PROVIDER_AUTH_SCHEMES` cannot reach here from
+    An ``auth_type`` outside :data:`VALID_AUTH_SCHEMES` cannot reach here from
     any write surface (the record types the field), so it is a programming error
     rather than operator input — hence a raise, not a silent fallback that would
     reintroduce "the selected scheme is ignored".
@@ -61,9 +51,9 @@ def provider_auth_headers(auth_type: str | None, auth_credentials: str) -> dict[
     if not auth_credentials:
         return {}
     scheme = auth_type or "bearer"
-    if scheme not in PROVIDER_AUTH_SCHEMES:
+    if scheme not in VALID_AUTH_SCHEMES:
         raise ValueError(
-            f"Unsupported TMP provider auth scheme {scheme!r}; expected one of {sorted(PROVIDER_AUTH_SCHEMES)}"
+            f"Unsupported TMP provider auth scheme {scheme!r}; expected one of {sorted(VALID_AUTH_SCHEMES)}"
         )
     return {"Authorization": f"Bearer {auth_credentials}"}
 
