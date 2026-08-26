@@ -14,8 +14,9 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import httpx
@@ -128,34 +129,59 @@ class TestCheckProviderHealth:
         )
 
 
+class TickMocks(NamedTuple):
+    """What :func:`_run_tick` yields — every seam ``tick()`` touches, named."""
+
+    repo: MagicMock
+    probe: AsyncMock
+    uow_cls: MagicMock
+    read_ctx: MagicMock
+
+
 @asynccontextmanager
-async def _run_tick(providers: list, *, probe: Any):
-    """Arrange the four patches ``tick()`` needs, run it, and yield the mocks.
+async def _run_tick(
+    providers: list,
+    *,
+    probe: Any = "healthy",
+    repo: MagicMock | None = None,
+    uow: MagicMock | None = None,
+    read_ctx: MagicMock | None = None,
+) -> AsyncIterator[TickMocks]:
+    """Arrange the four patches ``tick()`` needs, run it, and yield the seams.
 
     The same four-patch block (read session, repository, write UoW, probe) was
     re-typed in seven tests, so a change to the scheduler's dependencies meant
     seven edits (#1197 review).
 
-    ``probe`` is what ``_check_provider_health`` returns — a value, a list of
-    per-provider values, or an exception — mirroring ``AsyncMock``'s
-    return_value/side_effect. Yields ``(mock_repo, mock_check)``: the write
-    repository and the probe, which is what every caller asserts on.
+    Every parameter exists because a test needed to vary that one seam, so the
+    exceptions are expressed as arguments rather than as a hand-rolled copy of
+    the block with a comment explaining why it is a copy:
+
+    ``probe``   what ``_check_provider_health`` does — a value, a list of
+                per-provider values, an exception, or a **callable** for the
+                cases that branch on the endpoint or record call order.
+    ``repo``    the write repository, when the caller builds the UoW itself.
+    ``uow``     a custom ``TMPProviderUoW`` stand-in: pass one to observe the
+                constructor arguments (one UoW per tenant) or to make a
+                tenant's ``__enter__`` raise.
+    ``read_ctx`` the read phase's session context manager, for asserting it is
+                closed before the probes run.
     """
-    mock_repo = MagicMock()
-    probe_mock = AsyncMock(side_effect=probe) if isinstance(probe, list | Exception) else AsyncMock(return_value=probe)
+    repo = repo if repo is not None else MagicMock()
+    uow_cls = uow if uow is not None else make_tmp_repo_uow(repo)
+    read_ctx = read_ctx if read_ctx is not None else make_db_context(MagicMock())
+    needs_side_effect = isinstance(probe, list | Exception) or callable(probe)
+    probe_mock = AsyncMock(side_effect=probe) if needs_side_effect else AsyncMock(return_value=probe)
 
     with (
-        patch(
-            "src.services.tmp_health_scheduler.get_db_session",
-            return_value=make_db_context(MagicMock()),
-        ),
+        patch("src.services.tmp_health_scheduler.get_db_session", return_value=read_ctx),
         patch("src.services.tmp_health_scheduler.TMPProviderRepository") as mock_repo_cls,
-        patch("src.services.tmp_health_scheduler.TMPProviderUoW", make_tmp_repo_uow(mock_repo)),
+        patch("src.services.tmp_health_scheduler.TMPProviderUoW", uow_cls),
         patch("src.services.tmp_health_scheduler._check_provider_health", new=probe_mock),
     ):
         mock_repo_cls.get_all_syncable.return_value = providers
         await TMPHealthScheduler().tick()
-        yield mock_repo, probe_mock
+        yield TickMocks(repo=repo, probe=probe_mock, uow_cls=uow_cls, read_ctx=read_ctx)
 
 
 class TestCheckAllProviders:
@@ -167,8 +193,9 @@ class TestCheckAllProviders:
         provider_a = make_mock_provider(provider_id="prov_a", tenant_id="tenant-1", endpoint="https://a.example.com")
         provider_b = make_mock_provider(provider_id="prov_b", tenant_id="tenant-2", endpoint="https://b.example.com")
 
-        async with _run_tick([provider_a, provider_b], probe=["unhealthy", "error"]) as (mock_repo, mock_check):
+        async with _run_tick([provider_a, provider_b], probe=["unhealthy", "error"]) as tick:
             pass
+        mock_repo, mock_check = tick.repo, tick.probe
 
         # Verify probes were called with correct endpoints
         mock_check.assert_has_calls(
@@ -194,37 +221,22 @@ class TestCheckAllProviders:
             provider_id="prov_healthy", tenant_id="tenant-1", endpoint="https://healthy.example.com"
         )
 
-        async with _run_tick([provider], probe="healthy") as (mock_repo, _):
+        async with _run_tick([provider], probe="healthy") as tick:
             pass
+        mock_repo = tick.repo
 
         mock_repo.update_health_status.assert_called_once_with("prov_healthy", "healthy")
 
     @pytest.mark.asyncio
     async def test_skips_when_no_providers(self):
         """No active providers → no HTTP calls, no UoW opened."""
-        mock_session = MagicMock()
-        mock_uow_cls = MagicMock()
+        # A bare MagicMock for the UoW class: the assertion is that it is never
+        # CONSTRUCTED, so it must not be the context-manager-shaped default.
+        async with _run_tick([], uow=MagicMock()) as tick:
+            pass
 
-        with (
-            patch(
-                "src.services.tmp_health_scheduler.get_db_session",
-                return_value=make_db_context(mock_session),
-            ),
-            patch("src.services.tmp_health_scheduler.TMPProviderRepository") as mock_repo_cls,
-            patch("src.services.tmp_health_scheduler.TMPProviderUoW", mock_uow_cls),
-            patch(
-                "src.services.tmp_health_scheduler._check_provider_health",
-                new=AsyncMock(),
-            ) as mock_check,
-        ):
-            mock_repo_cls.get_all_syncable.return_value = []
-
-            scheduler = TMPHealthScheduler()
-            await scheduler.tick()
-
-        mock_check.assert_not_called()
-        # No UoW opened when there are no providers
-        mock_uow_cls.assert_not_called()
+        tick.probe.assert_not_called()
+        tick.uow_cls.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_session_closed_before_probes(self):
@@ -232,10 +244,6 @@ class TestCheckAllProviders:
         provider = make_mock_provider(provider_id="prov_x", tenant_id="tenant-1", endpoint="https://x.example.com")
 
         call_order: list[str] = []
-
-        mock_session_read = MagicMock()
-        mock_repo = MagicMock()
-        mock_uow_cls = make_tmp_repo_uow(mock_repo)
 
         def track_exit(*_args: object) -> bool:
             call_order.append("session_closed")
@@ -245,22 +253,11 @@ class TestCheckAllProviders:
             call_order.append("probe_called")
             return "healthy"
 
-        read_ctx = make_db_context(mock_session_read)
+        read_ctx = make_db_context(MagicMock())
         read_ctx.__exit__ = MagicMock(side_effect=track_exit)
 
-        with (
-            patch(
-                "src.services.tmp_health_scheduler.get_db_session",
-                return_value=read_ctx,
-            ),
-            patch("src.services.tmp_health_scheduler.TMPProviderRepository") as mock_repo_cls,
-            patch("src.services.tmp_health_scheduler.TMPProviderUoW", mock_uow_cls),
-            patch("src.services.tmp_health_scheduler._check_provider_health", side_effect=track_probe),
-        ):
-            mock_repo_cls.get_all_syncable.return_value = [provider]
-
-            scheduler = TMPHealthScheduler()
-            await scheduler.tick()
+        async with _run_tick([provider], probe=track_probe, read_ctx=read_ctx):
+            pass
 
         # The read session must be closed BEFORE any probe runs
         assert call_order.index("session_closed") < call_order.index("probe_called")
@@ -271,37 +268,21 @@ class TestCheckAllProviders:
         provider_a = make_mock_provider(provider_id="prov_a", tenant_id="tenant-1", endpoint="https://bad.invalid")
         provider_b = make_mock_provider(provider_id="prov_b", tenant_id="tenant-1", endpoint="https://good.example.com")
 
-        mock_session_read = MagicMock()
-        mock_repo = MagicMock()
-        mock_uow_cls = make_tmp_repo_uow(mock_repo)
-
-        # _check_provider_health already maps all exceptions to "error",
-        # but simulate a raw exception escaping to test the gather guard. This test
-        # keeps its own arrange block because the probe must branch on the endpoint,
-        # which _run_tick's value/list/exception forms deliberately do not model.
+        # _check_provider_health already maps all exceptions to "error", but
+        # simulate a raw exception escaping to test the gather guard. A callable
+        # probe is how the seam expresses "branches on the endpoint".
         async def probe_side_effect(endpoint: str) -> str:
             if "bad" in endpoint:
                 raise OSError("DNS failure")
             return "healthy"
 
-        with (
-            patch(
-                "src.services.tmp_health_scheduler.get_db_session",
-                return_value=make_db_context(mock_session_read),
-            ),
-            patch("src.services.tmp_health_scheduler.TMPProviderRepository") as mock_repo_cls,
-            patch("src.services.tmp_health_scheduler.TMPProviderUoW", mock_uow_cls),
-            patch("src.services.tmp_health_scheduler._check_provider_health", side_effect=probe_side_effect),
-        ):
-            mock_repo_cls.get_all_syncable.return_value = [provider_a, provider_b]
-
-            # Should not raise — gather(return_exceptions=True) + coercion handles it
-            scheduler = TMPHealthScheduler()
-            await scheduler.tick()
+        # Must not raise — gather(return_exceptions=True) + coercion handles it.
+        async with _run_tick([provider_a, provider_b], probe=probe_side_effect) as tick:
+            pass
 
         # Both providers must have a status written
-        assert mock_repo.update_health_status.call_count == 2
-        calls = {c.args for c in mock_repo.update_health_status.call_args_list}
+        assert tick.repo.update_health_status.call_count == 2
+        calls = {c.args for c in tick.repo.update_health_status.call_args_list}
         assert ("prov_a", "error") in calls
         assert ("prov_b", "healthy") in calls
 
@@ -312,7 +293,6 @@ class TestCheckAllProviders:
         provider_b = make_mock_provider(provider_id="prov_b", tenant_id="tenant-2", endpoint="https://b.example.com")
         provider_c = make_mock_provider(provider_id="prov_c", tenant_id="tenant-1", endpoint="https://c.example.com")
 
-        mock_session_read = MagicMock()
         mock_repo = MagicMock()
 
         # Track which tenant_ids TMPProviderUoW was constructed with
@@ -326,22 +306,12 @@ class TestCheckAllProviders:
             mock_uow.__exit__ = MagicMock(return_value=False)
             return mock_uow
 
-        with (
-            patch(
-                "src.services.tmp_health_scheduler.get_db_session",
-                return_value=make_db_context(mock_session_read),
-            ),
-            patch("src.services.tmp_health_scheduler.TMPProviderRepository") as mock_repo_cls,
-            patch("src.services.tmp_health_scheduler.TMPProviderUoW", side_effect=make_uow),
-            patch(
-                "src.services.tmp_health_scheduler._check_provider_health",
-                new=AsyncMock(return_value="healthy"),
-            ),
+        async with _run_tick(
+            [provider_a, provider_b, provider_c],
+            repo=mock_repo,
+            uow=MagicMock(side_effect=make_uow),
         ):
-            mock_repo_cls.get_all_syncable.return_value = [provider_a, provider_b, provider_c]
-
-            scheduler = TMPHealthScheduler()
-            await scheduler.tick()
+            pass
 
         # Exactly 2 UoW instances: one per unique tenant
         assert sorted(uow_tenant_ids) == ["tenant-1", "tenant-2"]
@@ -379,23 +349,13 @@ class TestWritePhaseIsIsolatedPerTenant:
             cm.__exit__ = MagicMock(return_value=False)
             return cm
 
-        mock_uow_cls = MagicMock(side_effect=_enter_for)
-
-        with (
-            patch(
-                "src.services.tmp_health_scheduler.get_db_session",
-                return_value=make_db_context(MagicMock()),
-            ),
-            patch("src.services.tmp_health_scheduler.TMPProviderRepository") as mock_repo_cls,
-            patch("src.services.tmp_health_scheduler.TMPProviderUoW", mock_uow_cls),
-            patch(
-                "src.services.tmp_health_scheduler._check_provider_health",
-                new=AsyncMock(side_effect=["healthy", "healthy"]),
-            ),
+        async with _run_tick(
+            [provider_a, provider_b],
+            probe=["healthy", "healthy"],
+            repo=mock_repo,
+            uow=MagicMock(side_effect=_enter_for),
         ):
-            mock_repo_cls.get_all_syncable.return_value = [provider_a, provider_b]
-
-            await TMPHealthScheduler().tick()
+            pass
 
         # tenant-2's write happened even though tenant-1's UoW blew up first.
         mock_repo.update_health_status.assert_called_once_with("prov_b", "healthy")
