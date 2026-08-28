@@ -23,6 +23,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from adcp.types import BrandReference
 
 from src.core.schema_helpers import to_brand_reference
 from tests.helpers.create_media_buy_capture import capture_a2a_forwarded_pnc, capture_mcp_forwarded_pnc
@@ -166,113 +167,49 @@ class TestA2AWrapperPncJsonSerialization:
             )
 
 
-class TestBrandStrToRef:
-    """to_brand_reference converts plain brand strings to typed BrandReference (Change 5).
+class TestToBrandReference:
+    """``to_brand_reference`` is the ONE str/dict/model → BrandReference converter.
 
-    AdCP 3.1 BrandReference.domain requires a bare hostname (no scheme, no path).
-    The helper must strip URL scheme and path components so adapters can read
-    ``brand.domain`` from stored creative data.
+    One home for the converter's contract, because there is one converter: the
+    creative-build path and ``create_media_buy``'s request builder both route
+    through it (``media_buy_create._build_create_media_buy_request`` no longer
+    constructs ``BrandReference(domain=brand)`` raw), so scheme-bearing/uppercase
+    shorthand is accepted identically on both.
 
-    Returns a typed BrandReference — not a loose dict — so the brand stays typed
-    end-to-end inside the application (serialization to dict happens only at the
-    DB/SDK boundary).
+    ``brand-ref.json @ 3.1.1`` requires ``domain`` to be a bare hostname — no
+    scheme, no path, no query, no fragment — so the converter strips every URL
+    component and lowercases the host. It returns a TYPED ``BrandReference``, not
+    a loose dict: the brand stays typed end-to-end inside the application and is
+    serialized only at the DB/SDK boundary.
     """
 
-    def test_plain_domain_unchanged(self):
-        """A bare domain string is returned as-is in the domain field."""
-        result = to_brand_reference("example.com")
-        assert result.domain == "example.com"
+    @pytest.mark.parametrize(
+        "raw,expected_domain",
+        [
+            pytest.param("example.com", "example.com", id="bare-domain"),
+            pytest.param("https://example.com", "example.com", id="https-scheme"),
+            pytest.param("http://example.com", "example.com", id="http-scheme"),
+            pytest.param("https://example.com/path/to/page", "example.com", id="path"),
+            pytest.param("https://example.com/path?q=1&foo=bar", "example.com", id="query"),
+            pytest.param("https://example.com/page#section", "example.com", id="fragment"),
+            pytest.param("https://example.com/path?q=1#anchor", "example.com", id="all-components"),
+            pytest.param("https://Example.COM/Path", "example.com", id="uppercase-host"),
+            pytest.param("https://ads.example.com/campaign", "ads.example.com", id="subdomain-preserved"),
+            pytest.param({"domain": "acme.com"}, "acme.com", id="dict-input"),
+            pytest.param(BrandReference(domain="acme.com"), "acme.com", id="model-input"),
+        ],
+    )
+    def test_normalizes_to_bare_lowercase_domain(self, raw, expected_domain):
+        result = to_brand_reference(raw)
 
-    def test_https_scheme_stripped(self):
-        """https:// scheme is stripped, leaving only the hostname."""
-        result = to_brand_reference("https://example.com")
-        assert result.domain == "example.com"
-
-    def test_http_scheme_stripped(self):
-        """http:// scheme is stripped, leaving only the hostname."""
-        result = to_brand_reference("http://example.com")
-        assert result.domain == "example.com"
-
-    def test_path_stripped(self):
-        """URL path is stripped — only the hostname is kept."""
-        result = to_brand_reference("https://example.com/path/to/page")
-        assert result.domain == "example.com"
-
-    def test_query_string_stripped(self):
-        """Query string is stripped — only the hostname is kept."""
-        result = to_brand_reference("https://example.com/path?q=1&foo=bar")
-        assert result.domain == "example.com"
-
-    def test_fragment_stripped(self):
-        """URL fragment is stripped — only the hostname is kept."""
-        result = to_brand_reference("https://example.com/page#section")
-        assert result.domain == "example.com"
-
-    def test_full_url_all_components_stripped(self):
-        """Full URL with scheme, path, query, and fragment → bare hostname."""
-        result = to_brand_reference("https://example.com/path?q=1#anchor")
-        assert result.domain == "example.com"
-
-    def test_result_is_brand_reference(self):
-        """Result is always a typed BrandReference, not a loose dict."""
-        from adcp.types import BrandReference
-
-        result = to_brand_reference("https://example.com")
-        assert isinstance(result, BrandReference)
-        assert result.domain == "example.com"
-
-    def test_domain_is_lowercase(self):
-        """Domain is lowercased for consistent comparison."""
-        result = to_brand_reference("https://Example.COM/Path")
-        assert result.domain == "example.com"
-
-    def test_subdomain_preserved(self):
-        """Subdomains are preserved in the domain field."""
-        result = to_brand_reference("https://ads.example.com/campaign")
-        assert result.domain == "ads.example.com"
-
-
-class TestToBrandReferenceNormalization:
-    """to_brand_reference() is the single str/dict/model → BrandReference converter.
-
-    Routes create_media_buy's raw ``BrandReference(domain=brand)`` construction
-    (media_buy_create.py) through the same normalizer the creative-build path
-    uses, so scheme-bearing/uppercase shorthand is accepted on both paths
-    instead of raising an unhandled ValidationError on this one.
-    """
-
-    def test_scheme_bearing_string_normalized(self):
-        """A scheme-bearing string ("https://Example.COM/path") no longer raises —
-        it is normalized to a bare lowercase hostname like the creative path.
-        """
-        from src.core.schema_helpers import to_brand_reference
-
-        result = to_brand_reference("https://Example.COM/path")
-        assert result is not None
-        assert result.domain == "example.com"
-
-    def test_bare_domain_string_passthrough(self):
-        """A bare domain string is accepted unchanged (already spec-compliant)."""
-        from src.core.schema_helpers import to_brand_reference
-
-        result = to_brand_reference("acme.com")
-        assert result is not None
-        assert result.domain == "acme.com"
-
-    def test_dict_input_still_validated(self):
-        """A dict brand is still routed through BrandReference validation."""
-        from src.core.schema_helpers import to_brand_reference
-
-        result = to_brand_reference({"domain": "acme.com"})
-        assert result is not None
-        assert result.domain == "acme.com"
+        assert isinstance(result, BrandReference), "the converter returns a typed BrandReference, not a dict"
+        assert result.domain == expected_domain
 
     def test_invalid_dict_raises_typed_correctable_error(self):
         """A malformed dict brand raises AdCPValidationError (correctable), not a raw
         pydantic ValidationError crash.
         """
         from src.core.exceptions import AdCPValidationError
-        from src.core.schema_helpers import to_brand_reference
 
         with pytest.raises(AdCPValidationError) as exc_info:
             to_brand_reference({"domain": 12345})  # wrong type — not coercible to str

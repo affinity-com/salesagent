@@ -23,6 +23,7 @@ from src.core.creative_agent_registry import (
     CreativeAgentRegistry,
     _connection_agent_url,
 )
+from src.core.schemas import FormatId
 
 _PINNED = "http://creative-agent:8080/api/creative-agent"
 
@@ -81,7 +82,7 @@ class TestRegistryConnectionRouting:
 
         with patch("src.core.creative_agent_registry.create_mcp_client", return_value=client_cm) as cmc:
             try:
-                await registry.preview_creative(PUBLIC_DEFAULT_AGENT_URL, "display_300x250", {"assets": {}})
+                await registry.preview_creative(FormatId(agent_url=PUBLIC_DEFAULT_AGENT_URL, id="display_300x250"), {})
             except Exception:
                 pass  # response parsing is not under test — only connection + payload
         assert cmc.call_args.kwargs["agent_url"] == _PINNED
@@ -89,13 +90,18 @@ class TestRegistryConnectionRouting:
         # The payload's format_id is the federation-identity OBJECT carrying the
         # CANONICAL agent_url (not the connection alias) — the pinned reference
         # agent rejects a bare string, which the live public host tolerated
-        # (the mismatch the in-network pinning unmasked). The identity is the
-        # FormatId serialization (model_dump(mode="json")): Pydantic AnyUrl
-        # yields the trailing-slash form for the path-less public URL
-        # (salesagent-ehdq — verified tolerated by the pinned reference agent).
+        # (the mismatch the in-network pinning unmasked). The identity is read out
+        # of the serialized CreativeManifest, so the request cannot carry two
+        # spellings of one agent_url; Pydantic AnyUrl yields the trailing-slash
+        # form for the path-less public URL (salesagent-ehdq — verified tolerated
+        # by the pinned reference agent).
         call_tool = client_cm.__aenter__.return_value.call_tool
         payload = call_tool.call_args.args[1]
         assert payload["format_id"] == {
             "agent_url": PUBLIC_DEFAULT_AGENT_URL + "/",
             "id": "display_300x250",
         }
+        assert payload["creative_manifest"]["format_id"] == payload["format_id"], (
+            "the tool's format_id and the manifest's format_id must be byte-identical — "
+            "they are rendered from one value precisely so they cannot drift"
+        )

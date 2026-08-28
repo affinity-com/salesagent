@@ -4485,7 +4485,7 @@ def given_creative_with_generative_format(ctx: dict) -> None:
     """Set up a creative with a generative format (output_format_ids populated)."""
     env = ctx["env"]
     _ensure_tenant_principal(ctx, env)
-    fmt = env.setup_generative_build(format_id="display_gen", gemini_api_key="test-gemini-key")
+    fmt = env.setup_generative_build(gemini_api_key="test-gemini-key")
     creative_payload = {
         "creative_id": "creative-generative-001",
         "name": "Generative Creative",
@@ -4663,7 +4663,7 @@ def given_creative_output_format_ids_present(ctx: dict) -> None:
     """
     env = ctx["env"]
     _ensure_tenant_principal(ctx, env)
-    fmt = env.setup_generative_build(format_id="display_gen", gemini_api_key="test-gemini-key")
+    fmt = env.setup_generative_build(gemini_api_key="test-gemini-key")
     creative_payload = {
         "creative_id": "creative-generative-part-001",
         "name": "Generative Partition Creative",
@@ -4683,7 +4683,7 @@ def given_creative_output_format_ids_present_create(ctx: dict) -> None:
     """
     env = ctx["env"]
     _ensure_tenant_principal(ctx, env)
-    fmt = env.setup_generative_build(format_id="display_gen", gemini_api_key="test-gemini-key")
+    fmt = env.setup_generative_build(gemini_api_key="test-gemini-key")
     creative_payload = {
         "creative_id": "creative-generative-create-001",
         "name": "My Summer Campaign Banner",
@@ -4788,7 +4788,7 @@ def given_creative_generative_with_prompt(ctx: dict) -> None:
     """Set up a generative creative with a message asset containing prompt text (boundary)."""
     env = ctx["env"]
     _ensure_tenant_principal(ctx, env)
-    fmt = env.setup_generative_build(format_id="display_gen", gemini_api_key="test-gemini-key")
+    fmt = env.setup_generative_build(gemini_api_key="test-gemini-key")
     asset_prompt = "Design a responsive ad for holiday promotion"
     creative_payload = {
         "creative_id": "creative-gen-prompt-001",
@@ -4811,7 +4811,7 @@ def given_new_creative_generative_no_prompt_with_name(ctx: dict) -> None:
     """
     env = ctx["env"]
     _ensure_tenant_principal(ctx, env)
-    fmt = env.setup_generative_build(format_id="display_gen", gemini_api_key="test-gemini-key")
+    fmt = env.setup_generative_build(gemini_api_key="test-gemini-key")
     creative_payload = {
         "creative_id": "creative-gen-name-fallback-001",
         "name": "Summer Sale Banner",
@@ -4835,7 +4835,7 @@ def given_creative_generative_no_gemini(ctx: dict) -> None:
     env = ctx["env"]
     _ensure_tenant_principal(ctx, env)
     # Set up generative format but WITHOUT gemini key
-    fmt = env.setup_generative_build(format_id="display_gen", gemini_api_key="test-gemini-key")
+    fmt = env.setup_generative_build(gemini_api_key="test-gemini-key")
     # Now remove the key — setup_generative_build sets it, we override
     env.mock["config"].return_value.gemini_api_key = None
     creative_payload = {
@@ -4926,7 +4926,7 @@ def given_creative_format_with_output_format_ids(ctx: dict) -> None:
     """
     env = ctx["env"]
     _ensure_tenant_principal(ctx, env)
-    fmt = env.setup_generative_build(format_id="display_gen", gemini_api_key="test-gemini-key")
+    fmt = env.setup_generative_build(gemini_api_key="test-gemini-key")
     creative_payload = {
         "creative_id": "creative-gen-inv1-001",
         "name": "Generative Detection Test",
@@ -4957,7 +4957,7 @@ def given_generative_creative_with_asset_role(ctx: dict, role: str, content: str
     """
     env = ctx["env"]
     _ensure_tenant_principal(ctx, env)
-    fmt = env.setup_generative_build(format_id="display_gen", gemini_api_key="test-gemini-key")
+    fmt = env.setup_generative_build(gemini_api_key="test-gemini-key")
     creative_payload = {
         "creative_id": "creative-gen-inv2-001",
         "name": "Generative Prompt From Assets",
@@ -4984,7 +4984,7 @@ def given_generative_creative_with_context_description(ctx: dict, description: s
     """
     env = ctx["env"]
     _ensure_tenant_principal(ctx, env)
-    fmt = env.setup_generative_build(format_id="display_gen", gemini_api_key="test-gemini-key")
+    fmt = env.setup_generative_build(gemini_api_key="test-gemini-key")
     creative_payload = {
         "creative_id": "creative-gen-inv3-001",
         "name": "Generative Context Description",
@@ -5006,7 +5006,7 @@ def given_generative_creative_named_no_prompt(ctx: dict, name: str) -> None:
     """
     env = ctx["env"]
     _ensure_tenant_principal(ctx, env)
-    fmt = env.setup_generative_build(format_id="display_gen", gemini_api_key="test-gemini-key")
+    fmt = env.setup_generative_build(gemini_api_key="test-gemini-key")
     creative_payload = {
         "creative_id": "creative-gen-inv4-001",
         "name": name,
@@ -5033,7 +5033,7 @@ def given_generative_creative_exists_with_content(ctx: dict) -> None:
     _ensure_tenant_principal(ctx, env)
     tenant = ctx["tenant"]
     principal = ctx["principal"]
-    fmt = env.setup_generative_build(format_id="display_gen", gemini_api_key="test-gemini-key")
+    fmt = env.setup_generative_build(gemini_api_key="test-gemini-key")
 
     creative_id = "creative-gen-inv5-001"
     existing_data = {
@@ -5055,7 +5055,7 @@ def given_generative_creative_exists_with_content(ctx: dict) -> None:
         creative_id=creative_id,
         name="Existing Generative Creative",
         agent_url=env.DEFAULT_AGENT_URL,
-        format="display_gen",
+        format=fmt["id"],
         data=existing_data,
     )
     env._commit_factory_data()
@@ -5098,7 +5098,7 @@ def given_generative_creative_with_user_assets_and_prompt(ctx: dict) -> None:
     """
     env = ctx["env"]
     _ensure_tenant_principal(ctx, env)
-    fmt = env.setup_generative_build(format_id="display_gen", gemini_api_key="test-gemini-key")
+    fmt = env.setup_generative_build(gemini_api_key="test-gemini-key")
     user_image = image_spec("image", url="https://example.com/user-banner.png")
     creative_payload = {
         "creative_id": "creative-gen-inv6-001",
@@ -5223,22 +5223,16 @@ def then_generative_build_uses_prompt(ctx: dict, expected_prompt: str) -> None:
     env = ctx["env"]
     registry = env.mock["registry"].return_value
     assert registry.build_creative.called, "build_creative should have been called for generative format"
-    call_kwargs = registry.build_creative.call_args
-    # Extract the message argument (keyword or positional)
-    message_arg = call_kwargs.kwargs.get("message")
-    if message_arg is None:
-        # Try positional: build_creative(agent_url, format_id, message, ...)
-        if len(call_kwargs.args) > 2:
-            message_arg = call_kwargs.args[2]
-    if message_arg is None:
-        for kw_name in ("prompt", "text"):
-            message_arg = call_kwargs.kwargs.get(kw_name)
-            if message_arg:
-                break
-    assert message_arg is not None, (
-        f"build_creative must be called with a message/prompt, got args={call_kwargs.args}, kwargs={call_kwargs.kwargs}"
+    call_args = registry.build_creative.call_args
+    # ``message`` is a named parameter of CreativeAgentRegistry.build_creative and the
+    # caller passes it by keyword — no positional/alias fallbacks, which would let a
+    # renamed parameter pass silently by matching something else.
+    assert "message" in call_args.kwargs, (
+        f"build_creative must be called with a message, got args={call_args.args}, kwargs={call_args.kwargs}"
     )
-    assert message_arg == expected_prompt, f"Expected prompt '{expected_prompt}', got '{message_arg}'"
+    assert call_args.kwargs["message"] == expected_prompt, (
+        f"Expected prompt '{expected_prompt}', got '{call_args.kwargs['message']}'"
+    )
 
 
 @then("the generative build should be skipped")

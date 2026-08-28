@@ -287,13 +287,18 @@ class TestGenerativeUpdateUserAssets:
 
 
 class TestGenerativeUpdatePromotedOfferings:
-    """Promoted offerings extracted and passed to build_creative.
+    """Promoted offerings reach build_creative — in ``assets``, on the update path.
 
     BDD: UC-006-GENERATIVE-CREATIVE-BUILD-07 (promoted_offerings on update)
+
+    The pre-3.1 call plucked this one slot into its own ``promoted_offerings``
+    argument; ``build-creative-request.json @ 3.1.1`` has no such property, so it
+    travels with the other assets on the manifest (#2143). What matters is that
+    the buyer's offering context is not dropped.
     """
 
     def test_update_promoted_offerings_passed(self, integration_db):
-        """Update with promoted_offerings asset → passed to build_creative."""
+        """Update with a promoted_offerings asset → forwarded in the assets map."""
         with CreativeSyncEnv() as env:
             env.setup_default_data()
             fmt = env.setup_generative_build()
@@ -324,7 +329,7 @@ class TestGenerativeUpdatePromotedOfferings:
 
             assert result.creatives[0].action == "updated"
             call_args = env.mock["registry"].return_value.build_creative.call_args
-            assert call_args[1]["promoted_offerings"] is not None
+            assert call_args.kwargs["assets"].keys() == {"message", "promoted_offerings"}
 
 
 class TestGenerativeUpdateNoBuildConfig:
@@ -823,143 +828,61 @@ class TestBrandPersistence:
     """media_buy_brand is stored in creative data["brand"] (Change 5).
 
     Verifies that brand information from the media buy request is propagated
-    through _sync_creatives_internal_impl (the internal orchestration entry point —
-    media_buy_brand is not on the buyer-facing wire contract) and persisted in the
-    creative's data field so adapters can read brand.domain for routing decisions.
+    through _sync_creatives_impl's keyword-only ``media_buy_brand`` (orchestration-only:
+    not on the buyer-facing wire contract, so no wrapper forwards it) and persisted in
+    the creative's data field so adapters can read brand.domain for routing decisions.
 
     media_buy_brand is typed as BrandReference end-to-end; serialization to
     dict happens only at the DB boundary inside _build_creative_data().
+
+    The four behaviours are one flow — sync, optionally sync again, read the
+    stored brand — over three scalars, so they are a table rather than four
+    copies of that flow. ``CreativeAsset`` has no ``brand`` field in the SDK
+    schema, so the priority axis is between successive ``media_buy_brand`` values
+    across syncs, never between a media-buy brand and a creative-level one.
     """
 
-    def test_create_media_buy_brand_stored_in_data(self, integration_db):
-        """CREATE: media_buy_brand kwarg stored in data["brand"]."""
+    @pytest.mark.parametrize(
+        "create_brand,update_brand,expected_domain",
+        [
+            # A single sync stores the brand it was given.
+            pytest.param("acme.com", None, "acme.com", id="create"),
+            # _build_creative_data only writes brand when media_buy_brand is given,
+            # and the update path carries the stored value forward, so a later
+            # brand-less sync must not erase it.
+            pytest.param("original.com", None, "original.com", id="preserved"),
+            # The media-buy brand is the buyer-level one and always takes precedence.
+            pytest.param("original.com", "mediabuy.com", "mediabuy.com", id="overwritten"),
+            # A creative first synced without a brand gets one on update.
+            pytest.param(None, "mediabuy.com", "mediabuy.com", id="set-on-update"),
+        ],
+    )
+    def test_brand_is_persisted_across_syncs(self, integration_db, create_brand, update_brand, expected_domain):
+        creative_id = "c_brand_matrix"
+
         with CreativeSyncEnv() as env:
             env.setup_default_data()
             fmt = env.setup_generative_build()
 
-            creative = _creative(
-                creative_id="c_brand_create",
-                format_id=fmt,
-                assets=build_assets(text_spec("message", content="Build me an ad")),
-            )
+            def _sync_brand(brand: str | None, message: str):
+                return env.call_internal_impl(
+                    creatives=[
+                        _creative(
+                            creative_id=creative_id,
+                            format_id=fmt,
+                            assets=build_assets(text_spec("message", content=message)),
+                        )
+                    ],
+                    **({"media_buy_brand": BrandReference(domain=brand)} if brand else {}),
+                )
 
-            result = env.call_internal_impl(
-                creatives=[creative],
-                media_buy_brand=BrandReference(domain="acme.com"),
-            )
+            created = _sync_brand(create_brand, "Initial")
+            assert created.creatives[0].action == "created"
 
-            assert result.creatives[0].action == "created"
+            # "preserved" is the second sync WITHOUT a brand: the same call shape,
+            # so it runs whenever this case does not set an update brand.
+            updated = _sync_brand(update_brand, "Updated")
+            assert updated.creatives[0].action == "updated"
 
-            db = env.get_one(DBCreative, creative_id="c_brand_create")
-            assert db.data.get("brand") == {"domain": "acme.com"}
-
-    def test_brand_not_overwritten_on_update(self, integration_db):
-        """UPDATE: once brand is set, a second sync without media_buy_brand does not overwrite it.
-
-        The fix uses _build_creative_data() which only sets brand when media_buy_brand
-        is provided — subsequent syncs without media_buy_brand preserve the stored brand.
-        """
-        with CreativeSyncEnv() as env:
-            env.setup_default_data()
-            fmt = env.setup_generative_build()
-
-            # First CREATE with brand
-            creative = _creative(
-                creative_id="c_brand_no_overwrite",
-                format_id=fmt,
-                assets=build_assets(text_spec("message", content="Initial")),
-            )
-            env.call_internal_impl(creatives=[creative], media_buy_brand=BrandReference(domain="original.com"))
-
-            # Second sync (UPDATE) without media_buy_brand — should NOT overwrite
-            creative2 = _creative(
-                creative_id="c_brand_no_overwrite",
-                format_id=fmt,
-                assets=build_assets(text_spec("message", content="Updated")),
-            )
-            result = env.call_internal_impl(creatives=[creative2])
-
-            assert result.creatives[0].action == "updated"
-
-            db = env.get_one(DBCreative, creative_id="c_brand_no_overwrite")
-            # Original brand preserved — no media_buy_brand on update means no overwrite
-            assert db.data.get("brand") == {"domain": "original.com"}
-
-    def test_media_buy_brand_overwrites_previously_stored_brand(self, integration_db):
-        """UPDATE: a new media_buy_brand overwrites the previously stored brand.
-
-        Priority semantics: when media_buy_brand is provided on an update sync,
-        it replaces whatever brand was stored from the previous sync.  This is the
-        buyer-level brand from the media buy request and always takes precedence.
-
-        Note: CreativeAsset has no ``brand`` field in the SDK schema — the
-        priority axis is between successive media_buy_brand values across syncs,
-        not between media_buy_brand and a creative-level brand field.
-        """
-        with CreativeSyncEnv() as env:
-            env.setup_default_data()
-            fmt = env.setup_generative_build()
-
-            # First CREATE with one brand
-            env.call_internal_impl(
-                creatives=[
-                    _creative(
-                        creative_id="c_brand_priority",
-                        format_id=fmt,
-                        assets=build_assets(text_spec("message", content="Initial")),
-                    )
-                ],
-                media_buy_brand=BrandReference(domain="original.com"),
-            )
-
-            # UPDATE with a different media_buy_brand — must overwrite the stored brand
-            result = env.call_internal_impl(
-                creatives=[
-                    _creative(
-                        creative_id="c_brand_priority",
-                        format_id=fmt,
-                        assets=build_assets(text_spec("message", content="Updated")),
-                    )
-                ],
-                media_buy_brand=BrandReference(domain="mediabuy.com"),
-            )
-
-            assert result.creatives[0].action == "updated"
-
-            db = env.get_one(DBCreative, creative_id="c_brand_priority")
-            # New media_buy_brand must overwrite the previously stored brand
-            assert db.data.get("brand") == {"domain": "mediabuy.com"}
-
-    def test_update_media_buy_brand_propagated(self, integration_db):
-        """UPDATE: media_buy_brand kwarg propagated and stored in data["brand"]."""
-        with CreativeSyncEnv() as env:
-            env.setup_default_data()
-            fmt = env.setup_generative_build()
-
-            # CREATE first (no brand)
-            env.call_internal_impl(
-                creatives=[
-                    _creative(
-                        creative_id="c_brand_mb_update",
-                        format_id=fmt,
-                        assets=build_assets(text_spec("message", content="Initial")),
-                    )
-                ]
-            )
-
-            # UPDATE with media_buy_brand
-            creative = _creative(
-                creative_id="c_brand_mb_update",
-                format_id=fmt,
-                assets=build_assets(text_spec("message", content="Updated")),
-            )
-
-            result = env.call_internal_impl(
-                creatives=[creative],
-                media_buy_brand=BrandReference(domain="mediabuy.com"),
-            )
-
-            assert result.creatives[0].action == "updated"
-
-            db = env.get_one(DBCreative, creative_id="c_brand_mb_update")
-            assert db.data.get("brand") == {"domain": "mediabuy.com"}
+            db = env.get_one(DBCreative, creative_id=creative_id)
+            assert db.data.get("brand") == {"domain": expected_domain}

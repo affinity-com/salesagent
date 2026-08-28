@@ -1,342 +1,232 @@
-"""Unit tests for _processing.py helper functions (Change 1 & 2).
+"""Unit tests for the creative-agent seam in ``_processing.py`` (Change 1 & 2).
 
 Covers:
-- ``_find_format``: canonical composite (agent_url, id) key lookup per
-  AdCP URL canonicalization (spec MUST — ``core/format-id.json`` /
-  ``reference/url-canonicalization.mdx``): lowercased host, default ports
-  stripped, trailing slash stripped. Transport-suffix paths (``/mcp``,
-  ``/a2a``) are NOT stripped — canonicalization must preserve the path, so
-  a reference carrying such a suffix is a genuinely different agent_url.
-- ``_build_generative_manifest``: AdCP-compliant creative_manifest structure
-  (format_id as object, assets required, no creative_id/name).
+- ``_find_format`` / ``_resolve_agent_format``: canonical composite
+  (agent_url, id) key lookup per AdCP URL canonicalization (spec MUST —
+  ``core/format-id.json`` / ``reference/url-canonicalization.mdx``): lowercased
+  host, default ports stripped, trailing slash stripped. Transport-suffix paths
+  (``/mcp``, ``/a2a``) are NOT stripped — canonicalization must preserve the
+  path, so a reference carrying such a suffix is a genuinely different agent_url.
+- ``_render_creative_manifest`` (the registry's single manifest renderer):
+  AdCP-compliant ``creative_manifest`` structure (``format_id`` as an object,
+  ``assets`` always present, no ``creative_id``/``name``).
+
+The format fixtures are REAL ``Format`` models, not ``Mock``s: production
+branches on ``format_obj.output_format_ids`` (generative vs static), and a
+``Mock`` auto-creates that attribute as truthy, which silently routes a
+static-format test down the generative path. The legacy shape (bare-string
+``format_id`` with a top-level ``agent_url``) cannot be expressed as a
+``Format``, so it gets an explicit stand-in that carries exactly those two
+attributes and nothing else.
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from dataclasses import dataclass
 
 import pytest
 
-from src.core.exceptions import AdCPConfigurationError
-from src.core.tools.creatives._processing import _build_generative_manifest, _find_format
+from src.core.creative_agent_registry import _render_creative_manifest
+from src.core.exceptions import AdCPValidationError
+from src.core.schemas import Format, FormatId
+from src.core.tools.creatives._processing import _find_format, _resolve_agent_format
+from tests.factories.creative_asset import build_assets, image_spec
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _make_format(agent_url: str, format_id: str) -> MagicMock:
-    """Build a mock Format object with a FormatId-shaped format_id attribute."""
-    fmt = MagicMock()
-    fmt.format_id = MagicMock()
-    fmt.format_id.agent_url = agent_url
-    fmt.format_id.id = format_id
-    fmt.agent_url = agent_url
-    return fmt
+AGENT = "https://creative.example.com"
 
 
-def _make_legacy_format(agent_url: str, format_id: str) -> MagicMock:
-    """Build a mock Format object with legacy shape: format_id is a plain string."""
-    fmt = MagicMock()
-    fmt.format_id = format_id  # bare string, not an object
-    fmt.agent_url = agent_url  # top-level attribute
-    return fmt
+def _structured_format(agent_url: str, format_id: str) -> Format:
+    """A real SDK-shaped ``Format`` (``format_id`` is a ``FormatId`` object)."""
+    return Format(format_id=FormatId(agent_url=agent_url, id=format_id), name="Test Format")
 
 
-def _make_creative_format(agent_url: str, format_id: str) -> MagicMock:
-    """Build a mock FormatId (creative.format_id) with agent_url and id."""
-    cf = MagicMock()
-    cf.agent_url = agent_url
-    cf.id = format_id
-    return cf
+@dataclass(frozen=True)
+class _LegacyFormat:
+    """The pre-federation format shape: bare-string id + top-level agent_url.
+
+    Still reachable from stored/adapter-provided formats, which is why
+    ``_get_format_agent_url`` keeps its runtime shape discrimination. Spelled as
+    a two-field object (not a ``Mock``) so an attribute production reads but
+    this shape does not define is an ``AttributeError``, not a truthy default.
+    """
+
+    agent_url: str
+    format_id: str
 
 
-# ---------------------------------------------------------------------------
-# _find_format — Change 1
-# ---------------------------------------------------------------------------
+def _legacy_format(agent_url: str, format_id: str) -> _LegacyFormat:
+    return _LegacyFormat(agent_url=agent_url, format_id=format_id)
+
+
+# The stored side under both shapes. A real ``FormatId`` pre-normalizes host
+# case, the default port and the trailing slash at construction, so those rows
+# exercise canonicalization end-to-end only for the legacy shape — where the
+# agent_url is an unnormalized plain string. Running the same table over both
+# shapes is the point: the outcome must not depend on which shape is stored.
+FORMAT_SHAPES = [
+    pytest.param(_structured_format, id="structured"),
+    pytest.param(_legacy_format, id="legacy"),
+]
+
+# (stored agent_url, requested agent_url, stored id, requested id, matches)
+LOOKUP_CASES = [
+    pytest.param(AGENT, AGENT, "display_300x250", "display_300x250", True, id="exact"),
+    pytest.param(AGENT, AGENT + "/", "display_300x250", "display_300x250", True, id="requested-trailing-slash"),
+    pytest.param(AGENT + "/", AGENT, "display_300x250", "display_300x250", True, id="stored-trailing-slash"),
+    pytest.param(AGENT + "/", AGENT + "/", "display_300x250", "display_300x250", True, id="both-trailing-slash"),
+    pytest.param(
+        "https://Creative.Example.com", AGENT, "display_300x250", "display_300x250", True, id="stored-host-case"
+    ),
+    pytest.param(AGENT + ":443", AGENT, "display_300x250", "display_300x250", True, id="stored-default-port"),
+    pytest.param(AGENT, AGENT + "/mcp", "display_300x250", "display_300x250", False, id="transport-suffix"),
+    pytest.param(AGENT, AGENT, "display_300x250", "display_728x90", False, id="id-mismatch"),
+    pytest.param(AGENT, "https://other.example.com", "display_300x250", "display_300x250", False, id="host-mismatch"),
+]
 
 
 class TestFindFormat:
-    """_find_format uses normalized composite (agent_url, id) key.
+    """_find_format matches on the canonical composite (agent_url, id) key.
 
-    AdCP URL canonicalization (RFC 3986 §6.2.2/§6.2.3): URLs differing only
-    by trailing slash, case, or default port must compare equal.
+    AdCP URL canonicalization (RFC 3986 §6.2.2/§6.2.3): URLs differing only by
+    trailing slash, host case, or default port must compare equal; a differing
+    path (``/mcp``) must not.
     """
 
-    def test_exact_match_returns_format(self):
-        """Exact URL + id match returns the correct format object."""
-        fmt = _make_format("https://creative.example.com", "display_300x250")
-        creative_format = _make_creative_format("https://creative.example.com", "display_300x250")
+    @pytest.mark.parametrize("make_format", FORMAT_SHAPES)
+    @pytest.mark.parametrize("stored_url,requested_url,stored_id,requested_id,matches", LOOKUP_CASES)
+    def test_lookup_table(self, make_format, stored_url, requested_url, stored_id, requested_id, matches):
+        fmt = make_format(stored_url, stored_id)
 
-        result = _find_format([fmt], creative_format)
+        result = _find_format([fmt], FormatId(agent_url=requested_url, id=requested_id))
 
-        assert result is fmt
-
-    def test_trailing_slash_normalized(self):
-        """Trailing slash on agent_url is normalized before comparison.
-
-        ``https://creative.example.com/`` and ``https://creative.example.com``
-        must match (RFC 3986 §6.2.3 path normalization).
-        """
-        fmt = _make_format("https://creative.example.com", "display_300x250")
-        creative_format = _make_creative_format("https://creative.example.com/", "display_300x250")
-
-        result = _find_format([fmt], creative_format)
-
-        assert result is fmt, (
-            "_find_format must normalize trailing slash: "
-            "'https://creative.example.com/' should match 'https://creative.example.com'"
+        assert result is (fmt if matches else None), (
+            f"stored {stored_url!r}/{stored_id!r} vs requested {requested_url!r}/{requested_id!r}: "
+            f"expected {'a match' if matches else 'no match'}"
         )
-
-    def test_trailing_slash_on_stored_format_normalized(self):
-        """Trailing slash on the stored format's agent_url is also normalized."""
-        fmt = _make_format("https://creative.example.com/", "display_300x250")
-        creative_format = _make_creative_format("https://creative.example.com", "display_300x250")
-
-        result = _find_format([fmt], creative_format)
-
-        assert result is fmt
-
-    def test_both_have_trailing_slash(self):
-        """Both sides having trailing slash still matches."""
-        fmt = _make_format("https://creative.example.com/", "display_300x250")
-        creative_format = _make_creative_format("https://creative.example.com/", "display_300x250")
-
-        result = _find_format([fmt], creative_format)
-
-        assert result is fmt
-
-    def test_mcp_suffix_not_stripped(self):
-        """``/mcp`` transport suffix is NOT stripped by canonical_agent_url (spec canonicalization
-        preserves the path — unlike the lenient ``normalize_agent_url`` used elsewhere).
-
-        A reference carrying a transport suffix is a genuinely different agent_url from the
-        bare host and must NOT match — this pins the over-match regression the review flagged.
-        """
-        fmt = _make_format("https://creative.example.com", "display_300x250")
-        creative_format = _make_creative_format("https://creative.example.com/mcp", "display_300x250")
-
-        result = _find_format([fmt], creative_format)
-
-        assert result is None, (
-            "_find_format must NOT strip /mcp: canonicalization preserves the path, "
-            "so 'https://creative.example.com/mcp' must not match 'https://creative.example.com'"
-        )
-
-    def test_host_case_normalized(self):
-        """Host case differences are normalized per spec canonicalization (lowercased host)."""
-        fmt = _make_format("https://Creative.Example.com", "display_300x250")
-        creative_format = _make_creative_format("https://creative.example.com", "display_300x250")
-
-        result = _find_format([fmt], creative_format)
-
-        assert result is fmt, (
-            "_find_format must canonicalize host case: "
-            "'https://Creative.Example.com' should match 'https://creative.example.com'"
-        )
-
-    def test_default_port_normalized(self):
-        """An explicit default port (443 for https) is normalized away per spec canonicalization."""
-        fmt = _make_format("https://creative.example.com:443", "display_300x250")
-        creative_format = _make_creative_format("https://creative.example.com", "display_300x250")
-
-        result = _find_format([fmt], creative_format)
-
-        assert result is fmt, (
-            "_find_format must strip the default port: "
-            "'https://creative.example.com:443' should match 'https://creative.example.com'"
-        )
-
-    def test_no_match_returns_none(self):
-        """No matching format returns None."""
-        fmt = _make_format("https://creative.example.com", "display_300x250")
-        creative_format = _make_creative_format("https://creative.example.com", "display_728x90")
-
-        result = _find_format([fmt], creative_format)
-
-        assert result is None
-
-    def test_wrong_agent_url_returns_none(self):
-        """Different agent_url (after normalization) returns None."""
-        fmt = _make_format("https://creative.example.com", "display_300x250")
-        creative_format = _make_creative_format("https://other.example.com", "display_300x250")
-
-        result = _find_format([fmt], creative_format)
-
-        assert result is None
 
     def test_empty_list_returns_none(self):
         """Empty format list returns None."""
-        creative_format = _make_creative_format("https://creative.example.com", "display_300x250")
-
-        result = _find_format([], creative_format)
-
-        assert result is None
+        assert _find_format([], FormatId(agent_url=AGENT, id="display_300x250")) is None
 
     def test_first_matching_format_returned(self):
         """When multiple formats match, the first one is returned."""
-        fmt_a = _make_format("https://creative.example.com", "display_300x250")
-        fmt_b = _make_format("https://creative.example.com", "display_300x250")
-        creative_format = _make_creative_format("https://creative.example.com", "display_300x250")
+        fmt_a = _structured_format(AGENT, "display_300x250")
+        fmt_b = _structured_format(AGENT, "display_300x250")
 
-        result = _find_format([fmt_a, fmt_b], creative_format)
+        result = _find_format([fmt_a, fmt_b], FormatId(agent_url=AGENT, id="display_300x250"))
 
         assert result is fmt_a
 
     def test_selects_correct_format_from_multiple(self):
         """Correct format is selected when multiple formats are present."""
-        fmt_a = _make_format("https://creative.example.com", "display_300x250")
-        fmt_b = _make_format("https://creative.example.com", "display_728x90")
-        creative_format = _make_creative_format("https://creative.example.com", "display_728x90")
+        fmt_a = _structured_format(AGENT, "display_300x250")
+        fmt_b = _structured_format(AGENT, "display_728x90")
 
-        result = _find_format([fmt_a, fmt_b], creative_format)
+        result = _find_format([fmt_a, fmt_b], FormatId(agent_url=AGENT, id="display_728x90"))
 
         assert result is fmt_b
 
-    def test_legacy_string_format_id_matches(self):
-        """Legacy shape: format_id is a plain string, agent_url is top-level attribute.
 
-        Some test mocks and older code paths use this shape. _find_format must
-        handle it without AttributeError.
-        """
-        fmt = _make_legacy_format("https://creative.example.com", "display_300x250")
-        creative_format = _make_creative_format("https://creative.example.com", "display_300x250")
+class TestResolveAgentFormat:
+    """_resolve_agent_format returns the format plus the ONE identity to dial with.
 
-        result = _find_format([fmt], creative_format)
-
-        assert result is fmt
-
-    def test_legacy_string_format_id_trailing_slash_normalized(self):
-        """Legacy shape: trailing slash on agent_url is normalized."""
-        fmt = _make_legacy_format("https://creative.example.com", "display_300x250")
-        creative_format = _make_creative_format("https://creative.example.com/", "display_300x250")
-
-        result = _find_format([fmt], creative_format)
-
-        assert result is fmt
-
-    def test_legacy_string_format_id_no_match(self):
-        """Legacy shape: wrong format_id string returns None."""
-        fmt = _make_legacy_format("https://creative.example.com", "display_300x250")
-        creative_format = _make_creative_format("https://creative.example.com", "display_728x90")
-
-        result = _find_format([fmt], creative_format)
-
-        assert result is None
-
-
-# ---------------------------------------------------------------------------
-# _build_generative_manifest — Change 2
-# ---------------------------------------------------------------------------
-
-
-class TestBuildGenerativeManifest:
-    """_build_generative_manifest produces AdCP-compliant creative_manifest.
-
-    AdCP 3.1 requires:
-    - ``format_id`` as a structured object (not a bare string)
-    - ``assets`` field always present (empty dict if no assets)
-    - No ``creative_id`` or ``name`` at the top level
+    Both agent calls (``preview_creative`` / ``build_creative``) are addressed
+    with this single ``FormatId``, so a request cannot carry two spellings of
+    the same agent_url.
     """
 
-    def _make_creative(self, assets=None) -> MagicMock:
-        creative = MagicMock()
-        creative.assets = assets
-        return creative
+    def test_returns_format_and_canonical_identity(self):
+        fmt = _structured_format(AGENT, "display_300x250")
 
-    def _make_format_obj(self, agent_url: str) -> MagicMock:
-        """Build a mock Format object (structured SDK shape) with format_id.agent_url set."""
-        return _make_format(agent_url, "unused_id")
+        resolved = _resolve_agent_format([fmt], FormatId(agent_url=AGENT + "/", id="display_300x250"))
 
-    def test_format_id_is_structured_object(self):
-        """format_id must be a dict with 'id' and 'agent_url' keys (not a bare string)."""
-        creative_format = _make_creative_format("https://creative.example.com", "display_300x250")
-        format_obj = self._make_format_obj("https://creative.example.com")
-        creative = self._make_creative()
+        assert resolved is not None
+        format_obj, agent_format = resolved
+        assert format_obj is fmt
+        assert agent_format.id == "display_300x250"
+        assert str(agent_format.agent_url).rstrip("/") == AGENT
 
-        manifest = _build_generative_manifest(creative_format, format_obj, creative)
+    def test_unresolvable_reference_returns_none(self):
+        """A reference to a format the agent list does not carry resolves to None."""
+        fmt = _structured_format(AGENT, "display_300x250")
 
+        assert _resolve_agent_format([fmt], FormatId(agent_url=AGENT, id="display_728x90")) is None
+
+    def test_format_without_agent_url_returns_none(self):
+        """A format carrying no agent_url has no agent to dial, so it does not resolve."""
+
+        @dataclass(frozen=True)
+        class _NoAgentUrlFormat:
+            format_id: str
+
+        assert (
+            _resolve_agent_format(
+                [_NoAgentUrlFormat("display_300x250")], FormatId(agent_url=AGENT, id="display_300x250")
+            )
+            is None
+        )
+
+
+class TestRenderCreativeManifest:
+    """_render_creative_manifest produces the AdCP-compliant creative_manifest.
+
+    AdCP 3.1 requires ``format_id`` as a structured object (never a bare
+    string), ``assets`` always present, and no ``creative_id``/``name`` at the
+    top level. Rendering lives in the registry (the adapter that owns the wire
+    contract), which is why this is graded against the serialized payload.
+    """
+
+    @pytest.fixture
+    def manifest(self) -> dict:
+        return _render_creative_manifest(
+            FormatId(agent_url=AGENT, id="display_300x250"),
+            build_assets(image_spec("banner")),
+        ).model_dump(mode="json", exclude_none=True)
+
+    def test_format_id_is_structured_object(self, manifest):
         assert isinstance(manifest["format_id"], dict), (
             "format_id must be a structured object (dict), not a bare string"
         )
         assert manifest["format_id"]["id"] == "display_300x250"
-        assert manifest["format_id"]["agent_url"] == "https://creative.example.com"
+        assert str(manifest["format_id"]["agent_url"]).rstrip("/") == AGENT
 
-    def test_assets_always_present(self):
-        """'assets' key must always be present in the manifest."""
-        creative_format = _make_creative_format("https://creative.example.com", "display_300x250")
-        format_obj = self._make_format_obj("https://creative.example.com")
-        creative = self._make_creative(assets=None)
+    def test_assets_are_carried(self, manifest):
+        assert manifest["assets"]["banner"]["asset_type"] == "image"
 
-        manifest = _build_generative_manifest(creative_format, format_obj, creative)
+    def test_no_creative_id_or_name(self, manifest):
+        assert "creative_id" not in manifest, "AdCP 3.1 removed creative_id from the manifest"
+        assert "name" not in manifest, "AdCP 3.1 removed name from the manifest"
 
-        assert "assets" in manifest, "manifest must always contain 'assets' key"
+    def test_no_url_key_without_one(self, manifest):
+        """``url`` is a static-preview extra — absent unless a media URL is passed."""
+        assert "url" not in manifest
 
     def test_assets_empty_dict_when_no_assets(self):
-        """When creative has no assets, manifest['assets'] is an empty dict."""
-        creative_format = _make_creative_format("https://creative.example.com", "display_300x250")
-        format_obj = self._make_format_obj("https://creative.example.com")
-        creative = self._make_creative(assets=None)
-
-        manifest = _build_generative_manifest(creative_format, format_obj, creative)
-
-        assert manifest["assets"] == {}, (
-            "manifest['assets'] must be {} when creative has no assets, not None or missing"
+        """A generative build with no buyer assets still sends ``assets`` as ``{}``."""
+        manifest = _render_creative_manifest(FormatId(agent_url=AGENT, id="gen"), None).model_dump(
+            mode="json", exclude_none=True
         )
 
-    def test_no_creative_id_in_manifest(self):
-        """Manifest must NOT contain 'creative_id' at the top level."""
-        creative_format = _make_creative_format("https://creative.example.com", "display_300x250")
-        format_obj = self._make_format_obj("https://creative.example.com")
-        creative = self._make_creative()
+        assert manifest["assets"] == {}, "assets must be {} when the creative has none, not None or missing"
 
-        manifest = _build_generative_manifest(creative_format, format_obj, creative)
+    def test_static_preview_url_rides_through(self):
+        """The static path's existing media URL reaches the agent as a manifest extra."""
+        manifest = _render_creative_manifest(
+            FormatId(agent_url=AGENT, id="display_300x250"),
+            build_assets(image_spec("banner")),
+            url="https://cdn.example.com/banner.png",
+        ).model_dump(mode="json", exclude_none=True)
 
-        assert "creative_id" not in manifest, "manifest must NOT contain 'creative_id' — AdCP 3.1 removed this field"
+        assert manifest["url"] == "https://cdn.example.com/banner.png"
 
-    def test_no_name_in_manifest(self):
-        """Manifest must NOT contain 'name' at the top level."""
-        creative_format = _make_creative_format("https://creative.example.com", "display_300x250")
-        format_obj = self._make_format_obj("https://creative.example.com")
-        creative = self._make_creative()
+    def test_malformed_asset_is_rejected_before_the_request_goes_out(self):
+        """model_validate (not model_construct) — a bad asset fails here, not at the agent.
 
-        manifest = _build_generative_manifest(creative_format, format_obj, creative)
-
-        assert "name" not in manifest, "manifest must NOT contain 'name' — AdCP 3.1 removed this field"
-
-    def test_agent_url_from_format_obj(self):
-        """agent_url in format_id comes from format_obj.format_id.agent_url (structured SDK shape)."""
-        creative_format = _make_creative_format("https://creative.example.com/mcp", "display_300x250")
-        format_obj = self._make_format_obj("https://creative.example.com")  # canonical form
-        creative = self._make_creative()
-
-        manifest = _build_generative_manifest(creative_format, format_obj, creative)
-
-        # The agent_url in the manifest comes from format_obj (canonical), not creative_format
-        assert manifest["format_id"]["agent_url"] == "https://creative.example.com"
-
-    def test_format_id_from_creative_format(self):
-        """format_id.id in manifest comes from creative_format.id."""
-        creative_format = _make_creative_format("https://creative.example.com", "video_standard_30s")
-        format_obj = self._make_format_obj("https://creative.example.com")
-        creative = self._make_creative()
-
-        manifest = _build_generative_manifest(creative_format, format_obj, creative)
-
-        assert manifest["format_id"]["id"] == "video_standard_30s"
-
-    def test_raises_when_format_obj_has_no_agent_url(self):
-        """Raises AdCPConfigurationError when format_obj has no resolvable agent_url.
-
-        An empty agent_url would produce an invalid manifest that the creative
-        agent would reject — _build_generative_manifest must fail fast rather
-        than silently emit a broken request with agent_url="".
+        Typed as ``VALIDATION_ERROR`` / ``correctable``: the assets are buyer input,
+        so the rejection must not reach the buyer as a retryable agent outage.
         """
-        creative_format = _make_creative_format("https://creative.example.com", "display_300x250")
-        # format_obj with neither format_id.agent_url nor top-level agent_url
-        format_obj = MagicMock(spec=[])  # spec=[] means no attributes at all
-
-        creative = self._make_creative()
-
-        with pytest.raises(AdCPConfigurationError, match="no resolvable agent_url"):
-            _build_generative_manifest(creative_format, format_obj, creative)
+        with pytest.raises(AdCPValidationError):
+            _render_creative_manifest(
+                FormatId(agent_url=AGENT, id="display_300x250"),
+                {"banner": {"asset_type": "image"}},  # image asset with no url/width/height
+            )

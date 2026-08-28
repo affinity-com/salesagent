@@ -180,26 +180,22 @@ EXPECTED_UNSUPPORTED_DECLARATIONS: frozenset[tuple[str, str, str]] = frozenset(
             "live stack always serves the agent catalog; an empty catalog cannot be realized over e2e",
         ),
         ("tests/harness/creative_formats.py", "_validate_registry_formats", "<dynamic>"),
-        # Justification (PR #1482): graduating @T-UC-006-ext-i made the generative
-        # sync scenario live on every transport, e2e_rest included. Its setup injects
-        # a synthetic format (plus a stubbed build_creative) into the in-process
-        # registry mock; over e2e the live server resolves formats against the real
-        # creative agent, which does not serve it, so the sync is rejected as an
-        # unknown format. This is the same "format-injection has no surface" class the
-        # ledger retirement already owns for CreativeFormatsEnv — not a way to dodge a
-        # production gap. It stays live on a2a/mcp/rest, where it grades the actual
-        # obligation (a generative build needs no seller-side generation key).
-        # Retiring this hatch means registering a generative format with the pinned
-        # reference agent and refreshing the reference fixture.
+        # Graduated (PR #1482 review round): setup_generative_build no longer
+        # declares itself unrealizable. It defaults to a generative format the
+        # PINNED reference agent serves (present in the reference fixture), and
+        # build_creative gained the ADCP_TESTING branch its sibling registry
+        # methods already had — so the live stack resolves the format AND answers
+        # the build, and the scenario is graded on e2e_rest like every other.
+        # What remains declared, at _realize_generative_build, is the narrower
+        # gap: a scenario-specific canned build_result cannot be injected into a
+        # live server that derives its own.
         (
             "tests/harness/creative_sync.py",
-            "setup_generative_build",
-            "generative setup injects a synthetic format (output_format_ids) plus a stubbed "
-            "build_creative into the in-process registry mock. Over e2e the live server resolves "
-            "formats against the real creative agent, which does not serve it — the sync is "
-            "rejected as an unknown format. Realizing this needs a generative format registered "
-            "with the pinned reference agent and present in the reference fixture.",
+            "_realize_generative_build",
+            "a scenario-specific build_result cannot be injected over e2e: the live server serves the "
+            "build result its own ADCP_TESTING branch derives. Assert on that result instead of pinning one.",
         ),
+        ("tests/harness/creative_sync.py", "_realize_generative_build", "<dynamic>"),
     }
 )
 

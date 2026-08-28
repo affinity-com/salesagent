@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from src.core.auth import require_identity, require_principal_id, require_tenant
 from src.core.database.repositories.uow import CreativeUoW
-from src.core.exceptions import AdCPError
+from src.core.exceptions import AdCPError, to_wire_error_code
 from src.core.helpers import log_tool_activity
 from src.core.resolved_identity import ResolvedIdentity
 from src.core.schemas import SyncCreativeResult, SyncCreativesResponse
@@ -46,17 +46,29 @@ def _sync_creatives_impl(
     push_notification_config: PushNotificationConfig | dict | None = None,
     context: ContextObject | dict | None = None,
     identity: ResolvedIdentity | None = None,
+    *,
+    media_buy_brand: BrandReference | None = None,
 ) -> SyncCreativesResponse:
     """Sync creative assets to centralized library (AdCP v2.5 spec compliant endpoint).
 
-    Buyer-facing shared business logic behind the MCP/A2A/REST ``sync_creatives``
-    wrappers. Its signature is exactly the ``SyncCreativesRequest`` contract — every
-    parameter here is one a buyer can set on the wire, so each wrapper must forward
-    all of them (enforced by ``test_architecture_boundary_completeness.py``).
+    Shared business logic behind the MCP/A2A/REST ``sync_creatives`` wrappers.
+    Every POSITIONAL-OR-KEYWORD parameter here is buyer-facing and is forwarded by
+    all three wire wrappers — enforced by
+    ``test_architecture_boundary_completeness.py``. (That is the wrapper-to-impl
+    completeness contract, not a claim that the signature equals the pinned request
+    schema: ``creative/sync-creatives-request.json @ 3.1.1`` requires
+    ``idempotency_key``/``account``/``creatives``, and the ``idempotency_key`` gap
+    is pre-existing and tracked in #2144.)
 
-    Internal orchestration that needs to pass inputs the AdCP request schema does
-    not define calls :func:`_sync_creatives_internal_impl` instead; see its
-    docstring.
+    Parameters after the ``*`` are KEYWORD-ONLY and orchestration-only: supplied by
+    in-process callers, absent from the wire contract, and never forwarded by a
+    wrapper. That is the whole marker — the guard reads the signature, so there is
+    no name registry to keep in step and no second entry point to keep in step
+    with this one. (A previous version split this function in two so the
+    orchestration-only input could stay off a "buyer-facing" signature; the split
+    bought nothing — FastMCP derives the advertised MCP tool schema from the
+    WRAPPER's signature, not from this one — and cost a third copy of the
+    nine-parameter forwarding block.)
 
     Primary creative management endpoint that handles:
     - Bulk creative upload/update with upsert semantics
@@ -77,48 +89,11 @@ def _sync_creatives_impl(
         push_notification_config: Push notification config for status updates (AdCP spec, optional)
         context: Application level context per adcp spec
         identity: ResolvedIdentity with principal/tenant info (transport-agnostic)
-
-    Returns:
-        SyncCreativesResponse with synced creatives and assignments
-    """
-    # Forward every parameter, leaving media_buy_brand at its default. ``locals()``
-    # here is exactly this function's parameters — this MUST remain the first
-    # statement in the body, and no local may be introduced above it. Spelling the
-    # nine names out instead would make this a third copy of the forwarding block
-    # the two transport wrappers already carry (DRY: pylint R0801 flags it), and a
-    # copy that silently drifts when a buyer-facing parameter is added.
-    return _sync_creatives_internal_impl(**locals())
-
-
-def _sync_creatives_internal_impl(
-    creatives: Sequence[CreativeAsset | BaseModel | dict[str, Any]],
-    assignments: dict | None = None,
-    creative_ids: list[str] | None = None,
-    delete_missing: bool = False,
-    dry_run: bool = False,
-    validation_mode: str = "strict",
-    push_notification_config: PushNotificationConfig | dict | None = None,
-    context: ContextObject | dict | None = None,
-    identity: ResolvedIdentity | None = None,
-    media_buy_brand: BrandReference | None = None,
-) -> SyncCreativesResponse:
-    """Internal sync entry point: the buyer-facing contract plus orchestration-only inputs.
-
-    Everything :func:`_sync_creatives_impl` documents applies here — this holds the
-    actual implementation and that function is a thin buyer-facing delegate. The
-    split exists so orchestration-only inputs stay OFF the buyer-facing signature:
-    a wire wrapper's signature is the buyer contract (FastMCP derives the advertised
-    MCP tool schema from it), and advertising an input the pinned AdCP request
-    schema does not define would be a spec violation, not a missing forward.
-
-    Only in-process callers use this entry point.
-
-    Args:
-        media_buy_brand: Typed brand from the ``create_media_buy`` request, threaded
-            in by ``process_and_upload_package_creatives`` so adapters can read
+        media_buy_brand: ORCHESTRATION-ONLY (keyword-only). Typed brand from the
+            ``create_media_buy`` request, threaded in by
+            ``process_and_upload_package_creatives`` so adapters can read
             ``brand.domain`` from the stored creative data. ``SyncCreativesRequest``
             has no ``brand`` field in the pinned spec and no transport caller sets it.
-        (all other args: see :func:`_sync_creatives_impl`)
 
     Returns:
         SyncCreativesResponse with synced creatives and assignments
@@ -235,7 +210,13 @@ def _sync_creatives_internal_impl(
                         error_msg = str(validation_error)
                     failed_creatives.append({"creative_id": creative_id, "error": error_msg})
                     failed_count += 1
-                    results.append(_failed_sync_result(creative_id, error_msg))
+                    # Buyer input the buyer can fix: VALIDATION_ERROR is classified
+                    # correctable in enums/error-code.json @ 3.1.1. The default
+                    # SERVICE_UNAVAILABLE would tell the buyer to retry with backoff
+                    # a payload that will be rejected identically every time.
+                    results.append(
+                        _failed_sync_result(creative_id, error_msg, recovery="correctable", code="VALIDATION_ERROR")
+                    )
                     continue  # Skip to next creative
 
                 # Check provenance requirement (EU AI Act Article 50)
@@ -415,7 +396,32 @@ def _sync_creatives_internal_impl(
                     {"creative_id": creative_id, "name": _get_field(raw_creative, "name"), "error": error_msg}
                 )
                 failed_count += 1
-                results.append(_failed_sync_result(creative_id, error_msg))
+                # The typed error owns both halves of the advisory: its own wire code
+                # and its own recovery. Defaulting to SERVICE_UNAVAILABLE here while
+                # the hint says "correctable" would tell the buyer to retry with
+                # backoff (the code's pinned classification) AND to fix the request
+                # (the hint) — see _failed_from_agent_error for the same rule on the
+                # creative-agent path.
+                results.append(
+                    _failed_sync_result(
+                        creative_id, error_msg, recovery=e.recovery, code=to_wire_error_code(e.error_code)
+                    )
+                )
+            except ValidationError as e:
+                # A malformed creative payload (e.g. an asset the AdCP AssetVariant
+                # union cannot express) — the buyer's to fix, so VALIDATION_ERROR /
+                # correctable, never the retry-with-backoff SERVICE_UNAVAILABLE
+                # default. Raised where the boundary builds the CreativeAsset, which
+                # is outside the inner validation try above.
+                creative_id = _get_field(raw_creative, "creative_id", "unknown")
+                error_msg = format_validation_error(e, context=f"creative {creative_id}")
+                failed_creatives.append(
+                    {"creative_id": creative_id, "name": _get_field(raw_creative, "name"), "error": error_msg}
+                )
+                failed_count += 1
+                results.append(
+                    _failed_sync_result(creative_id, error_msg, recovery="correctable", code="VALIDATION_ERROR")
+                )
             except Exception as e:
                 # Savepoint automatically rolls back this creative only
                 creative_id = _get_field(raw_creative, "creative_id", "unknown")

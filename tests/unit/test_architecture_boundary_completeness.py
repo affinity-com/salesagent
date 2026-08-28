@@ -1,9 +1,13 @@
-"""Guard: MCP/A2A wrappers must pass all _impl function parameters.
+"""Guard: MCP/A2A wrappers must pass all buyer-facing _impl parameters.
 
-Every parameter of an _impl function must be passed through by both its MCP
-wrapper and A2A raw wrapper at call sites. Silently dropping parameters means
-the transport boundary is incomplete — callers can't access functionality
+Every buyer-facing parameter of an _impl function must be passed through by both
+its MCP wrapper and A2A raw wrapper at call sites. Silently dropping parameters
+means the transport boundary is incomplete — callers can't access functionality
 that _impl provides.
+
+"Buyer-facing" is read off the signature, not off a list kept here — see
+:func:`_get_impl_params`: boundary-resolved (``identity``) and keyword-only
+(orchestration-only) parameters are excluded.
 
 Scanning approach: Hybrid — introspection for signatures, file-level AST
 for call-site verification of which arguments are actually passed.
@@ -62,11 +66,29 @@ def _module_to_filepath(module_path: str) -> Path:
 
 
 def _get_impl_params(module_path: str, func_name: str) -> list[str]:
-    """Get parameter names for an _impl function (excluding boundary-resolved)."""
+    """The buyer-facing parameters of an _impl function.
+
+    Two exclusions, both structural rather than name-by-name:
+
+    - ``BOUNDARY_RESOLVED_PARAMS`` — resolved AT the boundary from the transport
+      (``identity``), so a wrapper produces it instead of forwarding it.
+    - KEYWORD-ONLY parameters — orchestration-only by convention: supplied by
+      in-process callers (e.g. ``_sync_creatives_impl(media_buy_brand=…)`` from
+      ``process_and_upload_package_creatives``), absent from the AdCP request
+      schema, and never advertised by a wrapper. The ``*`` in the signature IS
+      the declaration, which is why this guard needs no allowlist of names that
+      could only ever grow: adding one is visible in the signature diff, and a
+      buyer-facing parameter placed after the ``*`` by mistake is a review
+      question about the signature, not a silent entry in a set here.
+    """
     mod = importlib.import_module(module_path)
     func = getattr(mod, func_name)
     sig = inspect.signature(func)
-    return [name for name in sig.parameters if name not in BOUNDARY_RESOLVED_PARAMS]
+    return [
+        name
+        for name, param in sig.parameters.items()
+        if name not in BOUNDARY_RESOLVED_PARAMS and param.kind is not inspect.Parameter.KEYWORD_ONLY
+    ]
 
 
 def _find_wrapper_info(module_path: str, impl_name: str) -> dict:
@@ -234,62 +256,4 @@ class TestBoundaryCompleteness:
             still_violated,
             KNOWN_VIOLATIONS,
             fix_hint="Remove fixed entries from KNOWN_VIOLATIONS.",
-        )
-
-
-class TestInternalOnlyImplParams:
-    """The buyer-facing sync impl delegates its whole signature to the internal one.
-
-    ``_sync_creatives_impl`` is the buyer-facing shared impl (its signature IS the
-    ``SyncCreativesRequest`` contract, which is why the completeness guard above
-    demands every wrapper forward all of it). The implementation lives in
-    ``_sync_creatives_internal_impl``, which additionally accepts inputs only
-    in-process orchestration supplies.
-
-    The delegation is written as ``**locals()`` precisely so the nine buyer-facing
-    names are not restated (a restated copy would duplicate the forwarding block
-    both transport wrappers already carry, and would drift when a parameter is
-    added). That makes the two signatures agree by convention rather than by type
-    checking — so pin the agreement here.
-    """
-
-    @pytest.mark.arch_guard
-    def test_buyer_facing_sync_params_all_exist_on_internal_impl(self):
-        """Every buyer-facing param must exist on the internal impl, or **locals() breaks."""
-        from src.core.tools.creatives._sync import _sync_creatives_impl, _sync_creatives_internal_impl
-
-        buyer = set(inspect.signature(_sync_creatives_impl).parameters)
-        internal = set(inspect.signature(_sync_creatives_internal_impl).parameters)
-
-        missing = buyer - internal
-        assert not missing, (
-            f"_sync_creatives_impl forwards **locals() to _sync_creatives_internal_impl, but "
-            f"{sorted(missing)} is missing from the internal signature — the delegation would "
-            f"raise TypeError. Add the parameter to _sync_creatives_internal_impl too."
-        )
-
-    @pytest.mark.arch_guard
-    def test_only_documented_params_are_orchestration_only(self):
-        """The internal impl may only add orchestration-only params that are declared here.
-
-        Keeps the internal seam from quietly becoming a side door for buyer-facing
-        inputs that should have gone on the shared contract (and thus through every
-        wrapper). Adding a name here is a deliberate, reviewable act.
-        """
-        from src.core.tools.creatives._sync import _sync_creatives_impl, _sync_creatives_internal_impl
-
-        # Supplied only by in-process orchestration; absent from SyncCreativesRequest.
-        # ``media_buy_brand``: threaded from _create_media_buy_impl through
-        # process_and_upload_package_creatives so adapters can read brand.domain
-        # from stored creative data.
-        expected_orchestration_only = {"media_buy_brand"}
-
-        buyer = set(inspect.signature(_sync_creatives_impl).parameters)
-        internal = set(inspect.signature(_sync_creatives_internal_impl).parameters)
-
-        assert internal - buyer == expected_orchestration_only, (
-            f"_sync_creatives_internal_impl adds {sorted(internal - buyer)} beyond the buyer-facing "
-            f"signature, expected {sorted(expected_orchestration_only)}. A new buyer-facing input "
-            f"belongs on _sync_creatives_impl (and every wrapper); a new orchestration-only input "
-            f"must be declared in this guard."
         )

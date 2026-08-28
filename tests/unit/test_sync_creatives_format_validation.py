@@ -11,6 +11,7 @@ import pytest
 from src.core.resolved_identity import ResolvedIdentity
 from src.core.tools.creatives import _sync_creatives_impl
 from tests.factories.creative_asset import build_assets, image_spec
+from tests.factories.format import make_static_format
 from tests.helpers.creative_test_helpers import (
     make_creative_dict,
 )
@@ -81,20 +82,11 @@ class TestSyncCreativesFormatValidation:
         return make_creative_dict(creative_id="creative_123")
 
     @pytest.fixture
-    def mock_format_spec(self):
-        """Mock format specification from creative agent."""
-        format_spec = Mock()
-        format_spec.format_id = "display_300x250_image"
-        format_spec.agent_url = "https://creative.adcontextprotocol.org"
-        format_spec.name = "Medium Rectangle - Image"
-        # Explicitly set to None so _find_format correctly identifies this as a
-        # static (non-generative) format. Without this, Mock() auto-creates a
-        # truthy Mock object for output_format_ids, causing the generative path
-        # to be taken and build_creative to be called unexpectedly.
-        format_spec.output_format_ids = None
-        return format_spec
+    def static_format_spec(self):
+        """A real static ``Format`` — see ``make_static_format`` for why not a Mock."""
+        return make_static_format(name="Medium Rectangle - Image")
 
-    def test_format_validation_success(self, identity, mock_tenant, valid_creative_dict, mock_format_spec):
+    def test_format_validation_success(self, identity, mock_tenant, valid_creative_dict, static_format_spec):
         """Test that format validation succeeds when format exists."""
         mock_uow, mock_creative_repo = _make_creative_uow()
 
@@ -109,10 +101,10 @@ class TestSyncCreativesFormatValidation:
 
             # Setup mock registry
             async def mock_list_all_formats(tenant_id=None):
-                return [mock_format_spec]
+                return [static_format_spec]
 
             async def mock_get_format(agent_url, format_id):
-                return mock_format_spec
+                return static_format_spec
 
             _configure_registry(
                 mock_registry_getter,
@@ -205,7 +197,7 @@ class TestSyncCreativesFormatValidation:
 
             assert exc_info.value.recovery == "transient"
 
-    def test_format_validation_with_string_format_id(self, identity, mock_tenant, mock_format_spec):
+    def test_format_validation_with_string_format_id(self, identity, mock_tenant, static_format_spec):
         """Test that string format_ids are rejected (FormatId object required)."""
         # Creative with string format_id (legacy format - no longer supported)
         creative_dict = {
@@ -226,10 +218,10 @@ class TestSyncCreativesFormatValidation:
 
             # Setup mock registry
             async def mock_list_all_formats(tenant_id=None):
-                return [mock_format_spec]
+                return [static_format_spec]
 
             async def mock_get_format(agent_url, format_id):
-                return mock_format_spec
+                return static_format_spec
 
             _configure_registry(
                 mock_registry_getter, list_all_formats=mock_list_all_formats, get_format=mock_get_format
@@ -245,7 +237,7 @@ class TestSyncCreativesFormatValidation:
             assert response.creatives[0].creative_id == "creative_456"
             # Error message will be from Pydantic validation, not our format validation
 
-    def test_format_validation_multiple_creatives(self, identity, mock_tenant, mock_format_spec):
+    def test_format_validation_multiple_creatives(self, identity, mock_tenant, static_format_spec):
         """Test that format validation works correctly with multiple creatives."""
         creatives = [
             make_creative_dict(creative_id="creative_1", name="Valid Creative"),
@@ -269,12 +261,12 @@ class TestSyncCreativesFormatValidation:
 
             # Setup mock registry
             async def mock_list_all_formats(tenant_id=None):
-                return [mock_format_spec]
+                return [static_format_spec]
 
             # Mock get_format to return format_spec for valid format, None for invalid
             async def mock_get_format(agent_url, format_id):
                 if format_id == "display_300x250_image":
-                    return mock_format_spec
+                    return static_format_spec
                 return None
 
             _configure_registry(
@@ -303,7 +295,7 @@ class TestSyncCreativesFormatValidation:
             assert response.creatives[2].creative_id == "creative_3"
             assert response.creatives[2].action == "created"
 
-    def test_format_validation_caching(self, identity, mock_tenant, valid_creative_dict, mock_format_spec):
+    def test_format_validation_caching(self, identity, mock_tenant, valid_creative_dict, static_format_spec):
         """Test that format validation uses in-memory cache (doesn't call agent twice for same format)."""
         # Create two creatives with same format
         creative1 = valid_creative_dict.copy()
@@ -325,10 +317,10 @@ class TestSyncCreativesFormatValidation:
 
             # Setup mock registry
             async def mock_list_all_formats(tenant_id=None):
-                return [mock_format_spec]
+                return [static_format_spec]
 
             async def mock_get_format(agent_url, format_id):
-                return mock_format_spec
+                return static_format_spec
 
             _configure_registry(
                 mock_registry_getter,

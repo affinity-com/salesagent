@@ -9,33 +9,77 @@ from src.core.creative_agent_registry import (
     _KNOWN_ASSET_TYPES,
     CreativeAgent,
     CreativeAgentRegistry,
+    GenerativeBuildResult,
 )
-from src.core.exceptions import AdCPAdapterError, AdCPAuthenticationError, AdCPServiceUnavailableError
+from src.core.exceptions import (
+    AdCPAdapterError,
+    AdCPAuthenticationError,
+    AdCPServiceUnavailableError,
+    AdCPValidationError,
+)
+from src.core.schemas import FormatId
+from tests.factories.creative_asset import build_assets, image_spec
 
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
 
 
-def _make_capture_client():
-    """Return (captured_requests, mock_adcp_client) for build_creative capture tests.
+def _make_agent_client(*, result: object = None, side_effect: BaseException | None = None, capture: list | None = None):
+    """Return a mock ``ADCPMultiAgentClient`` for the ``build_creative`` path.
 
-    Sets up a mock ADCPMultiAgentClient whose agent().build_creative() appends
-    each request to the returned list and returns {"status": "draft"}.
+    ONE double for the whole call chain the registry uses
+    (``_build_adcp_client(...)`` → ``.agent(name)`` → ``.build_creative(request)``).
+    Every test configures it through this helper, so a change to that chain — the
+    kind this PR just made — is a single edit here instead of eight hand-rolled
+    ``Mock`` / ``AsyncMock`` / ``agent()`` trios failing separately.
+
+    Args:
+        result: what ``build_creative`` returns (a model or a dict).
+        side_effect: raise this instead of returning.
+        capture: if given, every request is appended to it (and ``result`` is
+            returned).
     """
-    from adcp import BuildCreativeRequest
+    if capture is not None:
 
-    captured: list[BuildCreativeRequest] = []
+        async def _capture(request):
+            capture.append(request)
+            return result if result is not None else {"status": "draft"}
 
-    async def _capture(request):
-        captured.append(request)
-        return {"status": "draft"}
+        agent_client = Mock()
+        agent_client.build_creative = _capture
+    else:
+        agent_client = Mock()
+        agent_client.build_creative = AsyncMock(
+            return_value=result if result is not None else {"status": "draft"}, side_effect=side_effect
+        )
 
-    mock_agent_client = Mock()
-    mock_agent_client.build_creative = _capture
-    mock_adcp_client = Mock()
-    mock_adcp_client.agent = Mock(return_value=mock_agent_client)
-    return captured, mock_adcp_client
+    adcp_client = Mock()
+    adcp_client.agent = Mock(return_value=agent_client)
+    return adcp_client
+
+
+def _make_capture_client():
+    """``(captured_requests, mock_adcp_client)`` — the capture flavour of :func:`_make_agent_client`."""
+    captured: list = []
+    return captured, _make_agent_client(capture=captured)
+
+
+GENERATIVE_FORMAT = FormatId(agent_url="https://creative.example.com", id="display_300x250_generative")
+
+
+@pytest.fixture
+def dials_the_agent(monkeypatch):
+    """Turn OFF testing mode so build_creative actually dials the client.
+
+    ``ADCP_TESTING=true`` (set for the whole test session by ``tests/conftest.py``)
+    makes every registry method serve checked-in/derived data instead of making an
+    external call — which is the point in CI, and exactly what the tests below must
+    NOT exercise: they grade the request the registry BUILDS and the errors it
+    translates. Without this the assertions pass against a branch that never
+    constructs a ``BuildCreativeRequest``.
+    """
+    monkeypatch.setenv("ADCP_TESTING", "false")
 
 
 class TestCacheKeyAcceptsAnyUrl:
@@ -448,7 +492,7 @@ class TestBuildCreativeUsesADCPClient:
     - ADCPMultiAgentClient is used for the call
     - BuildCreativeRequest is constructed with target_format_id and idempotency_key
     - brand string is converted to BrandRef dict before the request
-    - Result is returned as a plain dict
+    - the response crosses the boundary as a typed GenerativeBuildResult
     """
 
     @pytest.mark.asyncio
@@ -464,47 +508,50 @@ class TestBuildCreativeUsesADCPClient:
         )
 
     @pytest.mark.asyncio
-    async def test_build_creative_uses_adcp_multi_agent_client(self):
-        """build_creative must use ADCPMultiAgentClient, not raw MCP client."""
-        registry = CreativeAgentRegistry()
+    async def test_build_creative_takes_domain_values_only(self):
+        """The signature carries domain values, not pre-built wire objects or dead inputs.
 
-        mock_result = Mock()
-        mock_result.model_dump = Mock(return_value={"status": "draft", "context_id": "ctx-1"})
+        ``creative_manifest`` is rendered by the registry from ``format_id`` +
+        ``assets`` (protocol framing belongs to this adapter), and the pre-3.1
+        ``promoted_offerings`` / ``context_id`` arguments are gone: neither has a
+        home in ``media-buy/build-creative-request.json @ 3.1.1``, and both were
+        accepted-and-ignored, which silently dropped buyer input (#2143).
+        """
+        import inspect
 
-        mock_agent_client = Mock()
-        mock_agent_client.build_creative = AsyncMock(return_value=mock_result)
+        params = set(inspect.signature(CreativeAgentRegistry.build_creative).parameters)
 
-        mock_adcp_client = Mock()
-        mock_adcp_client.agent = Mock(return_value=mock_agent_client)
-
-        with patch.object(registry, "_build_adcp_client", return_value=mock_adcp_client) as mock_build:
-            result = await registry.build_creative(
-                agent_url="https://creative.example.com",
-                format_id="display_300x250_generative",
-                message="Build a banner ad",
-            )
-
-        # _build_adcp_client must have been called with a list of CreativeAgent objects
-        from unittest.mock import ANY
-
-        mock_build.assert_called_once_with(ANY)
-        # build_creative on the agent client must have been called with a BuildCreativeRequest
-        mock_agent_client.build_creative.assert_called_once_with(ANY)
-        # Result must be a plain dict
-        assert isinstance(result, dict)
+        assert {"format_id", "message", "assets", "brand"} <= params
+        assert not params & {"creative_manifest", "promoted_offerings", "context_id"}, (
+            "build_creative must not accept wire objects or parameters its body never reads"
+        )
 
     @pytest.mark.asyncio
-    async def test_build_creative_passes_idempotency_key(self):
+    async def test_build_creative_uses_adcp_multi_agent_client(self, dials_the_agent):
+        """build_creative must use ADCPMultiAgentClient, not raw MCP client."""
+        from unittest.mock import ANY
+
+        registry = CreativeAgentRegistry()
+        adcp_client = _make_agent_client(result={"status": "draft", "context_id": "ctx-1"})
+
+        with patch.object(registry, "_build_adcp_client", return_value=adcp_client) as mock_build:
+            result = await registry.build_creative(format_id=GENERATIVE_FORMAT, message="Build a banner ad")
+
+        # _build_adcp_client must have been called with a list of CreativeAgent objects
+        mock_build.assert_called_once_with(ANY)
+        # build_creative on the agent client must have been called with a BuildCreativeRequest
+        adcp_client.agent.return_value.build_creative.assert_called_once_with(ANY)
+        assert result is not None
+        assert result.context_id == "ctx-1"
+
+    @pytest.mark.asyncio
+    async def test_build_creative_passes_idempotency_key(self, dials_the_agent):
         """build_creative must pass idempotency_key in the BuildCreativeRequest."""
         registry = CreativeAgentRegistry()
         captured_request, mock_adcp_client = _make_capture_client()
 
         with patch.object(registry, "_build_adcp_client", return_value=mock_adcp_client):
-            await registry.build_creative(
-                agent_url="https://creative.example.com",
-                format_id="display_300x250_generative",
-                message="Build a banner ad",
-            )
+            await registry.build_creative(format_id=GENERATIVE_FORMAT, message="Build a banner ad")
 
         assert len(captured_request) == 1
         req = captured_request[0]
@@ -514,7 +561,7 @@ class TestBuildCreativeUsesADCPClient:
         assert len(req.idempotency_key) > 0
 
     @pytest.mark.asyncio
-    async def test_build_creative_brand_str_converted_to_ref(self):
+    async def test_build_creative_brand_str_converted_to_ref(self, dials_the_agent):
         """build_creative converts brand string to typed BrandReference before the request."""
         from adcp.types import BrandReference
 
@@ -523,8 +570,7 @@ class TestBuildCreativeUsesADCPClient:
 
         with patch.object(registry, "_build_adcp_client", return_value=mock_adcp_client):
             await registry.build_creative(
-                agent_url="https://creative.example.com",
-                format_id="display_300x250_generative",
+                format_id=GENERATIVE_FORMAT,
                 message="Build a banner ad",
                 brand="https://advertiser.example.com/brand",
             )
@@ -537,130 +583,128 @@ class TestBuildCreativeUsesADCPClient:
         assert req.brand.domain == "advertiser.example.com"
 
     @pytest.mark.asyncio
-    async def test_build_creative_returns_dict(self):
-        """build_creative always returns a plain dict (not a Pydantic model)."""
-        registry = CreativeAgentRegistry()
+    async def test_request_identity_and_manifest_identity_are_one_value(self, dials_the_agent):
+        """``target_format_id`` and the manifest's ``format_id`` must serialize identically.
 
-        mock_result = Mock()
-        mock_result.model_dump = Mock(return_value={"status": "draft", "context_id": "ctx-abc"})
-
-        mock_agent_client = Mock()
-        mock_agent_client.build_creative = AsyncMock(return_value=mock_result)
-
-        mock_adcp_client = Mock()
-        mock_adcp_client.agent = Mock(return_value=mock_agent_client)
-
-        with patch.object(registry, "_build_adcp_client", return_value=mock_adcp_client):
-            result = await registry.build_creative(
-                agent_url="https://creative.example.com",
-                format_id="display_300x250_generative",
-                message="Build a banner ad",
-            )
-
-        assert isinstance(result, dict), "build_creative must return a plain dict for downstream processing"
-        assert result.get("status") == "draft"
-
-    @pytest.mark.asyncio
-    async def test_build_creative_translates_auth_error_to_typed_auth_error(self):
-        """build_creative must translate ADCPAuthenticationError to AdCPAuthenticationError.
-
-        Mirrors _fetch_formats_from_agent's translation via raise_mapped_adcp_error:
-        an SDK auth failure must not fall through to a blanket except that would
-        classify it as a generic retryable "transient" adapter outage — the auth
-        type, and with it the AUTH_REQUIRED wire code, must survive.
-
-        Recovery is ``correctable``, per the pinned AdCP error-code enum
-        (``AUTH_REQUIRED.recovery == "correctable"``) — see
-        ``AdCPAuthenticationError``'s docstring (#1417).
+        Both are rendered from the single ``format_id`` argument. A hand-built
+        canonical string next to a pydantic-serialized ``AnyUrl`` (which adds the
+        trailing slash for a path-less URL) put two spellings of one agent_url in
+        one request — the drift ``core/format-id.json``'s canonicalization MUST
+        exists to stop.
         """
-        from adcp.exceptions import ADCPAuthenticationError
-
         registry = CreativeAgentRegistry()
-
-        mock_agent_client = Mock()
-        mock_agent_client.build_creative = AsyncMock(
-            side_effect=ADCPAuthenticationError("invalid credentials", agent_id="agent-1")
-        )
-
-        mock_adcp_client = Mock()
-        mock_adcp_client.agent = Mock(return_value=mock_agent_client)
+        captured_request, mock_adcp_client = _make_capture_client()
 
         with patch.object(registry, "_build_adcp_client", return_value=mock_adcp_client):
-            with pytest.raises(AdCPAuthenticationError) as exc_info:
-                await registry.build_creative(
-                    agent_url="https://creative.example.com",
-                    format_id="display_300x250_generative",
-                    message="Build a banner ad",
-                )
+            await registry.build_creative(format_id=GENERATIVE_FORMAT, message="Build a banner ad")
 
-        assert exc_info.value.error_code == "AUTH_REQUIRED", (
-            "SDK auth failure must keep the AUTH_REQUIRED wire code, not collapse to a generic adapter error"
-        )
-        assert exc_info.value.recovery == "correctable", (
-            "Recovery must follow the pinned AdCP error-code enum (AUTH_REQUIRED → correctable)"
-        )
+        req = captured_request[0]
+        wire = req.model_dump(mode="json")
+        assert wire["creative_manifest"]["format_id"] == wire["target_format_id"]
 
     @pytest.mark.asyncio
-    async def test_build_creative_translates_timeout_error_to_transient(self):
-        """build_creative must translate ADCPTimeoutError to a transient AdCPServiceUnavailableError."""
-        from adcp.exceptions import ADCPTimeoutError
+    async def test_build_creative_returns_typed_result(self, dials_the_agent):
+        """build_creative returns a typed GenerativeBuildResult, not an untyped dict.
+
+        Callers read ``result.status`` / ``result.creative_output`` — a dict would
+        put them back on the stringly-typed ``.get()`` chains the typed-SDK
+        migration exists to remove.
+        """
+        registry = CreativeAgentRegistry()
+        # A REAL pydantic model, not a Mock with a model_dump attribute: the
+        # registry discriminates with isinstance(result, BaseModel) precisely so a
+        # duck-typed stand-in cannot stand in for an SDK response model.
+        sdk_result = GenerativeBuildResult(status="draft", context_id="ctx-abc")
+        adcp_client = _make_agent_client(result=sdk_result)
+
+        with patch.object(registry, "_build_adcp_client", return_value=adcp_client):
+            result = await registry.build_creative(format_id=GENERATIVE_FORMAT, message="Build a banner ad")
+
+        assert isinstance(result, GenerativeBuildResult)
+        assert result.status == "draft"
+        assert result.context_id == "ctx-abc"
+
+    @pytest.mark.asyncio
+    async def test_empty_response_is_none(self, dials_the_agent):
+        """An agent that returns no payload yields None — "nothing to store", not a default build."""
+        registry = CreativeAgentRegistry()
+        adcp_client = _make_agent_client(result={})
+
+        with patch.object(registry, "_build_adcp_client", return_value=adcp_client):
+            result = await registry.build_creative(format_id=GENERATIVE_FORMAT, message="Build a banner ad")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "sdk_error_name,sdk_kwargs,expected_type,expected_code,expected_recovery",
+        [
+            pytest.param(
+                "ADCPAuthenticationError",
+                {"agent_id": "agent-1"},
+                AdCPAuthenticationError,
+                "AUTH_REQUIRED",
+                "correctable",
+                id="auth",
+            ),
+            pytest.param(
+                "ADCPTimeoutError",
+                {"agent_id": "agent-1"},
+                AdCPServiceUnavailableError,
+                "SERVICE_UNAVAILABLE",
+                "transient",
+                id="timeout",
+            ),
+        ],
+    )
+    async def test_sdk_error_translated_to_internal_typed_error(
+        self, dials_the_agent, sdk_error_name, sdk_kwargs, expected_type, expected_code, expected_recovery
+    ):
+        """SDK exceptions become internal typed errors carrying their own code + recovery.
+
+        Mirrors ``_fetch_formats_from_agent``'s translation via
+        ``raise_mapped_adcp_error``: without it a blanket ``except`` would
+        classify every agent failure as a generic retryable outage. Recovery
+        follows the pinned enum (``enums/error-code.json @ 3.1.1``:
+        ``AUTH_REQUIRED`` → correctable, ``SERVICE_UNAVAILABLE`` → transient), so
+        the buyer is told to fix credentials rather than to retry them.
+        """
+        import adcp.exceptions
+
+        sdk_error = getattr(adcp.exceptions, sdk_error_name)("agent failed", **sdk_kwargs)
 
         registry = CreativeAgentRegistry()
+        adcp_client = _make_agent_client(side_effect=sdk_error)
 
-        mock_agent_client = Mock()
-        mock_agent_client.build_creative = AsyncMock(
-            side_effect=ADCPTimeoutError("request timed out", agent_id="agent-1")
-        )
+        with patch.object(registry, "_build_adcp_client", return_value=adcp_client):
+            with pytest.raises(expected_type) as exc_info:
+                await registry.build_creative(format_id=GENERATIVE_FORMAT, message="Build a banner ad")
 
-        mock_adcp_client = Mock()
-        mock_adcp_client.agent = Mock(return_value=mock_agent_client)
-
-        with patch.object(registry, "_build_adcp_client", return_value=mock_adcp_client):
-            with pytest.raises(AdCPServiceUnavailableError) as exc_info:
-                await registry.build_creative(
-                    agent_url="https://creative.example.com",
-                    format_id="display_300x250_generative",
-                    message="Build a banner ad",
-                )
-
-        assert exc_info.value.recovery == "transient", "A timeout may succeed on retry — recovery must be transient"
+        assert exc_info.value.error_code == expected_code
+        assert exc_info.value.recovery == expected_recovery
 
 
 class TestBuildCreativeManifestValidation:
-    """build_creative validates creative_manifest via model_validate (not model_construct).
+    """The registry renders the manifest via model_validate (not model_construct).
 
-    Covers the review's "untested strictness" gap: a realistic complete manifest
-    must pass through to the request, and a realistic partial/malformed manifest
-    (missing required asset fields) must raise rather than silently forward a
-    broken manifest to the creative agent.
+    Covers the review's "untested strictness" gap: realistic complete assets must
+    reach the request as a typed manifest, and realistic partial/malformed assets
+    must raise rather than silently forwarding a broken manifest to the agent.
     """
 
     @pytest.mark.asyncio
-    async def test_realistic_complete_manifest_forwarded(self):
-        """A complete, valid creative_manifest dict is forwarded as a typed CreativeManifest."""
+    async def test_realistic_complete_assets_forwarded_as_typed_manifest(self, dials_the_agent):
+        """Valid assets are rendered into a typed CreativeManifest on the request."""
         from adcp.types.generated_poc.core.creative_manifest import CreativeManifest
 
         registry = CreativeAgentRegistry()
         captured_request, mock_adcp_client = _make_capture_client()
 
-        manifest_dict = {
-            "format_id": {"id": "display_300x250", "agent_url": "https://creative.example.com"},
-            "assets": {
-                "main_image": {
-                    "asset_type": "image",
-                    "url": "https://example.com/img.png",
-                    "width": 300,
-                    "height": 250,
-                }
-            },
-        }
-
         with patch.object(registry, "_build_adcp_client", return_value=mock_adcp_client):
             await registry.build_creative(
-                agent_url="https://creative.example.com",
-                format_id="display_300x250",
+                format_id=FormatId(agent_url="https://creative.example.com", id="display_300x250"),
                 message="Build a banner ad",
-                creative_manifest=manifest_dict,
+                assets=build_assets(image_spec("main_image")),
             )
 
         assert len(captured_request) == 1
@@ -669,37 +713,32 @@ class TestBuildCreativeManifestValidation:
         assert isinstance(req.creative_manifest, CreativeManifest), (
             "creative_manifest must be a typed CreativeManifest (validated, not constructed unchecked)"
         )
+        assert req.creative_manifest.model_dump(mode="json")["assets"]["main_image"]["asset_type"] == "image"
 
     @pytest.mark.asyncio
-    async def test_realistic_partial_manifest_raises(self):
-        """A partial manifest (image asset missing required width/height) raises rather than
+    async def test_realistic_partial_assets_raise(self, dials_the_agent):
+        """A partial asset (image missing required width/height) raises rather than
         silently forwarding a broken manifest to the creative agent.
 
         model_validate() (not model_construct()) enforces the asset schema's field
         validators — this pins that strictness against silent regression to a lenient
-        construction path.
+        construction path. The rejection is TYPED (``VALIDATION_ERROR`` /
+        ``correctable``): the assets are buyer input, and a bare
+        ``pydantic.ValidationError`` is not an ``AdCPError``, so the sync path would
+        report it as "creative agent unreachable … retry recommended".
         """
-        from pydantic import ValidationError
 
         registry = CreativeAgentRegistry()
+        adcp_client = _make_agent_client()
 
-        mock_agent_client = Mock()
-        mock_agent_client.build_creative = AsyncMock(return_value={"status": "draft"})
-
-        mock_adcp_client = Mock()
-        mock_adcp_client.agent = Mock(return_value=mock_agent_client)
-
-        # Missing required width/height on the image asset.
-        partial_manifest = {
-            "format_id": {"id": "display_300x250", "agent_url": "https://creative.example.com"},
-            "assets": {"main_image": {"asset_type": "image", "url": "https://example.com/img.png"}},
-        }
-
-        with patch.object(registry, "_build_adcp_client", return_value=mock_adcp_client):
-            with pytest.raises(ValidationError):
+        with patch.object(registry, "_build_adcp_client", return_value=adcp_client):
+            with pytest.raises(AdCPValidationError) as exc_info:
                 await registry.build_creative(
-                    agent_url="https://creative.example.com",
-                    format_id="display_300x250",
+                    format_id=FormatId(agent_url="https://creative.example.com", id="display_300x250"),
                     message="Build a banner ad",
-                    creative_manifest=partial_manifest,
+                    # Missing required width/height on the image asset.
+                    assets={"main_image": {"asset_type": "image", "url": "https://example.com/img.png"}},
                 )
+
+        assert exc_info.value.error_code == "VALIDATION_ERROR"
+        assert exc_info.value.recovery == "correctable"

@@ -112,7 +112,7 @@ class TestCreativeLifecycleMCP:
         # Build a mock registry that satisfies _sync_creatives_impl's calls:
         #   registry.list_all_formats(tenant_id=...) → list of Format objects
         #   registry.preview_creative(...)            → None (no previews)
-        #   registry.build_creative(...)              → {} (unused for static formats)
+        #   registry.build_creative(...)              → None (unused for static formats)
         #   registry.get_format(agent_url, format_id) → Format | None
         mock_registry = MagicMock()
 
@@ -127,7 +127,9 @@ class TestCreativeLifecycleMCP:
         # preview_creative returns None → "no previews" branch; creatives that
         # supply a url (has_media_url=True) continue successfully without previews.
         mock_registry.preview_creative = AsyncMock(return_value=None)
-        mock_registry.build_creative = AsyncMock(return_value={})
+        # None is the real registry's "agent returned no payload" value
+        # (build_creative returns GenerativeBuildResult | None).
+        mock_registry.build_creative = AsyncMock(return_value=None)
 
         with (
             patch(

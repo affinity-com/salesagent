@@ -74,7 +74,14 @@ from src.core.schemas import (
     SyncCreativesResponse,
 )
 from tests.factories import PrincipalFactory
-from tests.factories.creative_asset import asset_spec, build_assets, image_spec, text_spec, video_spec
+from tests.factories.creative_asset import (
+    asset_spec,
+    build_assets,
+    image_spec,
+    make_build_result,
+    text_spec,
+    video_spec,
+)
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -1852,11 +1859,11 @@ class TestGenerativeCreativeBuild:
                 "format_id": "display_300x250_image",
                 "parameters": None,
             }
-            mock_run_async.return_value = {
-                "status": "draft",
-                "context_id": "ctx_1",
-                "creative_output": {"assets": {}, "output_format": {"url": "https://ai.example.com/output.png"}},
-            }
+            mock_run_async.return_value = make_build_result(
+                status="draft",
+                context_id="ctx_1",
+                creative_output={"assets": {}, "output_format": {"url": "https://ai.example.com/output.png"}},
+            )
 
             creative = _make_creative_asset(assets=build_assets(text_spec("message", content="Create a banner ad")))
             result, _ = _create_new_creative(
@@ -1904,11 +1911,11 @@ class TestGenerativeCreativeBuild:
                 "parameters": None,
             }
             # build_creative returns a result
-            mock_run_async.return_value = {
-                "status": "draft",
-                "context_id": "ctx_1",
-                "creative_output": {"assets": {}, "output_format": {"url": "https://ai.example.com/output.png"}},
-            }
+            mock_run_async.return_value = make_build_result(
+                status="draft",
+                context_id="ctx_1",
+                creative_output={"assets": {}, "output_format": {"url": "https://ai.example.com/output.png"}},
+            )
 
             creative = _make_creative_asset(
                 assets=build_assets(
@@ -1962,11 +1969,11 @@ class TestGenerativeCreativeBuild:
                 "format_id": "display_300x250_image",
                 "parameters": None,
             }
-            mock_run_async.return_value = {
-                "status": "draft",
-                "context_id": "ctx_1",
-                "creative_output": {"assets": {}, "output_format": {"url": "https://ai.example.com/output.png"}},
-            }
+            mock_run_async.return_value = make_build_result(
+                status="draft",
+                context_id="ctx_1",
+                creative_output={"assets": {}, "output_format": {"url": "https://ai.example.com/output.png"}},
+            )
 
             # Only 'brief' role, no 'message'
             creative = _make_creative_asset(assets=build_assets(text_spec("brief", content="Shoes ad brief")))
@@ -2012,11 +2019,11 @@ class TestGenerativeCreativeBuild:
                 "format_id": "display_300x250_image",
                 "parameters": None,
             }
-            mock_run_async.return_value = {
-                "status": "draft",
-                "context_id": "ctx_1",
-                "creative_output": {"assets": {}, "output_format": {"url": "https://ai.example.com/output.png"}},
-            }
+            mock_run_async.return_value = make_build_result(
+                status="draft",
+                context_id="ctx_1",
+                creative_output={"assets": {}, "output_format": {"url": "https://ai.example.com/output.png"}},
+            )
 
             # Only 'prompt' role -- no message or brief
             creative = _make_creative_asset(
@@ -2064,11 +2071,11 @@ class TestGenerativeCreativeBuild:
                 "format_id": "display_300x250_image",
                 "parameters": None,
             }
-            mock_run_async.return_value = {
-                "status": "draft",
-                "context_id": "ctx_1",
-                "creative_output": {"assets": {}, "output_format": {"url": "https://ai.example.com/output.png"}},
-            }
+            mock_run_async.return_value = make_build_result(
+                status="draft",
+                context_id="ctx_1",
+                creative_output={"assets": {}, "output_format": {"url": "https://ai.example.com/output.png"}},
+            )
 
             # No message/brief/prompt in assets; provide inputs instead
             creative = _make_creative_asset(
@@ -2119,11 +2126,11 @@ class TestGenerativeCreativeBuild:
                 "format_id": "display_300x250_image",
                 "parameters": None,
             }
-            mock_run_async.return_value = {
-                "status": "draft",
-                "context_id": "ctx_1",
-                "creative_output": {"assets": {}, "output_format": {"url": "https://ai.example.com/output.png"}},
-            }
+            mock_run_async.return_value = make_build_result(
+                status="draft",
+                context_id="ctx_1",
+                creative_output={"assets": {}, "output_format": {"url": "https://ai.example.com/output.png"}},
+            )
 
             # No message/brief/prompt in assets, no inputs -- falls back to name
             creative = _make_creative_asset(
@@ -2237,14 +2244,14 @@ class TestGenerativeCreativeBuild:
                 "parameters": None,
             }
             # build_creative returns generative assets
-            mock_run_async.return_value = {
-                "status": "final",
-                "context_id": "ctx_1",
-                "creative_output": {
+            mock_run_async.return_value = make_build_result(
+                status="final",
+                context_id="ctx_1",
+                creative_output={
                     "assets": {"generated_image": {"url": "https://ai.example.com/gen.png"}},
                     "output_format": {"url": "https://ai.example.com/output.png"},
                 },
-            }
+            )
 
             # User provides their own assets -- these should take priority
             user_assets = build_assets(image_spec("banner", url="https://user.example.com/my-ad.png"))
@@ -2293,9 +2300,7 @@ class TestGenerativeCreativeBuild:
         mock_format_obj, mock_config = self._setup_generative_mocks(mock_session, gemini_key=None)
 
         mock_registry = MagicMock()
-        mock_registry.build_creative = AsyncMock(
-            return_value={"status": "draft", "context_id": "ctx-1", "creative_output": {}}
-        )
+        mock_registry.build_creative = AsyncMock(return_value=make_build_result(context_id="ctx-1"))
 
         with (
             patch("src.core.tools.creatives._processing._extract_format_info") as mock_fmt,
@@ -2307,13 +2312,11 @@ class TestGenerativeCreativeBuild:
                 "format_id": "display_300x250_image",
                 "parameters": None,
             }
-            mock_run_async.return_value = {
-                "status": "draft",
-                "context_id": "ctx-1",
-                "creative_output": {
-                    "output_format": {"url": "https://generated.example.com/creative.html"},
-                },
-            }
+            mock_run_async.return_value = make_build_result(
+                status="draft",
+                context_id="ctx-1",
+                creative_output={"output_format": {"url": "https://generated.example.com/creative.html"}},
+            )
 
             creative = _make_creative_asset(
                 assets=build_assets(text_spec("message", content="Create a banner")),

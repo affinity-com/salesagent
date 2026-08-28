@@ -5,12 +5,16 @@ Covers:
 - validate_agent_url: media_buy_create wrapper
 - BLOCKED_HOSTNAMES: Docker-internal and cloud metadata hostname coverage
 - Flask endpoint-level wiring for signals agents add/edit handlers
+- url_for_log: the single log-rendering helper (no control characters, no credentials)
 """
 
 import os
+import re
 from unittest.mock import MagicMock, patch
 
-from src.core.security.url_validator import BLOCKED_HOSTNAMES, check_url_ssrf
+import pytest
+
+from src.core.security.url_validator import BLOCKED_HOSTNAMES, check_url_ssrf, url_for_log
 
 
 class TestCheckUrlSsrf:
@@ -467,3 +471,51 @@ class TestCreativeAgentEndpointSSRFWiring:
         body = response.get_json()
         assert body["success"] is False
         assert "not allowed" in body["error"].lower()
+
+
+class TestUrlForLogIsLogSafe:
+    """``url_for_log`` output can never forge a log record or leak credentials.
+
+    The two hazards the renderer exists to close, pinned as properties over the
+    hostile inputs rather than as one example each — it is the single helper every
+    SSRF/webhook log line renders its URL through, so a regression here is a
+    regression everywhere at once (CodeQL ``py/log-injection`` /
+    ``py/clear-text-logging-sensitive-data`` both point at these call sites).
+    """
+
+    # Everything outside printable ASCII: CR, LF, ESC, NUL, and the rest.
+    _NON_PRINTABLE = re.compile(r"[^\x21-\x7e]")
+
+    HOSTILE_URLS = [
+        pytest.param("https://evil.example.com/\r\nWARNING:root:forged entry", id="crlf-injection"),
+        pytest.param("https://evil.example.com/\x1b[31mred", id="ansi-escape"),
+        pytest.param("https://evil.example.com/\x00null", id="nul-byte"),
+        pytest.param("https://evil.example.com/a b\ttab", id="whitespace"),
+        pytest.param("https://user:s3cr3t@evil.example.com/p?token=abc123#frag", id="credentials-and-query"),
+        pytest.param("not a url at all", id="unparseable"),
+        pytest.param("", id="empty"),
+        pytest.param(None, id="none"),
+    ]
+
+    @pytest.mark.parametrize("hostile_url", HOSTILE_URLS)
+    def test_output_has_no_control_characters(self, hostile_url):
+        """No character outside printable ASCII survives — so no forged record."""
+        rendered = url_for_log(hostile_url)
+
+        assert not self._NON_PRINTABLE.search(rendered), (
+            f"url_for_log({hostile_url!r}) -> {rendered!r} carries a non-printable character; "
+            "a CR/LF/ESC reaching a log line lets the caller forge or corrupt records"
+        )
+
+    @pytest.mark.parametrize("hostile_url", HOSTILE_URLS)
+    def test_output_is_single_line(self, hostile_url):
+        """One input renders to exactly one log line."""
+        assert len(url_for_log(hostile_url).splitlines()) <= 1
+
+    def test_credentials_and_query_are_dropped(self):
+        """Userinfo and query string never reach the log — tokens hide in both."""
+        rendered = url_for_log("https://user:s3cr3t@evil.example.com/p?token=abc123#frag")
+
+        assert rendered == "https://evil.example.com/p"
+        for secret in ("s3cr3t", "user", "abc123", "frag"):
+            assert secret not in rendered
