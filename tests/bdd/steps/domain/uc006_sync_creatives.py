@@ -5140,9 +5140,53 @@ def when_buyer_updates_creative(ctx: dict) -> None:
 # ═══════════════════════════════════════════════════════════════════════
 
 
+def _stored_generative_build(ctx: dict) -> dict:
+    """The generative build result persisted on the synced creative.
+
+    The one piece of evidence that the generative path ran which is observable on
+    EVERY transport: only ``_apply_build_result`` writes this key, and it writes
+    it from what the creative agent returned.
+    """
+    env = ctx["env"]
+    session = env.get_session()
+    assert session is not None, "no DB session available to verify the generative build"
+
+    from sqlalchemy import select
+
+    from src.core.database.models import Creative as CreativeModel
+
+    creative_id = ctx["creatives"][-1]["creative_id"]
+    db_creative = session.scalars(
+        select(CreativeModel).filter_by(creative_id=creative_id, tenant_id=env._tenant_id)
+    ).first()
+    assert db_creative is not None, f"Creative {creative_id} not found in DB"
+    creative_data = db_creative.data or {}
+    assert "generative_build_result" in creative_data, (
+        f"Expected 'generative_build_result' in creative data, got keys: {list(creative_data.keys())}"
+    )
+    return creative_data
+
+
+def _assert_build_creative_dialled(ctx: dict) -> None:
+    """Assert the creative agent's generative build actually ran — transport-aware.
+
+    In-process the registry IS the harness mock, so the call itself is the sharpest
+    evidence. Over e2e the sync runs inside the live server: there is no local mock
+    to inspect (asserting on one there passes or fails for reasons unrelated to the
+    server), so the evidence is the build result the server persisted.
+    """
+    if is_e2e(ctx):
+        _stored_generative_build(ctx)
+        return
+    registry = ctx["env"].mock["registry"].return_value
+    assert registry.build_creative.called, (
+        "build_creative should have been called for generative format (output_format_ids present)"
+    )
+
+
 @then("the creative should be processed as generative")
 def then_processed_as_generative(ctx: dict) -> None:
-    """Assert the creative was classified as generative and build_creative was called.
+    """Assert the creative was classified as generative and the build was delegated.
 
     INV-1: format_obj.output_format_ids is truthy -> creative classified as generative.
     """
@@ -5156,12 +5200,7 @@ def then_processed_as_generative(ctx: dict) -> None:
     assert any(a in ("created", "updated") for a in actions), (
         f"Expected created/updated for generative processing, got {actions}"
     )
-    # Verify build_creative WAS invoked (generative detection)
-    env = ctx["env"]
-    registry = env.mock["registry"].return_value
-    assert registry.build_creative.called, (
-        "build_creative should have been called for generative format (output_format_ids present)"
-    )
+    _assert_build_creative_dialled(ctx)
 
 
 @then("the creative should have generated content")
@@ -5175,30 +5214,8 @@ def then_creative_has_generated_content(ctx: dict) -> None:
         pytest.xfail(f"SPEC-PRODUCTION GAP: expected generated content but got {type(error).__name__}: {error}")
 
     # Verify via DB: read the creative back and check for generative data
-    env = ctx["env"]
-    session = env.get_session()
-    if session is None:
-        pytest.xfail("SPEC-PRODUCTION GAP: no DB session available to verify generated content")
-
-    from sqlalchemy import select
-
-    from src.core.database.models import Creative as CreativeModel
-
-    creative_id = ctx["creatives"][-1]["creative_id"]
-    db_creative = session.scalars(
-        select(CreativeModel).filter_by(
-            creative_id=creative_id,
-            tenant_id=env._tenant_id,
-        )
-    ).first()
-    assert db_creative is not None, f"Creative {creative_id} not found in DB"
-    creative_data = db_creative.data or {}
-    assert "generative_build_result" in creative_data, (
-        f"Expected 'generative_build_result' in creative data, got keys: {list(creative_data.keys())}"
-    )
-    env = ctx["env"]
-    registry = env.mock["registry"].return_value
-    assert registry.build_creative.called, "build_creative should have been called to generate content"
+    _stored_generative_build(ctx)
+    _assert_build_creative_dialled(ctx)
 
 
 @then(parsers.parse('the generative build should use "{expected_prompt}" as the prompt'))

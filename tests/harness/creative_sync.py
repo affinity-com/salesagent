@@ -96,14 +96,22 @@ def _realize_generative_build(
     the same flag — so there is no per-scenario server registry to write, only an
     intent to validate.
 
-    - a generative format from the reference catalog -> no-op: the server already
-      serves it, and its own ``ADCP_TESTING`` build branch answers the call.
+    - a generative format from the reference catalog -> returns THAT catalog
+      entry's identity: the server resolves formats against the reference agent,
+      so a scenario payload carrying the in-process default agent_url
+      (``creative.test.example.com``, which only the registry mock serves) would
+      not resolve there — the sync would quietly take the no-agent path and
+      succeed with no generative build, which is what this realization exists to
+      prevent.
     - a format the catalog does not serve as generative -> unrealizable: name it
       and point at the fixture-refresh path.
+    - an explicit ``agent_url`` -> unrealizable unless it IS the catalog's agent:
+      the live server has no other registry to read.
     - a scenario-specific ``build_result`` -> unrealizable: the live server serves
       the result IT derives, so a canned response cannot be injected.
     """
     from src.core.format_cache import load_reference_formats
+    from src.core.schemas import canonical_agent_url
 
     if build_result is not None:
         raise E2EUnsupportedSetup(
@@ -111,16 +119,27 @@ def _realize_generative_build(
             "build result its own ADCP_TESTING branch derives. Assert on that result instead of pinning one."
         )
 
-    generative_ids = {fmt.format_id.id for fmt in load_reference_formats() if getattr(fmt, "output_format_ids", None)}
-    if format_id not in generative_ids:
+    generative = {
+        fmt.format_id.id: canonical_agent_url(fmt.format_id.agent_url)
+        for fmt in load_reference_formats()
+        if getattr(fmt, "output_format_ids", None)
+    }
+    if format_id not in generative:
         raise E2EUnsupportedSetup(
             f"{format_id!r} is not a generative format in the reference catalog "
-            f"(generative formats: {sorted(generative_ids)}). Register it with the creative agent "
+            f"(generative formats: {sorted(generative)}). Register it with the creative agent "
             "and refresh the fixture (`make creative-formats-refresh`)."
         )
 
+    catalog_agent_url = generative[format_id]
+    if agent_url is not None and canonical_agent_url(agent_url) != catalog_agent_url:
+        raise E2EUnsupportedSetup(
+            f"the live server resolves {format_id!r} against {catalog_agent_url} (the reference catalog); "
+            f"a format served from {agent_url} exists only in the in-process registry mock."
+        )
+
     env.mock["config"].return_value.gemini_api_key = gemini_api_key
-    return {"agent_url": agent_url or env.DEFAULT_AGENT_URL, "id": format_id}
+    return {"agent_url": catalog_agent_url, "id": format_id}
 
 
 class CreativeSyncEnv(IntegrationEnv):
