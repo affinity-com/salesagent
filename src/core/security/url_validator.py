@@ -6,8 +6,9 @@ property list resolution and webhook URL validation.
 
 import ipaddress
 import logging
+import re
 import socket
-from urllib.parse import ParseResult, quote, urlparse
+from urllib.parse import ParseResult, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -15,15 +16,31 @@ logger = logging.getLogger(__name__)
 UNPARSEABLE_URL_FOR_LOG = "<unparseable-url>"
 
 
+# Everything a rendered URL may keep in a log line. An ALLOWLIST, not a
+# denylist: the set is the RFC 3986 unreserved characters plus the few
+# delimiters that keep ``scheme://host/path`` readable, so anything else —
+# every control character, every byte that could forge or split a record — is
+# replaced rather than needing to be enumerated first.
+_LOG_UNSAFE_IN_URL = re.compile(r"[^A-Za-z0-9:/._~%-]")
+
+
 def url_for_log(url: str | None) -> str:
-    """Render a URL for a log line: ``scheme://host/path``, percent-encoded.
+    """Render a URL for a log line: ``scheme://host/path``, allowlist-filtered.
 
     Never logs a raw URL, guarding two hazards at once:
 
     - **Log forging** — an admin- or buyer-supplied URL is unvalidated request
-      data; percent-encoding removes every control character it could carry.
+      data. The rendered string is filtered through
+      :data:`_LOG_UNSAFE_IN_URL`, so no character outside the allowlist (CR, LF,
+      ESC, NUL, …) survives to the log line.
     - **Credential leakage** — userinfo and query string are dropped, so a token
       embedded in either never reaches the log.
+
+    The filter is a substitution rather than percent-encoding because the
+    guarantee should be legible both to a reader and to a scanner: an
+    unsafe byte is REMOVED here, not re-encoded into a form that has to be
+    reasoned about. ``TestUrlForLogIsLogSafe`` pins the guarantee as a property
+    over hostile inputs.
 
     Returns :data:`UNPARSEABLE_URL_FOR_LOG` when there is no usable scheme+host.
     """
@@ -32,7 +49,7 @@ def url_for_log(url: str | None) -> str:
     parsed = urlparse(str(url))
     if not (parsed.scheme and parsed.hostname):
         return UNPARSEABLE_URL_FOR_LOG
-    return quote(f"{parsed.scheme}://{parsed.hostname}{parsed.path or ''}", safe=":/._-~")
+    return _LOG_UNSAFE_IN_URL.sub("", f"{parsed.scheme}://{parsed.hostname}{parsed.path or ''}")
 
 
 # Blocked IP ranges (RFC 1918 private networks, loopback, link-local,

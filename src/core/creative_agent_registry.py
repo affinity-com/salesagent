@@ -359,7 +359,7 @@ PUBLIC_DEFAULT_AGENT_URL = "https://creative.adcontextprotocol.org"
 
 
 def _connection_agent_url(agent_url: str) -> str:
-    """Resolve the TRANSPORT url for an agent reference (salesagent-9qe2).
+    """Resolve the TRANSPORT url for an agent reference .
 
     When CREATIVE_AGENT_URL is set (test/CI stacks run a pinned container
     serving the standard catalog), references to the PUBLIC default agent
@@ -633,7 +633,7 @@ class CreativeAgentRegistry:
                 # expected schema ListCreativeFormatsResponse" with thousands of
                 # errors). Route to the raw-MCP path where per-format tolerant
                 # ingestion can salvage the compatible formats instead of
-                # discarding the entire catalog. (salesagent-w8yn)
+                # discarding the entire catalog.
                 schema_validation_failure = any(
                     marker in error_text.lower() for marker in _SCHEMA_VALIDATION_FAILURE_MARKERS
                 )
@@ -1079,7 +1079,7 @@ class CreativeAgentRegistry:
                     # The pinned reference agent's schema takes format_id as the
                     # federation-identity OBJECT {agent_url, id} — the live public
                     # host tolerated a bare string, which masked this mismatch
-                    # until connections were pinned in-network (salesagent-9qe2).
+                    # until connections were pinned in-network.
                     # The identity keeps the CANONICAL agent_url, not the
                     # connection alias, and is READ BACK OUT of the serialized
                     # manifest rather than rendered a second time: one request
@@ -1088,7 +1088,7 @@ class CreativeAgentRegistry:
                     # adds the trailing slash for a path-less URL) is exactly the
                     # drift core/format-id.json's canonicalization MUST exists to
                     # stop. The trailing-slash form is verified tolerated by the
-                    # pinned reference agent (probe 2026-07-13, salesagent-ehdq).
+                    # pinned reference agent (probe 2026-07-13).
                     "format_id": manifest_payload["format_id"],
                     "creative_manifest": manifest_payload,
                 },
