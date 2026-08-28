@@ -54,9 +54,16 @@ Usage::
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, PropertyMock
 
 from src.core.database.models import TMPProvider
+from src.core.schemas import (
+    CreateMediaBuyResult,
+    CreateMediaBuySuccess,
+    UpdateMediaBuyResult,
+    UpdateMediaBuySuccess,
+)
 
 # Sentinel distinguishing "caller didn't pass tenant" (auto-build one) from
 # "caller explicitly passed tenant=None" (simulate unknown tenant / 404 path).
@@ -350,3 +357,42 @@ def make_tmp_uow(providers: list[TMPProvider], tenant: MagicMock | None = _UNSET
     mock_uow.tenant_config = MagicMock()
     mock_uow.tenant_config.get_tenant.return_value = MagicMock() if tenant is _UNSET else tenant
     return mock_cm(mock_uow)
+
+
+#: Arbitrary confirmation stamp for the success doubles below. The suites that
+#: use them grade which union member's ``media_buy_id`` the TMP sync trigger
+#: reads, not what was persisted, so the value only has to exist.
+CONFIRMED_AT = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+def make_create_result(media_buy_id: str) -> CreateMediaBuyResult:
+    """A successful create envelope carrying *media_buy_id* on its inner response.
+
+    ``confirmed_at`` and ``revision`` are REQUIRED on ``CreateMediaBuySuccess``:
+    they lost their defaults so the persisted values must be read off the row
+    rather than minted by the response. Every double therefore has to state
+    them, which is why this lives here rather than once per suite — two suites
+    building the same five-line construction is exactly the duplication the
+    ratchet counts.
+    """
+    return CreateMediaBuyResult(
+        status="completed",
+        response=CreateMediaBuySuccess(
+            media_buy_id=media_buy_id,
+            packages=[],
+            confirmed_at=CONFIRMED_AT,
+            revision=1,
+        ),
+    )
+
+
+def make_update_result(media_buy_id: str) -> UpdateMediaBuyResult:
+    """A successful update envelope carrying *media_buy_id* on its inner response."""
+    return UpdateMediaBuyResult(
+        status="completed",
+        response=UpdateMediaBuySuccess(
+            media_buy_id=media_buy_id,
+            affected_packages=[],
+            revision=1,
+        ),
+    )

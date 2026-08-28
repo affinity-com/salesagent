@@ -1,7 +1,7 @@
 """Add tmp_providers table with auth fields for Trusted Match Protocol provider registrations
 
 Revision ID: 2fa4c97166ab
-Revises: 823974a5553e
+Revises: 9b2d4f6c1a37
 Create Date: 2026-05-21 09:31:00.000000
 
 Schema aligned with the pinned provider-registration schema — see
@@ -43,7 +43,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "2fa4c97166ab"
-down_revision: str | Sequence[str] | None = "823974a5553e"
+down_revision: str | Sequence[str] | None = "9b2d4f6c1a37"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

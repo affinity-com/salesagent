@@ -39,30 +39,13 @@ from src.core.schemas import Error
 from src.core.schemas._base import (
     CreateMediaBuyError,
     CreateMediaBuyResult,
-    CreateMediaBuySuccess,
     UpdateMediaBuyError,
     UpdateMediaBuyResult,
     UpdateMediaBuySubmitted,
-    UpdateMediaBuySuccess,
 )
 from src.services.tmp_provider_sync import _active_syncs, _extract_media_buy_id, fire_tmp_sync
 from tests.harness import make_identity
-
-
-def _create_result(media_buy_id: str) -> CreateMediaBuyResult:
-    """A successful create envelope carrying *media_buy_id* on its inner response."""
-    return CreateMediaBuyResult(
-        status="completed",
-        response=CreateMediaBuySuccess(media_buy_id=media_buy_id, packages=[]),
-    )
-
-
-def _update_result(media_buy_id: str) -> UpdateMediaBuyResult:
-    """A successful update envelope carrying *media_buy_id* on its inner response."""
-    return UpdateMediaBuyResult(
-        status="completed",
-        response=UpdateMediaBuySuccess(media_buy_id=media_buy_id, affected_packages=[]),
-    )
+from tests.unit._tmp_helpers import make_create_result, make_update_result
 
 
 class TestFiresTmpSyncDecorator:
@@ -139,7 +122,7 @@ class TestFiresTmpSyncDecorator:
 
         from src.services.tmp_provider_sync import fires_tmp_sync
 
-        result = _create_result("mb_decorated")
+        result = make_create_result("mb_decorated")
         identity = make_identity(tenant_id="tenant_1")
 
         @fires_tmp_sync
@@ -174,7 +157,7 @@ class TestFiresTmpSyncDecorator:
 
         from src.services.tmp_provider_sync import fires_tmp_sync
 
-        result = _create_result("mb_async")
+        result = make_create_result("mb_async")
 
         @fires_tmp_sync
         async def _impl(*, identity):
@@ -213,10 +196,10 @@ class TestExtractMediaBuyId:
     """
 
     def test_create_success_returns_the_inner_id(self):
-        assert _extract_media_buy_id(_create_result("mb_inner_001")) == "mb_inner_001"
+        assert _extract_media_buy_id(make_create_result("mb_inner_001")) == "mb_inner_001"
 
     def test_update_success_returns_the_inner_id(self):
-        assert _extract_media_buy_id(_update_result("mb_direct_001")) == "mb_direct_001"
+        assert _extract_media_buy_id(make_update_result("mb_direct_001")) == "mb_direct_001"
 
     def test_none_response_returns_none(self):
         assert _extract_media_buy_id(None) is None
@@ -275,7 +258,7 @@ class TestFireGuard:
 
     def test_no_sync_registered_when_identity_absent(self):
         before = self._registered_keys()
-        fire_tmp_sync(_create_result("mb_guard_1"), None)
+        fire_tmp_sync(make_create_result("mb_guard_1"), None)
         assert self._registered_keys() == before
         assert "mb_guard_1" not in self._registered_keys()
 
@@ -283,7 +266,7 @@ class TestFireGuard:
         """An identity with no tenant is logged, not silently dropped."""
         before = self._registered_keys()
         with caplog.at_level(logging.WARNING, logger="src.services.tmp_provider_sync"):
-            fire_tmp_sync(_create_result("mb_guard_2"), make_identity(tenant_id=None))
+            fire_tmp_sync(make_create_result("mb_guard_2"), make_identity(tenant_id=None))
 
         assert self._registered_keys() == before
         assert "mb_guard_2" in caplog.text

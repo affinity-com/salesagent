@@ -29,6 +29,7 @@ from src.services.tmp_provider_sync import (
 from tests.helpers.pinned_schema import validate_against_pinned_schema
 from tests.helpers.tmp_provider_http import make_mock_http_client
 from tests.unit._tmp_helpers import (
+    make_create_result,
     make_mock_package,
     make_mock_provider,
     make_sync_uow,
@@ -537,7 +538,7 @@ class TestSyncsForOneMediaBuyAreSerialized:
     def test_second_fire_waits_for_the_first(self):
         import threading
 
-        from src.core.schemas._base import CreateMediaBuyResult, CreateMediaBuySuccess
+        from src.core.schemas._base import CreateMediaBuyResult
         from src.services.tmp_provider_sync import fire_tmp_sync, join_active_syncs
         from tests.harness import make_identity
 
@@ -553,10 +554,7 @@ class TestSyncsForOneMediaBuyAreSerialized:
             order.append("end")
 
         def _result() -> CreateMediaBuyResult:
-            return CreateMediaBuyResult(
-                status="completed",
-                response=CreateMediaBuySuccess(media_buy_id="mb_serialize", packages=[]),
-            )
+            return make_create_result("mb_serialize")
 
         identity = make_identity(tenant_id="tenant_1")
         with patch("src.services.tmp_provider_sync.sync_packages_for_media_buy", _fake_sync):
