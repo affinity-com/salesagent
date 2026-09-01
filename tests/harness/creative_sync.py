@@ -57,6 +57,7 @@ from src.core.schemas import SyncCreativesResponse
 from tests.factories.format import make_generative_format
 from tests.harness._base import IntegrationEnv
 from tests.harness._realize import E2EUnsupportedSetup, realize_e2e
+from tests.harness.egress import EgressHatchMixin
 from tests.harness.transport import DeliverResult
 
 # Sink for the production error mapper's log calls in set_build_creative_sdk_error.
@@ -143,7 +144,7 @@ def _realize_generative_build(
     return {"agent_url": catalog_agent_url, "id": format_id}
 
 
-class CreativeSyncEnv(IntegrationEnv):
+class CreativeSyncEnv(EgressHatchMixin, IntegrationEnv):
     """Integration test environment for _sync_creatives_impl.
 
     Only mocks external services (creative agent registry, async runner,
@@ -275,21 +276,29 @@ class CreativeSyncEnv(IntegrationEnv):
         """
         self.set_build_creative_side_effect(error)
 
-    def set_build_creative_sdk_error(self, sdk_error: Any) -> None:
-        """Make ``build_creative`` fail exactly as the real registry does for an SDK error.
+    def set_build_creative_seam_error(self, *, status: int | None) -> None:
+        """Fail ``build_creative`` exactly as the GUARDED SEAM does for an HTTP *status*.
 
-        Routes *sdk_error* (an ``adcp.exceptions.ADCPError``) through the production
-        ``raise_mapped_adcp_error`` — the same call the real ``build_creative``
-        makes in its ``except ADCPError`` arm — so a test pins the whole
-        SDK-error → internal-typed-error → wire-recovery chain rather than only the
-        half after the mapping.
+        ``build_creative`` dials through ``call_operator_mcp_tool`` (#1802), which
+        owns the error mapping: a failure is re-raised by
+        ``raise_mapped_mcp_error`` as the AdCP error an OPERATOR-endpoint failure
+        warrants — a 401/403 from a creative agent is CONFIGURATION_ERROR /
+        terminal, because the buyer did not choose that address and cannot fix
+        its credentials; an unreachable agent is SERVICE_UNAVAILABLE / transient.
+
+        Routing the double through the PRODUCTION mapper (rather than raising a
+        hand-picked internal error) is what makes the case pin the whole chain —
+        seam failure → typed AdCP error → wire code — instead of only the half
+        after the mapping. The previous version routed through
+        ``raise_mapped_adcp_error``, the mapper the retired ``ADCPMultiAgentClient``
+        path used; it kept passing while pinning a translation production no
+        longer performs.
         """
-        from src.core.helpers.adapter_helpers import raise_mapped_adcp_error
+        from src.core.helpers.outbound_error_mapping import adcp_error_for_status
+        from src.core.security.outbound_http import OperatorEndpoint
 
-        def _raise_mapped(*_args: Any, **_kwargs: Any) -> None:
-            raise_mapped_adcp_error(sdk_error, agent_label="creative agent test", logger=_harness_logger)
-
-        self.set_build_creative_side_effect(_raise_mapped)
+        mapped = adcp_error_for_status(status, retry_after=None, provenance=OperatorEndpoint("the creative agent"))
+        self.set_build_creative_side_effect(mapped)
 
     def set_run_async_result(self, formats: list[Any]) -> None:
         """Configure run_async_in_sync_context to return *formats*.
@@ -336,31 +345,30 @@ class CreativeSyncEnv(IntegrationEnv):
         return self.call_impl(**kwargs)
 
     def deliver_a2a(self, **kwargs: Any) -> DeliverResult:
-        """Dispatch sync_creatives through the REAL A2A pipeline.
+        """Dispatch sync_creatives through the REAL A2A ``on_message_send`` pipeline.
 
         This used to call ``sync_creatives_raw`` directly, routing AROUND
         ``on_message_send``. The consequence (per tests/CLAUDE.md's own table:
         A2A ``wire_response`` is populated ONLY when the env routes through
         ``_run_a2a_handler``) was that the A2A leg produced no wire at all — so
         every storyboard Then on this transport had nothing transport-observable
-        to assert and fell back to reading an in-memory object. That is the
-        defect this module exists to remove, so the bypass is replaced rather than
-        worked around.
+        to assert and fell back to reading an in-memory object. Delegating to the
+        base ``_run_a2a_handler`` (message parse → skill routing →
+        ``_handle_sync_creatives_skill`` → ``_serialize_for_a2a`` →
+        Task/Artifact DataPart) makes the a2a seat grade the real handler,
+        per-item failures included, instead of standing in for it.
 
-        kwargs are JSON-normalized through ``build_rest_body`` — the SAME
-        normalizer the REST leg uses, not a second hand-rolled one — because
-        they now travel via ``create_a2a_message_with_skill`` -> ``_dict_to_value``
-        (protobuf), which cannot carry Pydantic models or enums the raw wrapper
-        accepted as live Python objects (account, push_notification_config,
-        validation_mode).
+        Parameters travel via ``create_a2a_message_with_skill`` ->
+        ``_dict_to_value`` (protobuf), which cannot carry a Pydantic model and
+        would turn one into a repr string instead of a document a buyer could
+        send. ``_run_a2a_handler`` normalizes every SKILL parameter itself, after
+        popping the kwargs it consumes (identity, req, the protocol push config)
+        — so kwargs pass through here untouched. Normalizing again in this env
+        would mean a second normalizer plus a list of names to exempt from it,
+        at a layer that does not know which kwargs the handler eats.
         """
-        self._commit_factory_data()
-        kwargs.setdefault("identity", self.identity)
         kwargs.setdefault("creatives", [])
-        identity = kwargs.pop("identity")
-        return self._run_a2a_handler(
-            "sync_creatives", SyncCreativesResponse, identity=identity, **self.build_rest_body(**kwargs)
-        )
+        return self._run_a2a_handler("sync_creatives", SyncCreativesResponse, **kwargs)
 
     def deliver_mcp(self, **kwargs: Any) -> DeliverResult:
         """Call sync_creatives via Client(mcp) — full pipeline dispatch.
@@ -370,39 +378,75 @@ class CreativeSyncEnv(IntegrationEnv):
         kwargs.setdefault("creatives", [])
         return self._run_mcp_client("sync_creatives", SyncCreativesResponse, **kwargs)
 
+    @classmethod
+    def _wire_value(cls, value: Any) -> Any:
+        """Convert a Pydantic model (or a list of them) to its wire dict form.
+
+        Anything else passes through unchanged. Conversion only: no key
+        filtering, no ``exclude_none`` — the REST seat's existing semantics.
+        """
+        if isinstance(value, list):
+            return [cls._wire_value(item) for item in value]
+        if hasattr(value, "model_dump"):
+            return value.model_dump(mode="json")
+        return value
+
     def build_rest_body(self, **kwargs: Any) -> dict[str, Any]:
         """Convert kwargs to SyncCreativesBody shape for REST POST."""
-        # The REST body expects 'creatives' as list[dict], matching SyncCreativesBody
+        # The REST body expects 'creatives' as list[dict], matching SyncCreativesBody.
+        # 'push_notification_config' and 'account' are declared by SyncCreativesBody and
+        # forwarded by the route to sync_creatives_raw — dropping either here would make
+        # any REST test of that behavior silently vacuous.
+        #
+        # 'idempotency_key' is schema-REQUIRED on sync_creatives (pinned_request_schema_fields
+        # reports it in the required set). It is carried by the acceptance seam rather than
+        # declared on SyncCreativesBody, so it must ride the REST body for the REST leg to
+        # grade idempotency at all — omitting it here would make every REST idempotency
+        # assertion vacuous.
         body: dict[str, Any] = {}
         if "creatives" in kwargs:
-            creatives = kwargs["creatives"]
-            # Convert Pydantic models to dicts if needed
-            body["creatives"] = [c.model_dump(mode="json") if hasattr(c, "model_dump") else c for c in creatives]
-        if "assignments" in kwargs and kwargs["assignments"] is not None:
-            body["assignments"] = kwargs["assignments"]
-        if "creative_ids" in kwargs and kwargs["creative_ids"] is not None:
-            body["creative_ids"] = kwargs["creative_ids"]
-        if "delete_missing" in kwargs:
-            body["delete_missing"] = kwargs["delete_missing"]
-        if "dry_run" in kwargs:
-            body["dry_run"] = kwargs["dry_run"]
-        if "validation_mode" in kwargs:
-            body["validation_mode"] = kwargs["validation_mode"]
-        if "account" in kwargs and kwargs["account"] is not None:
-            account = kwargs["account"]
-            body["account"] = account.model_dump(mode="json") if hasattr(account, "model_dump") else account
-        if "push_notification_config" in kwargs and kwargs["push_notification_config"] is not None:
-            pnc = kwargs["push_notification_config"]
-            body["push_notification_config"] = pnc.model_dump(mode="json") if hasattr(pnc, "model_dump") else pnc
-        if "idempotency_key" in kwargs and kwargs["idempotency_key"] is not None:
-            # Schema-REQUIRED on sync_creatives (pinned_request_schema_fields
-            # reports it in the required set). It is carried by the acceptance
-            # seam rather than declared on SyncCreativesBody, so it must ride the
-            # REST body for the REST leg to grade idempotency at all — omitting it
-            # here would make every REST idempotency assertion vacuous.
-            body["idempotency_key"] = kwargs["idempotency_key"]
+            body["creatives"] = self._wire_value(kwargs["creatives"])
+        for key in ("assignments", "creative_ids", "push_notification_config", "account", "idempotency_key"):
+            if kwargs.get(key) is not None:
+                body[key] = self._wire_value(kwargs[key])
+        for key in ("delete_missing", "dry_run", "validation_mode"):
+            if key in kwargs:
+                body[key] = self._wire_value(kwargs[key])
         return body
 
     def parse_rest_response(self, data: dict[str, Any]) -> SyncCreativesResponse:
         """Parse REST JSON into SyncCreativesResponse."""
         return SyncCreativesResponse(**data)
+
+
+class RealRegistryCreativeSyncEnv(CreativeSyncEnv):
+    """``CreativeSyncEnv`` with the creative-agent registry left UNPATCHED.
+
+    ``CreativeSyncEnv`` mocks ``get_creative_agent_registry`` so ordinary sync
+    tests never reach the network. This variant drops exactly that one patch and
+    changes nothing else, so a buyer-supplied ``format_id.agent_url`` travels the
+    real registry and is judged by the real egress seam — which is the point: a
+    refusal produced by a mock proves nothing about production.
+
+    Hermetic for the causes worth grading. A refused destination (cloud metadata,
+    a reserved literal, a non-https scheme) is refused BEFORE a connection is
+    opened, so no packet leaves and no DNS answer is needed. A scenario that
+    wants a SUCCESSFUL fetch wants plain ``CreativeSyncEnv`` — here the reference
+    agent would be dialled for real.
+
+    TRAP inherited from the same pattern in ``RealResolverProductEnv``:
+    ``self.mock["registry"]`` does not exist after ``__enter__``, so any helper
+    that programs the registry mock (``setup_generative_build``,
+    ``set_run_async_result``) will ``KeyError`` on this env.
+    """
+
+    EXTERNAL_PATCHES = {name: target for name, target in CreativeSyncEnv.EXTERNAL_PATCHES.items() if name != "registry"}
+
+    def _configure_mocks(self) -> None:
+        """Configure everything except the registry, which is real here."""
+        self.mock["run_async"].side_effect = lambda coro: []
+        self.mock["send_notifications"].return_value = None
+        self.mock["audit_log"].return_value = None
+        mock_config = MagicMock()
+        mock_config.gemini_api_key = None
+        self.mock["config"].return_value = mock_config

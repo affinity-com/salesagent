@@ -9,18 +9,20 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
 from adcp.types import BrandReference, CreativeAsset
-from adcp.types import Error as AdCPErrorDetail
 from pydantic import BaseModel
 
 from src.core.creative_agent_registry import GenerativeBuildResult
-from src.core.exceptions import AdCPError, RecoveryHint, to_wire_error_code
+from src.core.exceptions import AdCPError, to_wire_error_code, wire_advisory
+from src.core.format_resolver import find_format, is_agent_backed, is_generative
 from src.core.helpers import _extract_format_info, _validate_creative_assets
+from src.core.helpers.outbound_error_mapping import raise_mapped_outbound_error
 
 # Format/FormatId come from src.core.schemas, not adcp.types: the local models
 # subclass the library ones (Pattern #1), so annotating against the local types
 # keeps the extension point in play and lets callers pass extended instances.
 # Enforced by test_architecture_local_schema_imports.py.
 from src.core.schemas import CreativeStatusEnum, Format, FormatId, SyncCreativeResult, canonical_agent_url
+from src.core.security.outbound_http import OperatorEndpoint, OutboundError
 from src.core.validation_helpers import run_async_in_sync_context
 
 from ._assets import _build_creative_data, _extract_message_from_assets, _extract_url_from_assets
@@ -31,99 +33,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _get_format_agent_url(format_obj: Format) -> str | None:
-    """Extract the canonical agent_url from a format object.
-
-    Returns the canonicalized agent_url string per AdCP URL canonicalization
-    (lowercased host, default ports stripped, trailing slash stripped — see
-    ``schemas.canonical_agent_url``), or ``None`` if it cannot be determined.
-
-    Handles two format shapes:
-    - Structured: ``format_obj.format_id`` is a :class:`~src.core.schemas.FormatId`
-      with ``.agent_url`` (the canonical AdCP shape from the SDK ``Format``).
-    - Legacy: ``format_obj.format_id`` is a bare string id and ``agent_url`` is a
-      top-level attribute (older stored formats and adapter-provided formats).
-    """
-    # Try structured shape first (SDK Format objects: format_id.agent_url)
-    fmt_format_id = getattr(format_obj, "format_id", None)
-    if fmt_format_id is not None and not isinstance(fmt_format_id, str):
-        agent_url = getattr(fmt_format_id, "agent_url", None)
-        if agent_url is not None:
-            return canonical_agent_url(agent_url)
-    # Fall back to legacy shape (top-level agent_url attribute)
-    agent_url = getattr(format_obj, "agent_url", None)
-    if agent_url is not None:
-        return canonical_agent_url(agent_url)
-    return None
-
-
-def _get_format_id_value(format_obj: Format) -> str | None:
-    """Extract the bare format id from a format object, handling both shapes.
-
-    Counterpart to :func:`_get_format_agent_url` for the ``id`` half of the
-    composite key: structured ``format_obj.format_id.id``, or the legacy shape
-    where ``format_obj.format_id`` is already the bare string id.
-    """
-    fmt_format_id = getattr(format_obj, "format_id", None)
-    if isinstance(fmt_format_id, str):
-        return fmt_format_id
-    if fmt_format_id is None:
-        return None
-    fmt_id = getattr(fmt_format_id, "id", None)
-    return cast(str | None, fmt_id)
-
-
-def _find_format(all_formats: list[Format], creative_format: FormatId) -> Format | None:
-    """Find a format by canonical composite (agent_url, id) key.
-
-    Canonicalization of both sides is delegated to :func:`_get_format_agent_url`
-    (and the id half to :func:`_get_format_id_value`) so the structured-vs-legacy
-    discrimination and the canonical form live in exactly one place — the match
-    path cannot drift from the extract path used to build the agent request.
-
-    Canonicalization is a spec MUST (``core/format-id.json`` /
-    ``reference/url-canonicalization.mdx``): lowercased host, default ports
-    stripped, trailing slash stripped (see ``schemas.canonical_agent_url`` /
-    ``format_id_identity``, the same canonical form used for federation identity
-    and the format cache key). Unlike ``normalize_agent_url`` (used elsewhere for
-    lenient endpoint-suffix matching), this does NOT strip ``/mcp``/``/a2a``
-    transport suffixes — canonicalization must preserve the path, so a reference
-    carrying a transport suffix is a genuinely different agent_url and correctly
-    fails to match.
-    """
-    target_agent = canonical_agent_url(creative_format.agent_url)
-    target_id = creative_format.id
-    for fmt in all_formats:
-        fmt_agent = _get_format_agent_url(fmt)
-        if fmt_agent is None:
-            continue
-        if fmt_agent == target_agent and _get_format_id_value(fmt) == target_id:
-            return fmt
-    return None
-
-
 def _resolve_agent_format(all_formats: list[Format], creative_format: FormatId) -> tuple[Format, FormatId] | None:
     """Resolve a creative's format reference to ``(format_obj, agent identity)``.
 
     One home for the resolve step both the create and the update path run before
     dialling a creative agent (they previously carried byte-identical copies).
+    The matching itself is ``format_resolver.find_format`` — the ONE answer to
+    "same format?", which compares values rather than Python classes.
 
-    Returns ``None`` when the reference does not resolve to a format with a
-    usable agent_url — the caller then skips agent validation entirely, since
-    there is no agent to ask.
+    Returns ``None`` when the reference does not resolve to an agent-backed
+    format: the caller then skips agent validation entirely, since there is no
+    agent to ask.
 
     The returned :class:`FormatId` is the canonical federation identity the agent
     calls are addressed with: one value, so the request cannot carry two
     spellings of the same agent_url (the registry renders every wire object from
     it — see ``creative_agent_registry._render_creative_manifest``).
     """
-    format_obj = _find_format(all_formats, creative_format)
-    if format_obj is None:
+    format_obj = find_format(creative_format, all_formats)
+    if format_obj is None or not is_agent_backed(format_obj):
         return None
-    agent_url = _get_format_agent_url(format_obj)
-    if not agent_url:
-        return None
-    return format_obj, FormatId(agent_url=agent_url, id=creative_format.id)
+    return format_obj, FormatId(agent_url=canonical_agent_url(format_obj.agent_url), id=creative_format.id)
 
 
 def _generation_assets(creative: CreativeAsset) -> dict[str, Any]:
@@ -313,32 +243,29 @@ def _preview_via_agent(
 
 
 def _failed_sync_result(
-    creative_id: str, error_msg: str, *, recovery: str | None = None, code: str = "SERVICE_UNAVAILABLE"
+    creative_id: str,
+    error_msg: str,
+    *,
+    code: str = "SERVICE_UNAVAILABLE",
+    field: str | None = None,
 ) -> SyncCreativeResult:
     """Build a SyncCreativeResult for a failed creative sync operation.
 
-    ``recovery`` distinguishes a transient failure (creative agent down — a retry
-    may help) from a terminal one (server misconfiguration — retrying cannot fix
-    it). ``code`` and ``recovery`` must agree: every caller that knows the
-    condition passes the condition-specific code, so the pinned classification
-    of the code (``enums/error-code.json``) matches the ``recovery`` hint beside
-    it — ``CREATIVE_NOT_FOUND`` for an assignment referencing an unknown
-    creative_id (matching the strict-mode ``AdCPCreativeNotFoundError`` raise
-    since 287c93099), ``VALIDATION_ERROR`` for other correctable causes,
-    ``CONFIGURATION_ERROR``/``AUTH_REQUIRED`` for a typed agent failure (see
-    :func:`_failed_from_agent_error`, which derives both from the exception).
-    The ``SERVICE_UNAVAILABLE`` default is the genuinely-unknown-failure code,
-    whose pinned classification (``transient``) matches the default recovery of
-    that same fallback path.
+    The CODE is the choice; the recovery follows from it. ``wire_advisory``
+    derives the buyer-facing retry classification from the pinned enumMetadata,
+    so a call site says what happened and the retry signal follows. Pass the
+    condition-specific code: ``CONFIGURATION_ERROR`` for a seller-side
+    misconfiguration (pinned terminal — the buyer must not retry),
+    ``CREATIVE_NOT_FOUND`` for an assignment referencing an unknown creative_id
+    (matching the strict-mode ``AdCPCreativeNotFoundError`` raise since
+    287c93099), ``VALIDATION_ERROR`` for other buyer-correctable causes. The
+    default ``SERVICE_UNAVAILABLE`` (pinned transient) covers a creative agent
+    that is simply down.
     """
     return SyncCreativeResult(
         creative_id=creative_id,
         action="failed",
-        errors=[
-            AdCPErrorDetail(  # structural-guard: advisory per-creative result in SyncCreativeResult.errors[]
-                code=code, message=error_msg, recovery=recovery
-            )
-        ],
+        errors=[wire_advisory(code, error_msg, field=field)],
         review_feedback=None,
         assigned_to=None,
         assignment_errors=None,
@@ -350,29 +277,30 @@ def _failed_from_agent_error(
 ) -> tuple[SyncCreativeResult, bool]:
     """Classify a creative-agent failure into a failed ``(result, needs_approval)``.
 
-    Single home for the recovery/code ladder shared by the update and create
-    paths (``_update_existing_creative`` / ``_create_new_creative``), which
-    previously each carried their own byte-identical copy:
+    Single home for the ladder shared by the update and create paths
+    (``_update_existing_creative`` / ``_create_new_creative``), which previously
+    each carried their own byte-identical copy of it:
 
-    - any :class:`AdCPError` → the error's OWN ``error_code`` and ``recovery``.
-      The exception class owns both (``exceptions.py``: each typed subclass
-      declares ``_default_error_code``/``_default_recovery``, and a raise site
-      may override either), so this function must not restate a class's
-      classification — e.g. ``AdCPConfigurationError`` is already ``terminal``,
-      and a hardcoded arm here would discard a ``recovery=`` override.
-      ``build_creative`` maps the SDK's ``ADCPError`` through
-      ``raise_mapped_adcp_error``, so rejected agent credentials surface as
-      ``AUTH_REQUIRED``/``correctable`` rather than flattening to transient.
-      The code goes through :func:`to_wire_error_code` so an internal-only code
-      (e.g. ``CONFIGURATION_ERROR``) collapses to ``SERVICE_UNAVAILABLE``
-      instead of leaking verbatim in an advisory.
-    - anything else → ``SERVICE_UNAVAILABLE``/``transient``: a genuinely unknown
-      failure (network error, agent down, a bare ``pydantic.ValidationError``
-      from manifest validation) is the spec-endorsed fallback.
+    - :class:`OutboundError` → DELEGATED to ``raise_mapped_outbound_error``. The
+      egress seam already classified the refusal (and knows the field it came
+      from); re-describing it here would launder a correctable, buyer-fixable
+      address error into the generic "retry recommended" message below. The
+      mapper always raises, and the mapped ``AdCPError`` propagates to
+      ``_sync.py``'s per-creative handler, which forwards its own code onto the
+      per-item result.
+    - any other :class:`AdCPError` → the error's OWN ``error_code``. The
+      exception class owns its classification (``exceptions.py``: each typed
+      subclass declares ``_default_error_code``), so this function must not
+      restate it — e.g. ``AdCPConfigurationError`` already carries
+      ``CONFIGURATION_ERROR``, and a hardcoded arm here would discard a raise
+      site's override. The code goes through :func:`to_wire_error_code` so an
+      internal-only code cannot leak into an advisory.
+    - anything else → ``SERVICE_UNAVAILABLE``: a genuinely unknown failure
+      (network error, agent down) is the spec-endorsed fallback.
 
-    Code and recovery must stay consistent: shipping the default
-    ``SERVICE_UNAVAILABLE`` (whose pinned classification is ``transient``)
-    alongside ``recovery="correctable"`` tells the buyer two different things.
+    In every arm the recovery is DERIVED from the code by ``wire_advisory`` —
+    the pair can no longer disagree, which is what let a ``correctable`` hint
+    ride out beside a ``transient`` code.
 
     Args:
         creative_id: Creative the failure applies to (reported on the result).
@@ -383,14 +311,13 @@ def _failed_from_agent_error(
         ``(failed SyncCreativeResult, needs_approval=False)`` — the tuple shape
         both callers return.
     """
-    recovery: RecoveryHint
-    code: str
+    if isinstance(error, OutboundError):
+        raise_mapped_outbound_error(error, provenance=OperatorEndpoint("the creative agent"), logger=logger)
+
     if isinstance(error, AdCPError):
-        recovery = error.recovery
         code = to_wire_error_code(error.error_code)
         error_msg = str(error)
     else:
-        recovery = "transient"
         code = "SERVICE_UNAVAILABLE"
         error_msg = (
             f"Creative agent unreachable or validation error: {str(error)}. "
@@ -399,7 +326,7 @@ def _failed_from_agent_error(
     logger.error(
         "[sync_creatives] %s - rejecting %s of creative %s", error_msg, action_label, creative_id, exc_info=True
     )
-    return (_failed_sync_result(creative_id, error_msg, recovery=recovery, code=code), False)
+    return (_failed_sync_result(creative_id, error_msg, code=code), False)
 
 
 def _update_existing_creative(
@@ -544,11 +471,13 @@ def _update_existing_creative(
 
             if resolved is not None:
                 format_obj, agent_format = resolved
-                # A format with output_format_ids is generative: the agent BUILDS the
-                # creative rather than previewing one the buyer supplied.
-                is_generative = bool(getattr(format_obj, "output_format_ids", None))
+                # A generative format is BUILT by the agent rather than previewed
+                # from what the buyer supplied. ``is_generative`` is
+                # format_resolver's declared-field read — not a getattr probe
+                # against a field the model actually declares.
+                generative = is_generative(format_obj)
 
-                if is_generative:
+                if generative:
                     # Refinement: only rebuild when the buyer sent new instructions.
                     message = _extract_message_from_assets(creative)
                     if message:
@@ -692,11 +621,13 @@ def _create_new_creative(
 
             if resolved is not None:
                 format_obj, agent_format = resolved
-                # A format with output_format_ids is generative: the agent BUILDS the
-                # creative rather than previewing one the buyer supplied.
-                is_generative = bool(getattr(format_obj, "output_format_ids", None))
+                # A generative format is BUILT by the agent rather than previewed
+                # from what the buyer supplied. ``is_generative`` is
+                # format_resolver's declared-field read — not a getattr probe
+                # against a field the model actually declares.
+                generative = is_generative(format_obj)
 
-                if is_generative:
+                if generative:
                     message = _extract_message_from_assets(creative)
                     if not message:
                         message = f"Create a creative for: {creative.name}"

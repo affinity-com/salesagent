@@ -30,6 +30,7 @@ from tests.helpers.creative_test_helpers import (
 from tests.helpers.creative_test_helpers import (
     sync_patches as _sync_patches,
 )
+from tests.helpers.egress_hatches import UNDIALLED_PUBLIC_HTTPS_ORIGIN
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -63,7 +64,15 @@ def _make_creative_uow():
 
 
 class TestSyncPushNotificationConfig:
-    """Lines 117-121: push_notification_config dict and model forms."""
+    """Lines 117-121: push_notification_config dict and model forms.
+
+    The URL is an https public-unicast IP literal: sync_creatives now runs the
+    seam's ingest verdict on it (src/core/webhook_validator.py, reject_unsafe_webhook_registration_url), and an IP
+    literal passes under every hatch posture without resolving DNS — a
+    hostname here would make a unit test do live DNS and NXDOMAIN-refuse.
+    The refusal path itself is graded by
+    tests/integration/test_webhook_url_ingest_refusal.py.
+    """
 
     def test_push_notification_config_dict_form(self, identity, static_format_spec):
         """Line 117-118: dict push_notification_config extracts URL."""
@@ -73,7 +82,7 @@ class TestSyncPushNotificationConfig:
             response = _sync_creatives_impl(
                 creatives=[_make_creative_dict()],
                 identity=identity,
-                push_notification_config={"url": "https://hook.example.com"},
+                push_notification_config={"url": f"{UNDIALLED_PUBLIC_HTTPS_ORIGIN}/hook"},
             )
         assert response.creatives[0].action == "created"
 
@@ -85,7 +94,7 @@ class TestSyncPushNotificationConfig:
         from src.core.tools.creatives import _sync_creatives_impl
 
         config = PushNotificationConfig(
-            url="https://hook.example.com",
+            url=f"{UNDIALLED_PUBLIC_HTTPS_ORIGIN}/hook",
             authentication=Authentication(credentials="a" * 32, schemes=[AuthenticationScheme.Bearer]),
         )
         with _sync_patches()(static_format_spec) as (mock_creative_repo, _):
@@ -593,10 +602,14 @@ class TestValidationEdgeCases:
             variants=[],
         )
 
-        async def mock_get_format(agent_url, format_id):
+        async def mock_get_format(agent_url, format_id, **_kwargs):
             return static_format_spec
 
+        async def mock_preview_creative(*_args, **_kwargs):
+            return {"preview_url": "https://creative.example/preview/c1"}
+
         mock_registry = Mock()
+        mock_registry.preview_creative = mock_preview_creative
         mock_registry.get_format = mock_get_format
 
         result = _validate_creative_input(creative, mock_registry, "p1")

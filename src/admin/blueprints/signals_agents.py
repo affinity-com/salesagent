@@ -6,8 +6,8 @@ from flask import Blueprint, flash, jsonify, redirect, render_template, request,
 from sqlalchemy import select
 
 from src.admin.utils import require_tenant_access
-from src.admin.utils.agent_url_guard import reject_if_unsafe_agent_url
 from src.admin.utils.audit_decorator import log_admin_action
+from src.admin.utils.url_policy import json_error_if_url_blocked, redirect_if_url_blocked
 from src.core.database.database_session import get_db_session
 from src.core.database.models import SignalsAgent, Tenant
 
@@ -106,15 +106,14 @@ def add_signals_agent(tenant_id):
                 flash("Agent URL is required", "error")
                 return redirect(url_for("signals_agents.add_signals_agent", tenant_id=tenant_id))
 
-            rejection = reject_if_unsafe_agent_url(
+            # The agent URL is stored now and fetched later, so egress policy is
+            # applied at ingest — see src.admin.utils.url_policy.
+            if blocked := redirect_if_url_blocked(
                 agent_url,
-                agent_kind="Signals agent",
-                action="add",
-                redirect_endpoint="signals_agents.add_signals_agent",
-                tenant_id=tenant_id,
-            )
-            if rejection is not None:
-                return rejection
+                "Agent URL",
+                url_for("signals_agents.add_signals_agent", tenant_id=tenant_id),
+            ):
+                return blocked
 
             if not name:
                 flash("Agent name is required", "error")
@@ -212,16 +211,14 @@ def edit_signals_agent(tenant_id, agent_id):
                 return redirect(url_for("signals_agents.edit_signals_agent", tenant_id=tenant_id, agent_id=agent_id))
 
             # Validate the newly submitted URL — agent.agent_url is the form value set above.
-            rejection = reject_if_unsafe_agent_url(
+            # Returning here leaves the assignment uncommitted: get_db_session() closes
+            # without committing, so the rejected URL never reaches the row.
+            if blocked := redirect_if_url_blocked(
                 agent.agent_url,
-                agent_kind="Signals agent",
-                action="edit",
-                redirect_endpoint="signals_agents.edit_signals_agent",
-                tenant_id=tenant_id,
-                agent_id=agent_id,
-            )
-            if rejection is not None:
-                return rejection
+                "Agent URL",
+                url_for("signals_agents.edit_signals_agent", tenant_id=tenant_id, agent_id=agent_id),
+            ):
+                return blocked
 
             if not agent.name:
                 flash("Agent name is required", "error")
@@ -279,37 +276,33 @@ def test_signals_agent(tenant_id, agent_id):
 
             registry = SignalsAgentRegistry()
 
-            # Build agent config
-            auth = None
-            if agent.auth_type and agent.auth_credentials:
-                auth = {
-                    "type": agent.auth_type,
-                    "credentials": agent.auth_credentials,
-                }
-
-            # Validate URL before making outbound request (defence-in-depth: stored URLs
-            # may pre-date the add/edit SSRF checks)
-            rejection = reject_if_unsafe_agent_url(
-                agent.agent_url,
-                agent_kind="Signals agent",
-                action="test-connection",
-                redirect_endpoint="signals_agents.list_signals_agents",
-                as_json=True,
-                tenant_id=tenant_id,
-            )
-            if rejection is not None:
-                return rejection
+            # Re-validate the stored URL at send time: a row written while the
+            # egress-policy escape hatches were open must not become an outbound
+            # request once they are closed. This is NOT the validate-then-dial
+            # TOCTOU the epic removes — the underlying dial is guarded regardless
+            # (call_mcp_tool's own validate_url) — it exists because policy
+            # can change between ingest and test, and this route's obligation is
+            # "ask again, using CURRENT policy" (tests/integration/test_admin_ingest_url_policy.py).
+            if blocked := json_error_if_url_blocked(agent.agent_url, "Agent URL", success=False):
+                return blocked
 
             # Test connection
             # Use asyncio.run() instead of new_event_loop() for better compatibility with adcp library
-            result = asyncio.run(registry.test_connection(agent.agent_url, auth=auth, auth_header=agent.auth_header))
+            # The registry owns the row -> dial-config mapping, so the probe uses
+            # the stored timeout rather than a hard-coded one and dials exactly as
+            # production does.
+            result = asyncio.run(registry.probe_agent(agent))
 
-            if result.get("success"):
+            # The JSON keys are the template's contract (templates/signals_agents.html
+            # reads data.signal_count / data.message / data.error), so they stay put.
+            # What changed is that they are now projected from a typed result instead
+            # of read out of a dict with a default standing in for a missing key.
+            if result.ok:
                 return jsonify(
                     {
                         "success": True,
-                        "message": result.get("message", "Successfully connected"),
-                        "signal_count": result.get("signal_count", 0),
+                        "message": result.message,
+                        "signal_count": result.count,
                     }
                 )
             else:
@@ -317,7 +310,9 @@ def test_signals_agent(tenant_id, agent_id):
                     jsonify(
                         {
                             "success": False,
-                            "error": result.get("error", "Connection failed"),
+                            # ProbeResult.message is a required field, not an AdCP
+                            # response attribute -- the hook regex cannot tell.
+                            "error": result.message,  # noqa: response-attribute
                         }
                     ),
                     400,

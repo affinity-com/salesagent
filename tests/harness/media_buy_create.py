@@ -22,6 +22,7 @@ from src.core.schemas._base import (
     CreateMediaBuySuccess,
 )
 from tests.harness._base import IntegrationEnv
+from tests.harness.egress import EgressHatchMixin
 from tests.harness.transport import DeliverResult
 
 # Sentinel for missing-key tests: pass idempotency_key=OMIT_IDEMPOTENCY_KEY to send a
@@ -67,11 +68,14 @@ def _restore_creative_ids(req: CreateMediaBuyRequest, flat: dict[str, Any]) -> N
             flat_pkgs[i]["creative_ids"] = cids
 
 
-class MediaBuyCreateEnv(IntegrationEnv):
+class MediaBuyCreateEnv(EgressHatchMixin, IntegrationEnv):
     """Integration test environment for _create_media_buy_impl.
 
     Mocks external services (adapter, audit, slack, context manager).
-    Everything else is real: DB, repositories, validation, schema processing.
+    Everything else is real: DB, repositories, validation, schema processing —
+    including the egress seam's ingest verdict on webhook URLs, which is why
+    the env carries ``set_egress_hatches`` (the @egress ingest-twin scenarios
+    pin the hatch posture the refusal is graded under).
     """
 
     EXTERNAL_PATCHES = {
@@ -261,13 +265,16 @@ class MediaBuyCreateEnv(IntegrationEnv):
         unchanged — so the pipeline continues past the upload and any later
         failure still surfaces instead of being swallowed by the caller.
 
-        Registered on the env's patcher stack, so it is stopped on ``__exit__``.
+        Registered with ``_guard``, the env's cleanup registry, so it is stopped
+        on ``__exit__`` by either release path — a patch left running would leak
+        into every later test in the worker (which the leak detector now fails
+        the test for, rather than letting it spread silently).
         """
         from unittest.mock import patch
 
         patcher = patch("src.core.tools.media_buy_create.process_and_upload_package_creatives")
         mock_upload = patcher.start()
-        self._patchers.append(patcher)
+        self._guard("patch:upload_creatives", patcher.stop)
         self.mock["upload_creatives"] = mock_upload
         mock_upload.return_value = (req.packages, uploaded_ids or {})
         return mock_upload
@@ -354,7 +361,7 @@ class MediaBuyCreateEnv(IntegrationEnv):
             ),
         }
 
-        def _format_spec_side_effect(agent_url: str, format_id: str) -> Any:
+        def _format_spec_side_effect(agent_url: str, format_id: str, *, provenance: Any = None) -> Any:
             spec = self._format_specs.get(format_id)
             if spec is not None:
                 return spec
@@ -468,3 +475,35 @@ class MediaBuyCreateEnv(IntegrationEnv):
         else:
             response = CreateMediaBuyError(**data)
         return CreateMediaBuyResult(response=response, status=status, replayed=replayed)
+
+
+class RealFormatResolverMediaBuyCreateEnv(MediaBuyCreateEnv):
+    """``MediaBuyCreateEnv`` with the format-spec fetch left UNPATCHED.
+
+    ``MediaBuyCreateEnv`` mocks ``_get_format_spec_sync`` so ordinary
+    create_media_buy tests never resolve a format over the network. This variant
+    drops exactly that one patch and changes nothing else, so the pre-adapter
+    creative validation runs the real ``format_resolver`` → ``CreativeAgentRegistry``
+    → egress-seam chain — which is the point: a refusal whose wire envelope is
+    under test has to be produced by production code, including the ``field``
+    the production call site chooses for it.
+
+    TRAP: because the mock is gone, ``self.mock["format_spec"]`` does not exist
+    after ``__enter__`` — the stand-in below is deleted as soon as the happy-path
+    wiring has finished with it. A test that wants to INJECT a format-spec result
+    or error wants plain ``MediaBuyCreateEnv``, not this class.
+    """
+
+    EXTERNAL_PATCHES = {
+        name: target for name, target in MediaBuyCreateEnv.EXTERNAL_PATCHES.items() if name != "format_spec"
+    }
+
+    def _configure_mocks(self) -> None:
+        # The happy-path wiring pokes ``self.mock["format_spec"]``. A throwaway
+        # stand-in keeps those lines harmless without forking the rest of the
+        # wiring, which this env does want.
+        self.mock["format_spec"] = MagicMock()
+        try:
+            super()._configure_mocks()
+        finally:
+            del self.mock["format_spec"]

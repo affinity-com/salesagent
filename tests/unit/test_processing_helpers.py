@@ -1,12 +1,11 @@
-"""Unit tests for the creative-agent seam in ``_processing.py`` (Change 1 & 2).
+"""Unit tests for the creative-agent seam in ``_processing.py``.
 
 Covers:
-- ``_find_format`` / ``_resolve_agent_format``: canonical composite
-  (agent_url, id) key lookup per AdCP URL canonicalization (spec MUST —
-  ``core/format-id.json`` / ``reference/url-canonicalization.mdx``): lowercased
-  host, default ports stripped, trailing slash stripped. Transport-suffix paths
-  (``/mcp``, ``/a2a``) are NOT stripped — canonicalization must preserve the
-  path, so a reference carrying such a suffix is a genuinely different agent_url.
+- ``_resolve_agent_format``: the format reference → ``(format, canonical agent
+  identity)`` step both sync paths run before dialling. The MATCHING itself is
+  ``format_resolver.find_format`` (graded in ``test_format_resolver.py``); what
+  is graded here is the identity this layer hands the registry — one value, so a
+  request cannot carry two spellings of the same agent_url.
 - ``_render_creative_manifest`` (the registry's single manifest renderer):
   AdCP-compliant ``creative_manifest`` structure (``format_id`` as an object,
   ``assets`` always present, no ``creative_id``/``name``).
@@ -14,10 +13,7 @@ Covers:
 The format fixtures are REAL ``Format`` models, not ``Mock``s: production
 branches on ``format_obj.output_format_ids`` (generative vs static), and a
 ``Mock`` auto-creates that attribute as truthy, which silently routes a
-static-format test down the generative path. The legacy shape (bare-string
-``format_id`` with a top-level ``agent_url``) cannot be expressed as a
-``Format``, so it gets an explicit stand-in that carries exactly those two
-attributes and nothing else.
+static-format test down the generative path.
 """
 
 from __future__ import annotations
@@ -29,7 +25,7 @@ import pytest
 from src.core.creative_agent_registry import _render_creative_manifest
 from src.core.exceptions import AdCPValidationError
 from src.core.schemas import Format, FormatId
-from src.core.tools.creatives._processing import _find_format, _resolve_agent_format
+from src.core.tools.creatives._processing import _resolve_agent_format
 from tests.factories.creative_asset import build_assets, image_spec
 
 AGENT = "https://creative.example.com"
@@ -38,93 +34,6 @@ AGENT = "https://creative.example.com"
 def _structured_format(agent_url: str, format_id: str) -> Format:
     """A real SDK-shaped ``Format`` (``format_id`` is a ``FormatId`` object)."""
     return Format(format_id=FormatId(agent_url=agent_url, id=format_id), name="Test Format")
-
-
-@dataclass(frozen=True)
-class _LegacyFormat:
-    """The pre-federation format shape: bare-string id + top-level agent_url.
-
-    Still reachable from stored/adapter-provided formats, which is why
-    ``_get_format_agent_url`` keeps its runtime shape discrimination. Spelled as
-    a two-field object (not a ``Mock``) so an attribute production reads but
-    this shape does not define is an ``AttributeError``, not a truthy default.
-    """
-
-    agent_url: str
-    format_id: str
-
-
-def _legacy_format(agent_url: str, format_id: str) -> _LegacyFormat:
-    return _LegacyFormat(agent_url=agent_url, format_id=format_id)
-
-
-# The stored side under both shapes. A real ``FormatId`` pre-normalizes host
-# case, the default port and the trailing slash at construction, so those rows
-# exercise canonicalization end-to-end only for the legacy shape — where the
-# agent_url is an unnormalized plain string. Running the same table over both
-# shapes is the point: the outcome must not depend on which shape is stored.
-FORMAT_SHAPES = [
-    pytest.param(_structured_format, id="structured"),
-    pytest.param(_legacy_format, id="legacy"),
-]
-
-# (stored agent_url, requested agent_url, stored id, requested id, matches)
-LOOKUP_CASES = [
-    pytest.param(AGENT, AGENT, "display_300x250", "display_300x250", True, id="exact"),
-    pytest.param(AGENT, AGENT + "/", "display_300x250", "display_300x250", True, id="requested-trailing-slash"),
-    pytest.param(AGENT + "/", AGENT, "display_300x250", "display_300x250", True, id="stored-trailing-slash"),
-    pytest.param(AGENT + "/", AGENT + "/", "display_300x250", "display_300x250", True, id="both-trailing-slash"),
-    pytest.param(
-        "https://Creative.Example.com", AGENT, "display_300x250", "display_300x250", True, id="stored-host-case"
-    ),
-    pytest.param(AGENT + ":443", AGENT, "display_300x250", "display_300x250", True, id="stored-default-port"),
-    pytest.param(AGENT, AGENT + "/mcp", "display_300x250", "display_300x250", False, id="transport-suffix"),
-    pytest.param(AGENT, AGENT, "display_300x250", "display_728x90", False, id="id-mismatch"),
-    pytest.param(AGENT, "https://other.example.com", "display_300x250", "display_300x250", False, id="host-mismatch"),
-]
-
-
-class TestFindFormat:
-    """_find_format matches on the canonical composite (agent_url, id) key.
-
-    AdCP URL canonicalization (RFC 3986 §6.2.2/§6.2.3): URLs differing only by
-    trailing slash, host case, or default port must compare equal; a differing
-    path (``/mcp``) must not.
-    """
-
-    @pytest.mark.parametrize("make_format", FORMAT_SHAPES)
-    @pytest.mark.parametrize("stored_url,requested_url,stored_id,requested_id,matches", LOOKUP_CASES)
-    def test_lookup_table(self, make_format, stored_url, requested_url, stored_id, requested_id, matches):
-        fmt = make_format(stored_url, stored_id)
-
-        result = _find_format([fmt], FormatId(agent_url=requested_url, id=requested_id))
-
-        assert result is (fmt if matches else None), (
-            f"stored {stored_url!r}/{stored_id!r} vs requested {requested_url!r}/{requested_id!r}: "
-            f"expected {'a match' if matches else 'no match'}"
-        )
-
-    def test_empty_list_returns_none(self):
-        """Empty format list returns None."""
-        assert _find_format([], FormatId(agent_url=AGENT, id="display_300x250")) is None
-
-    def test_first_matching_format_returned(self):
-        """When multiple formats match, the first one is returned."""
-        fmt_a = _structured_format(AGENT, "display_300x250")
-        fmt_b = _structured_format(AGENT, "display_300x250")
-
-        result = _find_format([fmt_a, fmt_b], FormatId(agent_url=AGENT, id="display_300x250"))
-
-        assert result is fmt_a
-
-    def test_selects_correct_format_from_multiple(self):
-        """Correct format is selected when multiple formats are present."""
-        fmt_a = _structured_format(AGENT, "display_300x250")
-        fmt_b = _structured_format(AGENT, "display_728x90")
-
-        result = _find_format([fmt_a, fmt_b], FormatId(agent_url=AGENT, id="display_728x90"))
-
-        assert result is fmt_b
 
 
 class TestResolveAgentFormat:

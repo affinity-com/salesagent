@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from tests.factories.creative_asset import AssetSpec, assert_assets, build_assets, image_spec
 from tests.harness import make_mock_uow
@@ -105,17 +105,23 @@ def sync_patches():
         async def mock_list_all_formats(tenant_id=None):
             return [mock_format_spec_arg] if mock_format_spec_arg else []
 
-        async def mock_get_format(agent_url, format_id):
+        async def mock_get_format(agent_url, format_id, **_kwargs):
             return mock_format_spec_arg
+
+        async def mock_preview_creative(*_args, **_kwargs):
+            return {"preview_url": "https://creative.example/preview"}
 
         mock_registry = Mock()
         mock_registry.list_all_formats = mock_list_all_formats
         mock_registry.get_format = mock_get_format
-        # preview_creative must be an AsyncMock so run_async_in_sync_context can
-        # await it in the static creative path (_processing.py).  Returning None
-        # triggers the "no previews" branch; the test creative has a banner_image
-        # asset URL so has_media_url=True and creation continues successfully.
-        mock_registry.preview_creative = AsyncMock(return_value=None)
+        # preview_creative must be AWAITABLE. It was never reached before: the
+        # catalog lookup compared FormatId models with `==`, which is Pydantic's
+        # class-sensitive equality, so it never matched and the whole
+        # agent-backed arm was skipped for every consumer of this helper. A bare
+        # Mock() attribute is not a coroutine, so the first test to actually
+        # reach that arm got "Expected coroutine, got Mock" and its creative was
+        # rejected — the mock was incomplete all along, invisibly.
+        mock_registry.preview_creative = mock_preview_creative
 
         mock_uow, mock_creative_repo = make_creative_uow()
 

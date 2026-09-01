@@ -48,8 +48,12 @@ def _configure_registry(mock_registry_getter, *, list_all_formats, get_format=No
     mock_registry.list_all_formats = list_all_formats
     if get_format is not None:
         mock_registry.get_format = get_format
-    if with_preview:
-        mock_registry.preview_creative = AsyncMock(return_value=_STATIC_PREVIEW_RESULT)
+    # ALWAYS awaitable, even when a test does not expect the preview path: the
+    # catalog lookup now matches (format_resolver.find_format compares values,
+    # not Pydantic classes), so the agent-backed arm IS reached and a bare Mock
+    # attribute would fail with "Expected coroutine, got Mock" — a failure about
+    # the double, not about the behavior under test.
+    mock_registry.preview_creative = AsyncMock(return_value=_STATIC_PREVIEW_RESULT if with_preview else None)
     mock_registry_getter.return_value = mock_registry
     return mock_registry
 
@@ -103,7 +107,7 @@ class TestSyncCreativesFormatValidation:
             async def mock_list_all_formats(tenant_id=None):
                 return [static_format_spec]
 
-            async def mock_get_format(agent_url, format_id):
+            async def mock_get_format(agent_url, format_id, **_kwargs):
                 return static_format_spec
 
             _configure_registry(
@@ -138,7 +142,7 @@ class TestSyncCreativesFormatValidation:
             async def mock_list_all_formats(tenant_id=None):
                 return []
 
-            async def mock_get_format(agent_url, format_id):
+            async def mock_get_format(agent_url, format_id, **_kwargs):
                 return None  # Format not found
 
             _configure_registry(
@@ -185,7 +189,7 @@ class TestSyncCreativesFormatValidation:
             async def mock_list_all_formats(tenant_id=None):
                 return []
 
-            async def mock_get_format(agent_url, format_id):
+            async def mock_get_format(agent_url, format_id, **_kwargs):
                 raise AdCPServiceUnavailableError("Connection failed: agent unreachable — Connection refused")
 
             _configure_registry(
@@ -220,7 +224,7 @@ class TestSyncCreativesFormatValidation:
             async def mock_list_all_formats(tenant_id=None):
                 return [static_format_spec]
 
-            async def mock_get_format(agent_url, format_id):
+            async def mock_get_format(agent_url, format_id, **_kwargs):
                 return static_format_spec
 
             _configure_registry(
@@ -264,7 +268,7 @@ class TestSyncCreativesFormatValidation:
                 return [static_format_spec]
 
             # Mock get_format to return format_spec for valid format, None for invalid
-            async def mock_get_format(agent_url, format_id):
+            async def mock_get_format(agent_url, format_id, **_kwargs):
                 if format_id == "display_300x250_image":
                     return static_format_spec
                 return None
@@ -319,7 +323,7 @@ class TestSyncCreativesFormatValidation:
             async def mock_list_all_formats(tenant_id=None):
                 return [static_format_spec]
 
-            async def mock_get_format(agent_url, format_id):
+            async def mock_get_format(agent_url, format_id, **_kwargs):
                 return static_format_spec
 
             _configure_registry(
@@ -408,7 +412,7 @@ class TestSyncCreativesFormatValidation:
             async def mock_list_all_formats(tenant_id=None):
                 return []
 
-            async def mock_get_format(agent_url, format_id):
+            async def mock_get_format(agent_url, format_id, **_kwargs):
                 if "offline.example.com" in agent_url:
                     raise AdCPServiceUnavailableError("Connection failed: Connection refused")
 
