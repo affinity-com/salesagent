@@ -13,9 +13,11 @@ End-to-end scenarios exercised against a real PostgreSQL database:
 
 2. test_sync_packages_posts_to_providers
    sync_packages_for_media_buy fans out to all syncable providers; outbound
-   HTTP is stubbed at the httpx.Client level (not at _post_packages_sync) so
-   the full sync path — URL construction, auth header, body shape, AND the
-   resolve-before-MediaBuyUoW seller_agent lookup — is graded.
+   HTTP is stubbed at the egress seam (``outbound_http.send``), not at
+   _post_packages_sync, so the full sync path — URL construction, auth header,
+   body shape, AND the resolve-before-MediaBuyUoW seller_agent lookup — is
+   graded. The seam is the lowest layer this application owns since #1802; below
+   it is address/TLS/retry policy that has its own suite.
 
 3. test_health_scheduler_tick_persists_status
    TMPHealthScheduler.tick() probes providers (HTTP stubbed) and persists the
@@ -27,7 +29,7 @@ packages to every registered provider" — is NOT here. It is one BDD scenario
 harness over a2a/mcp/rest and e2e_rest through the env-owned seam
 (``tests.harness._mixins.TMPSyncMixin``). This file used to carry a hand-written
 ``_DISPATCHED_TRANSPORTS`` list plus a process-wide ``threading.Thread.start`` /
-``httpx.Client`` patch, and ``tests/e2e/test_tmp_provider_sync_e2e.py`` carried a
+process-wide outbound patch, and ``tests/e2e/test_tmp_provider_sync_e2e.py`` carried a
 second, independent implementation of the same seed→dispatch→collect→assert for
 one transport; both are replaced by that scenario (#1197 review).
 
@@ -48,7 +50,7 @@ from tests.harness._base import IntegrationEnv
 from tests.helpers.admin_client import make_super_admin_client
 from tests.helpers.envelope_assertions import assert_envelope_shape
 from tests.helpers.pinned_schema import validate_against_pinned_schema
-from tests.helpers.tmp_provider_http import make_mock_http_client
+from tests.helpers.tmp_provider_http import make_seam_result
 
 pytestmark = [pytest.mark.integration, pytest.mark.requires_db]
 
@@ -144,7 +146,7 @@ class TestAdminWriteReachesTheDiscoveryContract:
 
     _FORM = {
         "name": "Round Trip Provider",
-        "endpoint": "https://roundtrip.example.com/tmp",
+        "endpoint": "https://provider.example.com/tmp",
         "context_match": "on",
         "identity_match": "on",
         "countries": "US, DE",
@@ -163,10 +165,11 @@ class TestAdminWriteReachesTheDiscoveryContract:
 
         admin = make_super_admin_client()
         with (
+            # No resolver patch: the registration verdict is the seam's DNS-free
+            # one (EgressPolicy.check_registration), so a public hostname needs
+            # no resolution to be accepted (#1802 deleted the resolver this used
+            # to stub).
             patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}),
-            # The record's SSRF check resolves DNS; stub the resolution (not the
-            # check) so production's real guard still runs, against a public IP.
-            patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"),
         ):
             posted = admin.post("/tenant/tmp_roundtrip/tmp-providers/add", data=self._FORM, follow_redirects=False)
         # A rejected form redirects back to /add; a successful one to the list.
@@ -216,7 +219,6 @@ class TestAdminWriteReachesTheDiscoveryContract:
         admin = make_super_admin_client()
         with (
             patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}),
-            patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"),
         ):
             posted = admin.post(
                 "/tenant/tmp_roundtrip_lower/tmp-providers/add",
@@ -242,7 +244,6 @@ class TestAdminWriteReachesTheDiscoveryContract:
         admin = make_super_admin_client()
         with (
             patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}),
-            patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"),
         ):
             # identity_match with no countries — rejected by the record.
             posted = admin.post(
@@ -409,12 +410,12 @@ class TestDiscoveryAuth:
 
 
 class TestSyncPackagesPostsToProviders:
-    """sync_packages_for_media_buy POSTs to every syncable provider (HTTP stubbed at httpx level)."""
+    """sync_packages_for_media_buy POSTs to every syncable provider (stubbed at the egress seam)."""
 
     def test_sync_packages_posts_to_providers(self, integration_db):
-        """With two active providers and one package, httpx.Client.post is called twice.
+        """With two active providers and one package, the seam is called twice.
 
-        Stubs httpx.Client (not _post_packages_sync) so the full sync path is
+        Stubs ``outbound_http.send`` (not _post_packages_sync) so the full sync path is
         graded: URL construction via provider_url(), auth header via provider_auth_headers(),
         and JSON body shape from _build_package_payload().
 
@@ -455,9 +456,8 @@ class TestSyncPackagesPostsToProviders:
 
         from src.services.tmp_provider_sync import sync_packages_for_media_buy
 
-        mock_client = make_mock_http_client(200)
         with (
-            patch("src.services.tmp_provider_sync.httpx.Client", return_value=mock_client),
+            patch("src.services.tmp_provider_sync.send", return_value=make_seam_result(200)) as seam,
             patch.dict(os.environ, {}, clear=False),
         ):
             os.environ.pop("ADCP_AGENT_URL", None)
@@ -466,23 +466,24 @@ class TestSyncPackagesPostsToProviders:
         expected_seller_agent_url = "https://tmp-int-sync-t1.publisher.example.com/mcp"
 
         # Both providers must have been called
-        assert mock_client.post.call_count == 2
+        assert seam.call_count == 2
 
         # Assert the URLs hit — provider_url() appends /packages/sync
-        called_urls = {call.args[0] for call in mock_client.post.call_args_list}
+        called_urls = {call.args[0] for call in seam.call_args_list}
         assert called_urls == {
             "https://alpha.example.com/tmp/packages/sync",
             "https://beta.example.com/tmp/packages/sync",
         }
 
-        # No auth credentials on either provider → no Authorization header
-        for call in mock_client.post.call_args_list:
-            headers = call.kwargs.get("headers", call.args[2] if len(call.args) > 2 else {})
-            assert "Authorization" not in headers
+        # No auth credentials on either provider → no Authorization header.
+        # The seam is called with keywords only, so there is no positional
+        # fallback to read any more.
+        for call in seam.call_args_list:
+            assert "Authorization" not in call.kwargs["headers"]
 
         # Body must be a list of AvailablePackage dicts with required fields
-        for call in mock_client.post.call_args_list:
-            body = call.kwargs.get("json", call.args[1] if len(call.args) > 1 else None)
+        for call in seam.call_args_list:
+            body = call.kwargs["json"]
             assert isinstance(body, list)
             assert len(body) == 1
             pkg_payload = body[0]

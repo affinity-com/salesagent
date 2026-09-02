@@ -1,62 +1,51 @@
-"""Mock ``httpx`` clients for the outbound TMP-provider calls.
+"""Doubles for the outbound TMP-provider calls, at the egress seam.
 
-Both TMP services make outbound provider calls through ``httpx`` — the package
-sync synchronously (``httpx.Client.post``) and the health scheduler
-asynchronously (``httpx.AsyncClient.get``). Three test files had each written
-their own builder for the same context-manager-shaped mock, so a change to the
-client contract meant three edits and the copies had already drifted on whether
-a >= 400 status raises (CLAUDE.md DRY invariant, #1197 review).
+Both TMP services reach providers through ``src.core.security.outbound_http``
+— the package sync synchronously (``send``) and the health scheduler
+asynchronously (``asend``). #1802 moved every outbound call in the application
+onto that seam, so these builders returns the seam's OWN types rather than mock
+``httpx`` clients: the thing a test doubles is the one function the production
+code calls, not the three layers of client/context-manager/response that used
+to sit under it.
+
+The values are REAL ``OutboundResult`` / ``OutboundDeliveryFailed`` instances,
+not ``MagicMock``s shaped like them. A mock would accept ``.status_code``,
+``.ok``, or any other spelling the production code might drift to; the real
+types accept only ``http_status``, so a rename at the seam fails these tests
+instead of passing them vacuously.
 
 Tests that want the sync path graded end-to-end over a real socket should use
-``tests.harness._mixins.TMPSyncMixin`` instead of a mock client; these builders
-are for the unit-level tests of a single function's HTTP shape.
+``tests.harness._mixins.TMPSyncMixin`` instead; these builders are for the
+unit-level tests of a single function's request shape.
 """
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from src.core.security.egress.attempts import OutboundDeliveryFailed
+from src.core.security.egress.response import OutboundResult
 
-import httpx
 
+def make_seam_result(status_code: int = 200, *, content: bytes = b"") -> OutboundResult:
+    """A delivered response the seam would hand back for *status_code*.
 
-def make_mock_http_client(status_code: int = 200) -> MagicMock:
-    """A mock ``httpx.Client`` context manager whose ``.post()`` returns *status_code*.
-
-    ``raise_for_status`` behaves like the real one: it raises
-    ``httpx.HTTPStatusError`` for 4xx/5xx and is a no-op otherwise, so a test
-    passing a failure status exercises the caller's error path rather than a
-    silently successful mock.
+    ``headers`` is empty and ``duration_seconds`` is 0.0 — neither TMP call site
+    reads them, and inventing values would suggest a test depends on them.
     """
-    mock_response = MagicMock()
-    mock_response.status_code = status_code
-    mock_response.raise_for_status = MagicMock(
-        side_effect=(
-            httpx.HTTPStatusError(
-                f"Server error {status_code}",
-                request=MagicMock(),
-                response=MagicMock(status_code=status_code),
-            )
-            if status_code >= 400
-            else None
-        )
+    return OutboundResult(
+        http_status=status_code,
+        headers={},
+        content=content,
+        attempts=1,
+        duration_seconds=0.0,
     )
 
-    mock_client = MagicMock()
-    mock_client.__enter__ = MagicMock(return_value=mock_client)
-    mock_client.__exit__ = MagicMock(return_value=False)
-    mock_client.post.return_value = mock_response
-    return mock_client
 
+def make_delivery_failed(status_code: int | None, *, attempts: int = 1) -> OutboundDeliveryFailed:
+    """What the seam raises when the destination was reached but not delivered.
 
-def make_mock_async_http_client(
-    *, get_return: MagicMock | None = None, get_side_effect: Exception | None = None
-) -> AsyncMock:
-    """A mock ``httpx.AsyncClient`` async context manager for the health probe.
-
-    Exactly one of *get_return* or *get_side_effect* is meaningful per call.
+    ``status_code=None`` is the transport-failure case (nothing answered), which
+    is the distinction the health probe's "unhealthy" vs "error" answer rests
+    on — so a test can state which one it means instead of relying on a mock's
+    default.
     """
-    mock_client = AsyncMock()
-    mock_client.get = AsyncMock(return_value=get_return, side_effect=get_side_effect)
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
-    return mock_client
+    return OutboundDeliveryFailed(attempts=attempts, http_status=status_code)

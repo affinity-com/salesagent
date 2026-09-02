@@ -33,13 +33,12 @@ import asyncio
 import logging
 from collections import defaultdict
 
-import httpx
-
 from src.core.database.database_session import get_db_session
 from src.core.database.repositories.tmp_provider import TMPProviderRepository
 from src.core.database.repositories.uow import TMPProviderUoW
 from src.core.logging_config import log_safe
-from src.services._provider_http import provider_client_kwargs, provider_url
+from src.core.security.outbound_http import OperatorEndpoint, OutboundDeliveryFailed, asend
+from src.services._provider_http import provider_url
 from src.services._scheduler_base import IntervalScheduler, make_singleton, parse_interval_env
 
 logger = logging.getLogger(__name__)
@@ -57,24 +56,42 @@ async def _check_provider_health(endpoint: str) -> str:
 
     Returns one of: ``"healthy"``, ``"unhealthy"``, ``"error"``.
 
-    Uses ``follow_redirects=False`` to prevent SSRF via open-redirect even
-    though the base URL was validated at registration time.
+    Probed through the outbound egress seam (``outbound_http.asend``), which owns
+    address policy, TLS and redirect refusal — the ``follow_redirects=False``
+    this used to set itself is httpx's default inside the seam (#1802).
 
-    Any exception that escapes ``httpx.HTTPError`` (e.g. ``socket.gaierror``,
-    ``UnicodeError`` on a malformed hostname) is caught here and mapped to
-    ``"error"`` so the caller's ``gather(return_exceptions=True)`` loop never
-    sees a raw exception from this coroutine.
+    ``max_attempts=1``: a health probe must report what one request saw. The
+    seam's default of 3 would turn a single scheduled probe into three requests
+    per provider per tick and report the last one, which is a different
+    measurement from the one this scheduler has always taken.
+
+    The three-way answer survives the seam raising on non-2xx.
+    ``OutboundDeliveryFailed`` carries ``http_status``, so "the provider answered
+    and it was not 200" (unhealthy) stays distinguishable from "no answer
+    reached us at all" (error) — the distinction the persisted status exists to
+    make. Anything else (a refusal, a malformed hostname) is ``"error"`` so the
+    caller's ``gather(return_exceptions=True)`` loop never sees a raw exception
+    from this coroutine.
     """
     health_url = provider_url(endpoint, "/health")
     try:
-        async with httpx.AsyncClient(
-            **provider_client_kwargs(timeout=HEALTH_CHECK_TIMEOUT_SECONDS),
-        ) as client:
-            resp = await client.get(health_url)
-        return "healthy" if resp.status_code == 200 else "unhealthy"
+        result = await asend(
+            health_url,
+            method="GET",
+            timeout=HEALTH_CHECK_TIMEOUT_SECONDS,
+            max_attempts=1,
+            provenance=OperatorEndpoint("the TMP provider"),
+        )
+    except OutboundDeliveryFailed as failed:
+        if failed.http_status is not None:
+            logger.debug("[TMP health] Provider %s answered %d", log_safe(endpoint), failed.http_status)
+            return "unhealthy"
+        logger.exception("[TMP health] Health probe failed for %s", log_safe(endpoint))
+        return "error"
     except Exception:
         logger.exception("[TMP health] Health probe failed for %s", log_safe(endpoint))
         return "error"
+    return "healthy" if result.http_status == 200 else "unhealthy"
 
 
 class TMPHealthScheduler(IntervalScheduler):

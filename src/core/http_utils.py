@@ -1,3 +1,5 @@
+from adcp.types import AuthenticationScheme
+
 """HTTP utility functions shared across the codebase."""
 
 from collections.abc import Mapping
@@ -45,8 +47,14 @@ def parse_bearer_token(authorization_header: str) -> str | None:
         The token string if the header has the form ``Bearer <token>``
         (case-insensitive), otherwise ``None``.
     """
+    # Compared against the pinned enum member, never a string literal: a
+    # mistyped member fails to resolve, while a mistyped literal silently takes
+    # the wrong branch (the reason
+    # ``test_architecture_enum_not_compared_to_string`` forbids the literal
+    # form). ``.lower()`` on both sides keeps the RFC 7235 §2.1
+    # case-insensitivity this helper exists to provide.
     parts = authorization_header.strip().split(None, 1)
-    if len(parts) == 2 and parts[0].lower() == "bearer":
+    if len(parts) == 2 and parts[0].lower() == AuthenticationScheme.Bearer.value.lower():
         token = parts[1].strip()
         return token if token else None
     return None

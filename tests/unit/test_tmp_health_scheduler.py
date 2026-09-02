@@ -19,106 +19,121 @@ from contextlib import asynccontextmanager
 from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
-import httpx
 import pytest
 
+from src.core.security.egress.policy import OutboundRequestBlocked
+from src.core.security.outbound_http import OperatorEndpoint
 from src.services.tmp_health_scheduler import (
     TMPHealthScheduler,
     _check_provider_health,
     get_tmp_health_scheduler,
 )
-from tests.helpers.tmp_provider_http import make_mock_async_http_client
+from tests.helpers.tmp_provider_http import make_delivery_failed, make_seam_result
 from tests.unit._tmp_helpers import make_db_context, make_mock_provider, make_tmp_repo_uow
 
 # ── Shared helpers ──────────────────────────────────────────────────
 
 
 class TestCheckProviderHealth:
-    """_check_provider_health probes a single provider's /health endpoint."""
+    """_check_provider_health probes a single provider's /health endpoint.
+
+    Doubles ``asend`` — the egress seam function production calls since #1802 —
+    rather than an ``httpx.AsyncClient``. The three-way answer is the subject:
+    "healthy" and "unhealthy" both mean the provider ANSWERED, and "error" means
+    nothing did, so the seam's raise-on-non-2xx must not collapse the middle
+    case into the last one.
+    """
+
+    _ENDPOINT = "https://provider.example.com/tmp"
+
+    @staticmethod
+    def _seam(**kwargs):
+        """Patch the seam's async send for the duration of a probe."""
+        return patch("src.services.tmp_health_scheduler.asend", new=AsyncMock(**kwargs))
 
     @pytest.mark.asyncio
     async def test_returns_healthy_on_200(self):
         """200 response → 'healthy'."""
-        mock_resp = MagicMock(status_code=200)
-        mock_client = make_mock_async_http_client(get_return=mock_resp)
-
-        with patch("src.services.tmp_health_scheduler.httpx.AsyncClient", return_value=mock_client):
-            result = await _check_provider_health("https://provider.example.com/tmp")
+        with self._seam(return_value=make_seam_result(200)) as seam:
+            result = await _check_provider_health(self._ENDPOINT)
 
         assert result == "healthy"
-        mock_client.get.assert_called_once_with("https://provider.example.com/tmp/health")
+        assert seam.call_args[0][0] == "https://provider.example.com/tmp/health"
+        assert seam.call_args.kwargs["method"] == "GET"
 
     @pytest.mark.asyncio
-    async def test_returns_unhealthy_on_non_200(self):
-        """Non-200 response → 'unhealthy'."""
-        mock_resp = MagicMock(status_code=503)
-        mock_client = make_mock_async_http_client(get_return=mock_resp)
-
-        with patch("src.services.tmp_health_scheduler.httpx.AsyncClient", return_value=mock_client):
-            result = await _check_provider_health("https://provider.example.com/tmp")
-
-        assert result == "unhealthy"
+    async def test_returns_unhealthy_on_a_delivered_non_200(self):
+        """A 2xx-but-not-200 the seam delivers → 'unhealthy'."""
+        with self._seam(return_value=make_seam_result(204)):
+            assert await _check_provider_health(self._ENDPOINT) == "unhealthy"
 
     @pytest.mark.asyncio
-    async def test_returns_error_on_connection_failure(self):
-        """ConnectError → 'error'."""
-        mock_client = make_mock_async_http_client(get_side_effect=httpx.ConnectError("Connection refused"))
+    async def test_returns_unhealthy_when_the_provider_answered_an_error_status(self):
+        """A 503 reaches the caller as OutboundDeliveryFailed CARRYING the status.
 
-        with patch("src.services.tmp_health_scheduler.httpx.AsyncClient", return_value=mock_client):
-            result = await _check_provider_health("https://provider.example.com/tmp")
-
-        assert result == "error"
+        This is the case the migration could have silently lost: the seam raises
+        on a non-2xx, and a bare ``except`` would have reported a provider that
+        answered "I am unwell" as though nothing answered at all.
+        """
+        with self._seam(side_effect=make_delivery_failed(503)):
+            assert await _check_provider_health(self._ENDPOINT) == "unhealthy"
 
     @pytest.mark.asyncio
-    async def test_returns_error_on_timeout(self):
-        """TimeoutException → 'error'."""
-        mock_client = make_mock_async_http_client(get_side_effect=httpx.TimeoutException("Read timed out"))
+    async def test_returns_error_when_nothing_answered(self):
+        """A transport failure (no status) → 'error'."""
+        with self._seam(side_effect=make_delivery_failed(None)):
+            assert await _check_provider_health(self._ENDPOINT) == "error"
 
-        with patch("src.services.tmp_health_scheduler.httpx.AsyncClient", return_value=mock_client):
-            result = await _check_provider_health("https://provider.example.com/tmp")
-
-        assert result == "error"
+    @pytest.mark.asyncio
+    async def test_returns_error_when_the_seam_refuses_the_address(self):
+        """A policy refusal → 'error', not a raise out of the coroutine."""
+        with self._seam(side_effect=OutboundRequestBlocked(field=None)):
+            assert await _check_provider_health("https://10.0.0.1/tmp") == "error"
 
     @pytest.mark.asyncio
     async def test_strips_trailing_slash_from_endpoint(self):
         """Trailing slash on endpoint is stripped before appending /health."""
-        mock_resp = MagicMock(status_code=200)
-        mock_client = make_mock_async_http_client(get_return=mock_resp)
-
-        with patch("src.services.tmp_health_scheduler.httpx.AsyncClient", return_value=mock_client):
+        with self._seam(return_value=make_seam_result(200)) as seam:
             await _check_provider_health("https://provider.example.com/tmp/")
 
-        mock_client.get.assert_called_once_with("https://provider.example.com/tmp/health")
+        assert seam.call_args[0][0] == "https://provider.example.com/tmp/health"
 
     @pytest.mark.asyncio
     async def test_returns_error_on_arbitrary_exception(self):
-        """Any non-httpx exception (e.g. socket.gaierror) → 'error', not a raise."""
-        mock_client = make_mock_async_http_client(get_side_effect=OSError("Name or service not known"))
-
-        with patch("src.services.tmp_health_scheduler.httpx.AsyncClient", return_value=mock_client):
-            result = await _check_provider_health("https://bad-hostname.invalid")
-
-        assert result == "error"
+        """Any other exception (e.g. socket.gaierror) → 'error', not a raise."""
+        with self._seam(side_effect=OSError("Name or service not known")):
+            assert await _check_provider_health("https://bad-hostname.invalid") == "error"
 
     @pytest.mark.asyncio
-    async def test_follow_redirects_false_prevents_ssrf(self):
-        """follow_redirects=False is always passed to prevent SSRF via open-redirect."""
-        mock_resp = MagicMock(status_code=200)
-        mock_client = make_mock_async_http_client(get_return=mock_resp)
+    async def test_probe_sends_exactly_one_request(self):
+        """max_attempts=1: a scheduled probe reports what ONE request saw.
 
-        with patch("src.services.tmp_health_scheduler.httpx.AsyncClient", return_value=mock_client) as mock_cls:
+        Replaces a ``follow_redirects=False`` assertion — that flag is the seam's
+        default now, not this call site's argument. What IS still this call
+        site's decision is opting out of the seam's 3-attempt retry, which would
+        otherwise turn each tick into three requests per provider and report the
+        last (#1802 migration).
+        """
+        with self._seam(return_value=make_seam_result(200)) as seam:
             await _check_provider_health("https://provider.example.com")
 
-        _, kwargs = mock_cls.call_args
-        assert kwargs.get("follow_redirects") is False
+        assert seam.call_args.kwargs["max_attempts"] == 1
+
+    @pytest.mark.asyncio
+    async def test_provenance_is_an_operator_endpoint_naming_no_address(self):
+        """The seam is told whose URL this is, as a role rather than an address."""
+        with self._seam(return_value=make_seam_result(200)) as seam:
+            await _check_provider_health("https://provider.example.com")
+
+        provenance = seam.call_args.kwargs["provenance"]
+        assert isinstance(provenance, OperatorEndpoint)
+        assert "://" not in provenance.name
 
     @pytest.mark.asyncio
     async def test_logs_exception_on_error(self):
         """Exceptions are logged before mapping to 'error' — no silent failures."""
-        mock_client = make_mock_async_http_client(get_side_effect=OSError("DNS failure"))
-
         with (
-            patch("src.services.tmp_health_scheduler.httpx.AsyncClient", return_value=mock_client),
+            self._seam(side_effect=OSError("DNS failure")),
             patch("src.services.tmp_health_scheduler.logger") as mock_logger,
         ):
             result = await _check_provider_health("https://bad-hostname.invalid")

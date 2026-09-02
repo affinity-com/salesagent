@@ -515,11 +515,11 @@ class TestDiscoveryEntryIsTheSdkType:
         appending. Asserted explicitly so the normalization is a stated property
         rather than a surprise to a router operator diffing stored vs published.
         """
-        p = make_provider(endpoint="http://si-agent.localhost:3003")
+        p = make_provider(endpoint="https://si-agent.localhost:3003")
         entry = self._entry_dict(p)
 
         validate_against_pinned_schema(PROVIDER_REGISTRATION_SCHEMA, entry)
-        assert entry["endpoint"] == "http://si-agent.localhost:3003/"
+        assert entry["endpoint"] == "https://si-agent.localhost:3003/"
 
     def test_hyphenated_provider_id_cannot_be_emitted(self):
         """Construction fails on the charset rule — it is no longer possible to serialize it.

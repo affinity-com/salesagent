@@ -193,7 +193,7 @@ def make_db_context(session: MagicMock) -> MagicMock:
 def make_provider(
     provider_id: str = "prov_1",
     name: str = "Provider A",
-    endpoint: str = "http://si-agent.localhost:3003",
+    endpoint: str = "https://si-agent.localhost:3003",
     context_match: bool = True,
     identity_match: bool = False,
     countries: list[str] | None = None,

@@ -41,10 +41,13 @@ that type is a ``RootModel`` union over two closed (``extra="forbid"``)
 variants describing the **wire** registration a router consumes.  It requires
 ``provider_id`` (assigned by us at INSERT, absent from the form), forbids the
 three fields this record must carry (``name``, ``auth_type``,
-``auth_credentials``), types ``properties`` as UUIDs, and rejects non-https
-endpoints — which would break local development against
-``http://…​.localhost`` providers.  Inheriting a closed RootModel union also
-yields no field inheritance.  The shared rules are instead grounded on the same
+``auth_credentials``) and types ``properties`` as UUIDs.  Inheriting a closed
+RootModel union also yields no field inheritance.  Its https-only ``endpoint``
+rule is NOT diverged from any more: this module used to relax it for local dev
+hosts, and #1802 made the repo's TLS gate unconditional (the insecure hatch was
+deleted so no call site can relax a scheme), while the generated test CA covers
+``*.localhost`` — so local development speaks https too and the relaxation was
+buying nothing.  The shared rules are instead grounded on the same
 SDK enums and pinned against the library model by
 ``tests/unit/test_tmp_provider_registration.py``.
 """
@@ -53,7 +56,6 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING, Annotated, TypedDict, cast
-from urllib.parse import urlparse
 from uuid import UUID
 
 from adcp.types.generated_poc.enums.uid_type import UidType
@@ -66,20 +68,18 @@ from adcp.types.generated_poc.trusted_match.provider_registration import (
 )
 from pydantic import (
     AfterValidator,
-    AnyUrl,
     ConfigDict,
     Field,
     RootModel,
     StringConstraints,
     ValidationError,
-    field_validator,
     model_validator,
 )
 
-from src.core.domain_config import is_local_host
+from src.core.exceptions import AdCPBlockedUrlError
 from src.core.logging_config import log_safe
 from src.core.schemas._base import SalesAgentBaseModel
-from src.core.security.url_validator import check_url_ssrf
+from src.core.security.egress.policy import EgressPolicy
 
 if TYPE_CHECKING:
     # Type-only: gives from_row() a checked contract with the ORM row without
@@ -214,41 +214,11 @@ class TMPProviderFields(TypedDict):
     auth_credentials: str | None
 
 
-class _LocalHttpEndpointMixin:
-    """Relax the SDK's https-only ``endpoint`` rule for local dev hosts ONLY.
-
-    The divergence from the codegen is stated as a CONDITION, in one place, mixed
-    into both ``anyOf`` branch classes. It was a blanket no-op copied verbatim into
-    each branch, which had two problems: the only reachable effect was that a
-    tenant could register and publish a **cleartext public** endpoint — against
-    the pinned spec's MUST (``trusted-match/specification`` §"Provider
-    registration security", repeated in the schema's ``endpoint.description``) —
-    and a future narrowing would have had to be made twice or the two branches
-    would accept different endpoints (#1197 review).
-
-    What the schema itself says: ``endpoint`` is ``{"type": "string", "format":
-    "uri"}``. The HTTPS requirement is prose in the field description, so relaxing
-    it for a host that cannot serve https is a conformant reading; relaxing it for
-    a public host is not.
-
-    ``is_local_host`` is the codebase's single local-host predicate
-    (``src/core/domain_config.py``) — the same one that answers "can this host
-    serve https?" for the advertised agent URLs and the seller-agent resolution.
-    """
-
-    @field_validator("endpoint")
-    @classmethod
-    def _require_https_endpoint(cls, value: AnyUrl) -> AnyUrl:
-        if value.scheme == "https" or is_local_host(value.host):
-            return value
-        raise ValueError("endpoint must use https (non-https is permitted only for local dev hosts)")
-
-
-class _ContextMatchEntry(_LocalHttpEndpointMixin, LibraryContextMatchRegistration):
+class _ContextMatchEntry(LibraryContextMatchRegistration):
     """The ``context_match: true`` branch of the pinned schema's ``anyOf``."""
 
 
-class _IdentityMatchEntry(_LocalHttpEndpointMixin, LibraryIdentityMatchRegistration):
+class _IdentityMatchEntry(LibraryIdentityMatchRegistration):
     """The ``identity_match: true`` branch of the pinned schema's ``anyOf``."""
 
 
@@ -417,32 +387,47 @@ class TMPProviderRegistration(SalesAgentBaseModel):
         if self.status not in VALID_STATUSES:
             raise ValueError(f"Invalid status '{self.status}'. Valid values: {', '.join(sorted(VALID_STATUSES))}")
 
-        # The two halves of the write path use ONE predicate, so they cannot
-        # contradict each other. A public endpoint must be https (the pinned spec's
-        # MUST) and is DNS-checked against private ranges; a local dev host may be
-        # http and skips the resolution check, which is what makes the
-        # ``http://…​.localhost`` form the route documents actually registrable.
-        # Before this, `require_https` was left at its default (so a cleartext
-        # PUBLIC endpoint was accepted) while `resolve_dns` rejected every local
-        # host — the relaxation's stated reason was unreachable and its only real
-        # effect was the thing the spec forbids (#1197 review).
-        endpoint_host = urlparse(self.endpoint).hostname
-        local_endpoint = is_local_host(endpoint_host)
-        is_safe, ssrf_error = check_url_ssrf(
-            self.endpoint,
-            require_https=not local_endpoint,
-            resolve_dns=not local_endpoint,
-        )
-        if not is_safe:
+        # The endpoint is STORED here and fetched later by the sync, so the
+        # verdict is the seam's DNS-FREE registration one
+        # (``EgressPolicy.check_registration`` — the port of the deleted
+        # ``check_url_ssrf(resolve_dns=False)`` path, #1802). Not ``validate_url``:
+        # that resolves, and a registration must not depend on whether the
+        # provider's DNS happens to answer while an operator fills in a form.
+        #
+        # The URL is passed BYTE-FOR-BYTE. There is no local-dev scheme
+        # relaxation any more, and deliberately so:
+        #
+        #   * #1802 made the TLS gate unconditional across the repo and deleted
+        #     the insecure hatch, so no call site can relax the scheme — a
+        #     per-feature exception here would be the one place that does.
+        #   * The pinned spec already made https a MUST for this surface, which
+        #     is what the SDK codegen's own rule said before this module
+        #     overrode it.
+        #   * Local development does not need http: the generated test CA covers
+        #     ``*.localhost`` and ``agent.localhost`` (``SAN_DNS_NAMES`` in
+        #     ``scripts/dev/gen_test_tls.py``), so ``https://si-agent.localhost``
+        #     is registrable and reachable. The relaxation was buying nothing that
+        #     https does not already give.
+        #
+        # An earlier port of this block asked the policy about an https-rewritten
+        # copy of the URL to keep the old relaxation. That is a destination
+        # rewrite, which ``test_architecture_no_destination_rewrite`` forbids for
+        # exactly the right reason: what the policy judged would not have been
+        # what a caller supplied.
+        try:
+            EgressPolicy.check_registration(self.endpoint)
+        except AdCPBlockedUrlError as blocked:
             # Tagged `[TMP …]` so an operator grepping `[TMP` for this feature's
-            # logs sees SSRF rejections from every write surface, not just the
-            # admin form the check used to live behind.
+            # logs sees egress refusals from every write surface, not just the
+            # admin form the check used to live behind. The policy's message is
+            # already opaque about the address (AdCP 3.1.1 security point 6); the
+            # real cause is in the policy's own WARNING line.
             logger.warning(
                 "[TMP registration][SECURITY] Provider rejected unsafe URL %s: %s",
                 log_safe(self.endpoint),
-                log_safe(ssrf_error),
+                log_safe(str(blocked)),
             )
-            raise ValueError(f"Endpoint URL is not allowed: {ssrf_error}")
+            raise ValueError(f"Endpoint URL is not allowed: {blocked}") from blocked
 
         if not self.context_match and not self.identity_match:
             raise ValueError("Provider must support at least one of context_match or identity_match")

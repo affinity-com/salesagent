@@ -1,16 +1,19 @@
-"""Shared HTTP helpers for outbound TMP Provider calls.
+"""Shared request-shaping helpers for outbound TMP Provider calls.
 
 Both the health-check scheduler (``tmp_health_scheduler.py``) and the package
-sync service (``tmp_provider_sync.py``) make HTTP calls to TMP Provider
-endpoints.  Centralising the URL-building and auth-header helpers here ensures
-every outbound call inherits the same hardening (trailing-slash normalisation,
-``follow_redirects=False``) rather than each call site re-implementing
-it independently.
+sync service (``tmp_provider_sync.py``) address TMP Provider endpoints, so the
+URL building and the auth header live here rather than once per call site.
+
+What this module deliberately does NOT own any more is transport hardening.
+``follow_redirects=False`` and the shared client kwargs used to live here; #1802
+moved outbound HTTP onto ``src.core.security.outbound_http``, which owns address
+policy, TLS, redirect refusal and retry classification for every call in the
+application. Two call sites naming those flags identically was the shape that
+made it possible to forget one (the POST side did, once) — the seam removes the
+opportunity rather than the mistake.
 """
 
 from __future__ import annotations
-
-from typing import TypedDict
 
 from src.core.schemas.tmp_provider import VALID_AUTH_SCHEMES
 
@@ -56,42 +59,3 @@ def provider_auth_headers(auth_type: str | None, auth_credentials: str) -> dict[
             f"Unsupported TMP provider auth scheme {scheme!r}; expected one of {sorted(VALID_AUTH_SCHEMES)}"
         )
     return {"Authorization": f"Bearer {auth_credentials}"}
-
-
-class ProviderClientKwargs(TypedDict):
-    """The exact ``httpx`` client kwargs every outbound TMP Provider call sets.
-
-    A closed two-key contract, so the ``**``-unpack into ``httpx.Client(...)``
-    is checked: ``dict[str, Any]`` gave the call sites nothing to check against
-    and left the key set documented only in prose (#1197 review).
-    """
-
-    timeout: float
-    follow_redirects: bool
-
-
-def provider_client_kwargs(timeout: float = _DEFAULT_SYNC_TIMEOUT_SECONDS) -> ProviderClientKwargs:
-    """Return shared ``httpx.Client`` / ``httpx.AsyncClient`` constructor kwargs.
-
-    Centralises the two flags that every outbound TMP Provider call must set:
-
-    - ``follow_redirects=False`` — prevents SSRF via open-redirect on both the
-      GET (health probe) and POST (package sync) sides.  This flag was forgotten
-      once on the POST side (round 7) and must never be omitted again.
-    - ``timeout`` — callers may override for async health probes (which use a
-      different constant) but the default matches the sync package-sync timeout.
-
-    Usage::
-
-        import httpx
-        from src.services._provider_http import provider_client_kwargs
-
-        # Sync (package sync):
-        with httpx.Client(**provider_client_kwargs()) as client:
-            resp = client.post(url, json=payloads, headers=headers)
-
-        # Async (health scheduler) — override timeout:
-        async with httpx.AsyncClient(**provider_client_kwargs(timeout=5)) as client:
-            resp = await client.get(health_url)
-    """
-    return ProviderClientKwargs(timeout=timeout, follow_redirects=False)

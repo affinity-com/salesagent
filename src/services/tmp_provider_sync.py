@@ -46,9 +46,8 @@ import threading
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
-import httpx
 from adcp.types import AvailablePackage, SellerAgentReference
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
 from src.core.database.models import MediaPackage, TMPProvider
 from src.core.database.repositories.uow import MediaBuyUoW, TenantConfigUoW, TMPProviderUoW
@@ -63,8 +62,9 @@ from src.core.schemas._base import (
     UpdateMediaBuySubmitted,
     UpdateMediaBuySuccess,
 )
+from src.core.security.outbound_http import OperatorEndpoint, send
 from src.core.thread_registry import ThreadRegistry
-from src.services._provider_http import provider_auth_headers, provider_client_kwargs, provider_url
+from src.services._provider_http import _DEFAULT_SYNC_TIMEOUT_SECONDS, provider_auth_headers, provider_url
 
 if TYPE_CHECKING:
     from src.core.resolved_identity import ResolvedIdentity
@@ -554,27 +554,45 @@ def _post_packages_sync(
     ``Authorization: Bearer <credentials>``.  The TMP Provider resolves
     the tenant server-side from the credential.
 
-    ``follow_redirects=False`` prevents SSRF via open-redirect on the POST
-    side (matching the GET-side guard in the health probe).
+    Sent through the outbound egress seam (``outbound_http.send``), which owns
+    address policy, TLS, redirect refusal and retry classification — this module
+    states none of them. Redirect refusal, which used to be this function's own
+    ``follow_redirects=False``, is httpx's default inside the seam; the SSRF
+    guard the flag stood in for is now the seam's pinned-IP transport (#1802).
 
-    Raises httpx.HTTPError on non-2xx responses so the caller can log and
-    continue to the next provider.
+    ``provenance`` is an :class:`OperatorEndpoint`, not a ``CounterpartyUrl``: a
+    TMP provider endpoint is registered by the operator through the admin form,
+    so a refusal has no buyer-request field to name, and the role name must not
+    be an address (AdCP 3.1.1 security point 6).
+
+    Raises :class:`OutboundError` on a refusal, a transport failure or a non-2xx
+    the seam will not retry, so the caller can log and continue to the next
+    provider — the same contract ``raise_for_status()`` gave it before.
     """
     url = provider_url(endpoint, "/packages/sync")
     headers = provider_auth_headers(auth_type, auth_credentials)
     # The single model_dump in the whole path: the fan-out carries validated
     # AvailablePackage models and JSON is produced only here, at the transport
     # edge, so `Any` never travels through this module (#1197 review).
-    body = [pkg.model_dump(mode="json", exclude_none=True) for pkg in payloads]
-    with httpx.Client(**provider_client_kwargs()) as client:
-        resp = client.post(url, json=body, headers=headers)
-        resp.raise_for_status()
+    # Annotated as the seam's own JsonValue: model_dump returns dict[str, Any],
+    # and Any inside the element type does not satisfy the recursive alias on its
+    # own. Stating the boundary type here keeps the seam call checked instead of
+    # casting at it.
+    body: JsonValue = [pkg.model_dump(mode="json", exclude_none=True) for pkg in payloads]
+    result = send(
+        url,
+        method="POST",
+        json=body,
+        headers=headers,
+        timeout=_DEFAULT_SYNC_TIMEOUT_SECONDS,
+        provenance=OperatorEndpoint("the TMP provider"),
+    )
     # Sync fires on every media-buy create/update; keep at DEBUG (failures stay
     # at WARNING in sync_packages_for_media_buy's fan-out loop below).
     logger.debug(
         "[TMP sync] POST %s → %d (%d package(s), auth=%s)",
         log_safe(url),
-        resp.status_code,
+        result.http_status,
         len(payloads),
         "bearer" if auth_credentials else "none",
     )

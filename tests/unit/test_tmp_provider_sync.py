@@ -14,11 +14,12 @@ from __future__ import annotations
 from unittest import mock
 from unittest.mock import MagicMock, patch
 
-import httpx
 import pytest
 from adcp.types import AvailablePackage, SellerAgentReference
 from sqlalchemy.orm.exc import DetachedInstanceError
 
+from src.core.security.egress.attempts import OutboundDeliveryFailed
+from src.core.security.outbound_http import OperatorEndpoint
 from src.services.tmp_provider_sync import (
     AVAILABLE_PACKAGE_SCHEMA,
     _build_package_payload,
@@ -27,7 +28,7 @@ from src.services.tmp_provider_sync import (
     sync_packages_for_media_buy,
 )
 from tests.helpers.pinned_schema import validate_against_pinned_schema
-from tests.helpers.tmp_provider_http import make_mock_http_client
+from tests.helpers.tmp_provider_http import make_delivery_failed, make_seam_result
 from tests.unit._tmp_helpers import (
     make_create_result,
     make_mock_package,
@@ -241,7 +242,7 @@ class TestSyncSessionClosedBeforeHTTP:
 
         provider = MagicMock()
         provider.name = "Provider A"
-        provider.endpoint = "http://provider-a:3000"
+        provider.endpoint = "https://provider-a:3000"
         provider.auth_credentials = None
 
         mock_mb_cls, mock_mb_uow, mock_tp_cls, mock_tp_uow = make_sync_uow(packages=[pkg], providers=[provider])
@@ -317,7 +318,7 @@ class TestProviderMaterializedBeforeSessionCloses:
         pkg = make_mock_package(package_id="pkg-1", package_config={"product_id": "prod-1"})
 
         closed_flag = [False]
-        provider = self._DetachAfterCloseProvider("Provider A", "http://provider-a:3000", "secret", closed_flag)
+        provider = self._DetachAfterCloseProvider("Provider A", "https://provider-a:3000", "secret", closed_flag)
 
         mock_mb_cls, _mock_mb_uow, mock_tp_cls, mock_tp_uow = make_sync_uow(packages=[pkg], providers=[provider])
 
@@ -336,7 +337,7 @@ class TestProviderMaterializedBeforeSessionCloses:
             sync_packages_for_media_buy("tenant-1", "mb-1")
 
         mock_post.assert_called_once_with(
-            "http://provider-a:3000",
+            "https://provider-a:3000",
             mock.ANY,  # payload correctness pinned by TestBuildPackagePayload
             "secret",
             "bearer",  # the provider's scheme, passed through — not mock.ANY
@@ -359,11 +360,11 @@ class TestSyncPackagesFanOut:
 
         provider1 = MagicMock()
         provider1.name = "Provider A"
-        provider1.endpoint = "http://provider-a:3000"
+        provider1.endpoint = "https://provider-a:3000"
         provider1.auth_credentials = None
         provider2 = MagicMock()
         provider2.name = "Provider B"
-        provider2.endpoint = "http://provider-b:3000"
+        provider2.endpoint = "https://provider-b:3000"
         provider2.auth_credentials = None
 
         mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = make_sync_uow(packages=[pkg], providers=[provider1, provider2])
@@ -381,7 +382,7 @@ class TestSyncPackagesFanOut:
         assert mock_post.call_count == 2
         called_endpoints = {call.args[0] for call in mock_post.call_args_list}
         called_auths = {call.args[2] for call in mock_post.call_args_list}
-        assert called_endpoints == {"http://provider-a:3000", "http://provider-b:3000"}
+        assert called_endpoints == {"https://provider-a:3000", "https://provider-b:3000"}
         assert called_auths == {""}  # both providers have no auth_credentials
 
     @patch("src.services.tmp_provider_sync._post_packages_sync")
@@ -420,14 +421,14 @@ class TestSyncPackagesFanOut:
 
         provider1 = MagicMock()
         provider1.name = "Failing Provider"
-        provider1.endpoint = "http://fail:3000"
+        provider1.endpoint = "https://fail:3000"
         provider2 = MagicMock()
         provider2.name = "Working Provider"
-        provider2.endpoint = "http://ok:3000"
+        provider2.endpoint = "https://ok:3000"
 
         mock_mb_cls, _mb_uow, mock_tp_cls, _tp_uow = make_sync_uow(packages=[pkg], providers=[provider1, provider2])
         # First call raises, second succeeds
-        mock_post.side_effect = [httpx.ConnectError("refused"), None]
+        mock_post.side_effect = [make_delivery_failed(None), None]
 
         with (
             patch("src.services.tmp_provider_sync.MediaBuyUoW", mock_mb_cls),
@@ -724,70 +725,66 @@ class TestResolveSellAgentUrl:
 class TestPostPackagesSyncAuth:
     """_post_packages_sync sends Bearer auth when credentials are provided."""
 
-    def _make_mock_client(self, status_code: int = 200) -> tuple[MagicMock, MagicMock]:
-        """Return (mock_client, mock_response) from the shared builder."""
-        mock_client = make_mock_http_client(status_code)
-        return mock_client, mock_client.post.return_value
-
     def test_sends_bearer_token_when_auth_credentials_set(self):
         """When auth_credentials is non-empty, Authorization: Bearer header is sent."""
-        mock_client, _ = self._make_mock_client(200)
-
-        with patch("src.services.tmp_provider_sync.httpx.Client", return_value=mock_client):
+        with patch("src.services.tmp_provider_sync.send", return_value=make_seam_result(200)) as seam:
             _post_packages_sync(
-                "http://provider:3000",
+                "https://provider:3000",
                 [_a_package()],
                 auth_credentials="secret-token",
             )
 
-        mock_client.post.assert_called_once_with(
-            "http://provider:3000/packages/sync",
-            # The SERIALIZED body, not the model: _post_packages_sync owns the one
-            # model_dump in the path, so this asserts what goes on the wire.
-            json=[_package_wire()],
-            headers={"Authorization": "Bearer secret-token"},
-        )
+        _, kwargs = seam.call_args
+        assert seam.call_args[0][0] == "https://provider:3000/packages/sync"
+        assert kwargs["method"] == "POST"
+        # The SERIALIZED body, not the model: _post_packages_sync owns the one
+        # model_dump in the path, so this asserts what goes on the wire.
+        assert kwargs["json"] == [_package_wire()]
+        assert kwargs["headers"] == {"Authorization": "Bearer secret-token"}
 
     def test_sends_no_auth_headers_when_no_credentials(self):
         """When auth_credentials is empty, no auth headers are sent."""
-        mock_client, _ = self._make_mock_client(200)
-
-        with patch("src.services.tmp_provider_sync.httpx.Client", return_value=mock_client):
+        with patch("src.services.tmp_provider_sync.send", return_value=make_seam_result(200)) as seam:
             _post_packages_sync(
-                "http://provider:3000",
+                "https://provider:3000",
                 [_a_package()],
                 auth_credentials="",
             )
 
-        mock_client.post.assert_called_once_with(
-            "http://provider:3000/packages/sync",
-            # The SERIALIZED body, not the model: _post_packages_sync owns the one
-            # model_dump in the path, so this asserts what goes on the wire.
-            json=[_package_wire()],
-            headers={},
-        )
+        assert seam.call_args.kwargs["headers"] == {}
 
-    def test_follow_redirects_false_prevents_ssrf(self):
-        """follow_redirects=False is always passed to prevent SSRF via open-redirect."""
-        mock_client, _ = self._make_mock_client(200)
+    def test_provenance_is_an_operator_endpoint_naming_no_address(self):
+        """The seam is told whose URL this is, as a role rather than an address.
 
-        with patch("src.services.tmp_provider_sync.httpx.Client", return_value=mock_client) as mock_cls:
-            _post_packages_sync("http://provider:3000", [_a_package()])
-
-        _, kwargs = mock_cls.call_args
-        assert kwargs.get("follow_redirects") is False
-
-    def test_5xx_response_raises_http_status_error(self):
-        """A 5xx response from the TMP Provider raises httpx.HTTPStatusError.
-
-        This ensures a silent success is impossible — the caller's except block
-        will log the failure and continue to the next provider.
+        Replaces a ``follow_redirects=False`` assertion: that flag is no longer
+        this module's to pass — it is httpx's default inside the seam, and the
+        SSRF guard it stood in for is the seam's pinned-IP transport. What IS
+        still this call site's decision is the provenance it declares, and an
+        ``OperatorEndpoint`` whose name looked like a URL would disclose network
+        topology on a refusal (AdCP 3.1.1 security point 6), which its own
+        constructor refuses (#1802 migration).
         """
-        mock_client, _ = self._make_mock_client(500)
+        with patch("src.services.tmp_provider_sync.send", return_value=make_seam_result(200)) as seam:
+            _post_packages_sync("https://provider:3000", [_a_package()])
 
-        with patch("src.services.tmp_provider_sync.httpx.Client", return_value=mock_client):
-            with pytest.raises(httpx.HTTPStatusError):
-                _post_packages_sync("http://provider:3000", [_a_package()])
+        provenance = seam.call_args.kwargs["provenance"]
+        assert isinstance(provenance, OperatorEndpoint)
+        assert "://" not in provenance.name
+
+    def test_seam_failure_propagates_to_the_caller(self):
+        """A non-2xx the seam refuses to retry reaches the caller as OutboundError.
+
+        Silent success must be impossible: the fan-out's except block logs the
+        failure and continues to the next provider, which only happens if this
+        raises. The seam raises rather than returning a 500 result, so the
+        contract ``raise_for_status()`` used to provide is preserved.
+        """
+        with patch(
+            "src.services.tmp_provider_sync.send",
+            side_effect=make_delivery_failed(500),
+        ):
+            with pytest.raises(OutboundDeliveryFailed):
+                _post_packages_sync("https://provider:3000", [_a_package()])
 
     def test_fan_out_uses_provider_auth_credentials(self):
         """sync_packages_for_media_buy passes provider.auth_credentials to _post_packages_sync."""
@@ -795,7 +792,7 @@ class TestPostPackagesSyncAuth:
 
         provider = MagicMock()
         provider.name = "Credentialed Provider"
-        provider.endpoint = "http://provider:3000"
+        provider.endpoint = "https://provider:3000"
         provider.auth_credentials = "provider-secret"
         provider.auth_type = "bearer"
 
@@ -809,7 +806,7 @@ class TestPostPackagesSyncAuth:
             sync_packages_for_media_buy("tenant-1", "mb-1")
 
         mock_post.assert_called_once_with(
-            "http://provider:3000",
+            "https://provider:3000",
             mock.ANY,  # payload correctness pinned by TestBuildPackagePayload
             "provider-secret",
             "bearer",  # the provider's scheme, passed through — not mock.ANY

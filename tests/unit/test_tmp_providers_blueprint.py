@@ -36,6 +36,9 @@ def _make_tmp_provider_client():
     return make_super_admin_client()
 
 
+# A public hostname is fine again: the registration verdict is the seam's
+# DNS-FREE one (EgressPolicy.check_registration), so no test needs a resolver
+# stub or an IP literal to get a deterministic answer.
 _SAFE_ENDPOINT = "https://provider.example.com/tmp"
 
 # One valid add payload; each rejection case overrides exactly one thing, so a
@@ -69,7 +72,6 @@ def _post_add(form: dict[str, str], mock_uow_cls) -> object:
     client = _make_tmp_provider_client()
     with (
         patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls),
-        patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"),
         patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}),
     ):
         return client.post("/tenant/default/tmp-providers/add", data=form, follow_redirects=False)
@@ -105,21 +107,20 @@ class TestTMPProviderAddSSRF:
 
         mock_uow_cls, mock_uow = make_blueprint_uow()
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
-            with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
-                with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                    response = client.post(
-                        "/tenant/default/tmp-providers/add",
-                        data={
-                            "name": "Safe Provider",
-                            "endpoint": "https://provider.example.com/tmp",
-                            "context_match": "on",
-                            "identity_match": "on",
-                            "countries": "US,GB",
-                            "uid_types": "uid2,id5",
-                            "timeout_ms": "50",
-                        },
-                        follow_redirects=False,
-                    )
+            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
+                response = client.post(
+                    "/tenant/default/tmp-providers/add",
+                    data={
+                        "name": "Safe Provider",
+                        "endpoint": _SAFE_ENDPOINT,
+                        "context_match": "on",
+                        "identity_match": "on",
+                        "countries": "US,GB",
+                        "uid_types": "uid2,id5",
+                        "timeout_ms": "50",
+                    },
+                    follow_redirects=False,
+                )
 
         # Must redirect to list (success) — not back to add form
         assert response.status_code == 302
@@ -194,22 +195,21 @@ class TestTMPProviderEditSSRF:
         mock_uow_cls, mock_uow = make_blueprint_uow()
         mock_uow.tmp_providers.get_by_id.return_value = existing_provider
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
-            with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
-                with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                    response = client.post(
-                        "/tenant/default/tmp-providers/prov_test_1234/edit",
-                        data={
-                            "name": "Existing Provider",
-                            "endpoint": "https://provider.example.com/tmp",
-                            "context_match": "on",
-                            "identity_match": "on",
-                            "countries": "US,GB",
-                            "uid_types": "uid2,id5",
-                            "timeout_ms": "50",
-                            "status": "active",
-                        },
-                        follow_redirects=False,
-                    )
+            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
+                response = client.post(
+                    "/tenant/default/tmp-providers/prov_test_1234/edit",
+                    data={
+                        "name": "Existing Provider",
+                        "endpoint": _SAFE_ENDPOINT,
+                        "context_match": "on",
+                        "identity_match": "on",
+                        "countries": "US,GB",
+                        "uid_types": "uid2,id5",
+                        "timeout_ms": "50",
+                        "status": "active",
+                    },
+                    follow_redirects=False,
+                )
 
         assert response.status_code == 302
         assert "tmp-providers" in response.headers.get("Location", "")
@@ -238,22 +238,21 @@ class TestTMPProviderInputValidation:
 
         mock_uow_cls, mock_uow = make_blueprint_uow()
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
-            with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
-                with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                    response = client.post(
-                        "/tenant/default/tmp-providers/add",
-                        data={
-                            "name": "Draining Provider",
-                            "endpoint": "https://provider.example.com/tmp",
-                            "context_match": "on",
-                            "identity_match": "on",
-                            "countries": "US",
-                            "uid_types": "uid2",
-                            "timeout_ms": "50",
-                            "status": "draining",
-                        },
-                        follow_redirects=False,
-                    )
+            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
+                response = client.post(
+                    "/tenant/default/tmp-providers/add",
+                    data={
+                        "name": "Draining Provider",
+                        "endpoint": _SAFE_ENDPOINT,
+                        "context_match": "on",
+                        "identity_match": "on",
+                        "countries": "US",
+                        "uid_types": "uid2",
+                        "timeout_ms": "50",
+                        "status": "draining",
+                    },
+                    follow_redirects=False,
+                )
 
         assert response.status_code == 302
         mock_uow.tmp_providers.create_from_fields.assert_called_once_with(
@@ -439,23 +438,22 @@ class TestTMPProviderAuthFields:
 
         mock_uow_cls, mock_uow = make_blueprint_uow()
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
-            with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
-                with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                    response = client.post(
-                        "/tenant/default/tmp-providers/add",
-                        data={
-                            "name": "Auth Provider",
-                            "endpoint": "https://provider.example.com/tmp",
-                            "context_match": "on",
-                            "identity_match": "on",
-                            "countries": "US",
-                            "uid_types": "uid2",
-                            "timeout_ms": "50",
-                            "auth_type": "bearer",
-                            "auth_credentials": "my-secret-token",
-                        },
-                        follow_redirects=False,
-                    )
+            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
+                response = client.post(
+                    "/tenant/default/tmp-providers/add",
+                    data={
+                        "name": "Auth Provider",
+                        "endpoint": _SAFE_ENDPOINT,
+                        "context_match": "on",
+                        "identity_match": "on",
+                        "countries": "US",
+                        "uid_types": "uid2",
+                        "timeout_ms": "50",
+                        "auth_type": "bearer",
+                        "auth_credentials": "my-secret-token",
+                    },
+                    follow_redirects=False,
+                )
 
         assert response.status_code == 302
         mock_uow.tmp_providers.create_from_fields.assert_called_once_with(
@@ -484,24 +482,23 @@ class TestTMPProviderAuthFields:
         mock_uow_cls, mock_uow = make_blueprint_uow()
         mock_uow.tmp_providers.get_by_id.return_value = existing_provider
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
-            with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
-                with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                    response = client.post(
-                        "/tenant/default/tmp-providers/prov_test_1234/edit",
-                        data={
-                            "name": "Existing Provider",
-                            "endpoint": "https://provider.example.com/tmp",
-                            "context_match": "on",
-                            "identity_match": "on",
-                            "countries": "US",
-                            "uid_types": "uid2",
-                            "timeout_ms": "50",
-                            "status": "active",
-                            "auth_type": "bearer",
-                            "auth_credentials": "",  # empty — should preserve existing
-                        },
-                        follow_redirects=False,
-                    )
+            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
+                response = client.post(
+                    "/tenant/default/tmp-providers/prov_test_1234/edit",
+                    data={
+                        "name": "Existing Provider",
+                        "endpoint": _SAFE_ENDPOINT,
+                        "context_match": "on",
+                        "identity_match": "on",
+                        "countries": "US",
+                        "uid_types": "uid2",
+                        "timeout_ms": "50",
+                        "status": "active",
+                        "auth_type": "bearer",
+                        "auth_credentials": "",  # empty — should preserve existing
+                    },
+                    follow_redirects=False,
+                )
 
         assert response.status_code == 302
         # Production uses update_fields() — verify auth_credentials was NOT
@@ -533,24 +530,23 @@ class TestTMPProviderAuthFields:
         mock_uow_cls, mock_uow = make_blueprint_uow()
         mock_uow.tmp_providers.get_by_id.return_value = existing_provider
         with patch("src.admin.blueprints.tmp_providers.TMPProviderUoW", mock_uow_cls):
-            with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
-                with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
-                    response = client.post(
-                        "/tenant/default/tmp-providers/prov_test_1234/edit",
-                        data={
-                            "name": "Existing Provider",
-                            "endpoint": "https://provider.example.com/tmp",
-                            "context_match": "on",
-                            "identity_match": "on",
-                            "countries": "US",
-                            "uid_types": "uid2",
-                            "timeout_ms": "50",
-                            "status": "active",
-                            "auth_type": "bearer",
-                            "auth_credentials": "new-secret",
-                        },
-                        follow_redirects=False,
-                    )
+            with patch.dict(os.environ, {"ADCP_AUTH_TEST_MODE": "true"}):
+                response = client.post(
+                    "/tenant/default/tmp-providers/prov_test_1234/edit",
+                    data={
+                        "name": "Existing Provider",
+                        "endpoint": _SAFE_ENDPOINT,
+                        "context_match": "on",
+                        "identity_match": "on",
+                        "countries": "US",
+                        "uid_types": "uid2",
+                        "timeout_ms": "50",
+                        "status": "active",
+                        "auth_type": "bearer",
+                        "auth_credentials": "new-secret",
+                    },
+                    follow_redirects=False,
+                )
 
         assert response.status_code == 302
         # Production uses update_fields() — verify auth_credentials IS included

@@ -16,10 +16,12 @@ from tests.factories.account import AccountFactory, AgentAccountAccessFactory
 from tests.factories.core import (
     AdapterConfigFactory,
     AuthorizedPropertyFactory,
+    CreativeAgentFactory,
     CurrencyLimitFactory,
     GAMInventoryFactory,
     PropertyTagFactory,
     PublisherPartnerFactory,
+    SignalsAgentFactory,
     TenantFactory,
 )
 from tests.factories.creative import CreativeAssignmentFactory, CreativeFactory
@@ -43,7 +45,7 @@ from tests.factories.tmp_provider import (
     replace_tmp_providers,
 )
 from tests.factories.user import TenantAuthConfigFactory, UserFactory
-from tests.factories.webhook import PushNotificationConfigFactory
+from tests.factories.webhook import PushNotificationConfigFactory, WebhookTaskContextFactory
 
 ALL_FACTORIES = [
     TenantFactory,
@@ -55,6 +57,8 @@ ALL_FACTORIES = [
     PropertyTagFactory,
     PublisherPartnerFactory,
     AuthorizedPropertyFactory,
+    CreativeAgentFactory,
+    SignalsAgentFactory,
     PrincipalFactory,
     InventoryProfileFactory,
     ProductFactory,
@@ -78,6 +82,7 @@ __all__ = [
     "AuthorizedPropertyFactory",
     "AgentAccountAccessFactory",
     "CollectionListReferenceFactory",
+    "CreativeAgentFactory",
     "CreativeAssetFactory",
     "CreativeAssignmentFactory",
     "CreativeFactory",
@@ -98,6 +103,7 @@ __all__ = [
     "PropertyTagFactory",
     "PublisherPartnerFactory",
     "PushNotificationConfigFactory",
+    "SignalsAgentFactory",
     "TargetingFactory",
     "TenantAuthConfigFactory",
     "TenantFactory",
@@ -106,4 +112,5 @@ __all__ = [
     "plant_seller_agent_host",
     "replace_tmp_providers",
     "UserFactory",
+    "WebhookTaskContextFactory",
 ]

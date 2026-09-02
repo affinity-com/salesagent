@@ -20,7 +20,7 @@ Covers:
 
 from __future__ import annotations
 
-from unittest.mock import patch
+import logging
 
 import pytest
 from adcp.types.generated_poc.enums.uid_type import UidType
@@ -72,18 +72,6 @@ _VALID: TMPProviderFields = {
 
 def _fields(**overrides) -> TMPProviderFields:
     return {**_VALID, **overrides}  # type: ignore[typeddict-item]
-
-
-@pytest.fixture(autouse=True)
-def _resolvable_dns():
-    """Make the SSRF check's DNS lookup deterministic (public IP) for every test.
-
-    Patched at the ``url_validator`` module so production's real ``check_url_ssrf``
-    runs — only the resolution result is stubbed.  Tests that need a *rejected*
-    endpoint use a hostname the validator blocks before resolving.
-    """
-    with patch("src.core.security.url_validator.socket.gethostbyname", return_value="93.184.216.34"):
-        yield
 
 
 class TestFieldContract:
@@ -188,21 +176,33 @@ class TestRegistrationInvariants:
         )
         assert (registration.context_match, registration.identity_match) == (True, False)
 
-    def test_ssrf_unsafe_endpoint_is_rejected(self):
-        """The SSRF check runs inside the record, not only behind the admin form.
+    def test_ssrf_unsafe_endpoint_is_rejected(self, caplog):
+        """The egress verdict runs inside the record, not only behind the admin form.
 
-        Mutation this pins: dropping ``check_url_ssrf`` from the model would let
-        an internal-network endpoint register from *any* write surface.
+        Mutation this pins: dropping ``EgressPolicy.check_registration`` from the
+        model would let an internal-network endpoint register from *any* write
+        surface.
 
-        Deliberately **https**, so the SSRF check is the only thing that can
-        reject it — an http URL would now be refused by the scheme rule first
-        (see TestEndpointSchemeIsConditional) and this test would pass without
-        the SSRF check running at all.
+        Deliberately **https**, so the address rule is the only thing that can
+        reject it — an http URL would be refused by the scheme rule first (see
+        TestEndpointSchemeIsConditional) and this test would pass without the
+        address check running at all.
+
+        The message no longer echoes the host. #1802 made refusal reasons opaque
+        to whoever supplied the URL (AdCP 3.1.1 security point 6: a reason naming
+        the resolved address is a host scanner), and routes the real cause to the
+        log instead — so that is where this asserts it, which is a stronger claim
+        than the old substring match on a user-facing string.
         """
-        message = _rejection_message(endpoint="https://host.docker.internal:9999/tmp")
+        with caplog.at_level(logging.WARNING, logger="src.core.schemas.tmp_provider"):
+            message = _rejection_message(endpoint="https://host.docker.internal:9999/tmp")
 
         assert message.startswith("Endpoint URL is not allowed:")
-        assert "host.docker.internal" in message
+        assert "host.docker.internal" not in message, "a refusal must not echo the address back"
+        logged = [record.getMessage() for record in caplog.records]
+        assert any("[TMP registration][SECURITY]" in line and "host.docker.internal" in line for line in logged), (
+            f"the operator-facing log must still name the endpoint it refused; got {logged}"
+        )
 
     def test_direct_construction_raises_validation_error(self):
         """Programmatic write surfaces get an exception, not a message tuple."""
@@ -381,33 +381,53 @@ class TestRejectionMessagesNameTheOffendingInput:
         )
 
 
-class TestEndpointSchemeIsConditional:
-    """Non-https is permitted for a local dev host and rejected for a public one.
+class TestEndpointSchemeIsUnconditionallyHttps:
+    """https is required for EVERY provider endpoint, local dev included.
 
-    The divergence from the SDK codegen's https-only rule used to be a blanket
-    no-op justified by "local development against ``http://….localhost`` keeps
-    working" — while the SSRF check on the same write path rejected every local
-    host, so that reason was unreachable and the relaxation's only real effect was
-    to accept a **cleartext public** endpoint, which the pinned spec forbids
-    (#1197 review). Both halves now use ``is_local_host``.
+    This class used to pin the opposite for local hosts. #1802 made the repo's
+    TLS gate unconditional and deleted the insecure hatch, so a per-feature
+    relaxation here would have been the only place in the tree that could
+    downgrade a scheme — and the generated test CA covers ``*.localhost``
+    (``SAN_DNS_NAMES``), so local development speaks https and the relaxation was
+    buying nothing. The pinned spec made https a MUST for this surface all along;
+    the record now simply agrees with it, and with the SDK codegen it used to
+    override.
     """
 
-    def test_public_http_endpoint_is_rejected(self):
-        """The pinned spec's MUST: a public provider endpoint has to be https."""
-        message = _rejection_message(endpoint="http://provider.example.com/tmp")
+    def test_public_http_endpoint_is_rejected(self, caplog):
+        """The pinned spec's MUST: a public provider endpoint has to be https.
 
-        assert "HTTPS" in message or "https" in message
+        Asserted on the LOG, not the message: the refusal handed back is opaque
+        by design since #1802, so "which rule refused this" is a fact the log
+        carries and the buyer-facing string deliberately does not.
+        """
+        with caplog.at_level(logging.WARNING, logger="src.core.security.egress.policy"):
+            message = _rejection_message(endpoint="http://provider.example.com/tmp")
+
+        assert message.startswith("Endpoint URL is not allowed:")
+        logged = [record.getMessage() for record in caplog.records]
+        assert any("scheme is not https" in line for line in logged), (
+            f"the scheme rule must be the one that refused a cleartext public endpoint; got {logged}"
+        )
 
     def test_public_https_endpoint_is_accepted(self):
         registration = TMPProviderRegistration.parse(_fields(endpoint="https://provider.example.com/tmp"))
 
         assert registration.endpoint == "https://provider.example.com/tmp"
 
-    def test_local_http_endpoint_is_accepted(self):
-        """The documented dev form — and it must be registrable, not just documented."""
-        registration = TMPProviderRegistration.parse(_fields(endpoint="http://si-agent.localhost:3003"))
+    def test_local_https_endpoint_is_accepted(self):
+        """The documented dev form — and it must be registrable, not just documented.
 
-        assert registration.endpoint == "http://si-agent.localhost:3003"
+        https, because that is what the route documents now: the generated CA
+        covers ``*.localhost``, so a dev provider serves TLS like any other.
+        """
+        registration = TMPProviderRegistration.parse(_fields(endpoint="https://si-agent.localhost:3003"))
+
+        assert registration.endpoint == "https://si-agent.localhost:3003"
+
+    def test_local_http_endpoint_is_rejected(self):
+        """The relaxation is gone: a local host gets no scheme exemption either."""
+        assert _rejection_message(endpoint="http://si-agent.localhost:3003")
 
     def test_loopback_literal_is_still_rejected(self):
         """Relaxing the scheme for local hosts must not open the loopback IP.
@@ -418,8 +438,8 @@ class TestEndpointSchemeIsConditional:
         """
         assert _rejection_message(endpoint="http://127.0.0.1:3003")
 
-    def test_the_entry_type_applies_the_same_condition(self):
-        """The wire entry and the record agree, because both use one predicate."""
+    def test_the_entry_type_applies_the_same_rule(self):
+        """The wire entry and the record agree: https, unconditionally."""
         import pytest as _pytest
         from pydantic import ValidationError as _ValidationError
 
@@ -428,10 +448,12 @@ class TestEndpointSchemeIsConditional:
         payload = {
             "provider_id": "prov_scheme",
             "context_match": True,
-            "endpoint": "http://si-agent.localhost:3003",
+            "endpoint": "https://si-agent.localhost:3003",
         }
-        # Local: permitted.
+        # https: permitted, local or not.
         assert TMPProviderDiscoveryEntry.model_validate(payload) is not None
-        # Public cleartext: not permitted, by the mixin shared by both branches.
-        with _pytest.raises(_ValidationError):
-            TMPProviderDiscoveryEntry.model_validate({**payload, "endpoint": "http://provider.example.com/tmp"})
+        # Cleartext: refused by the SDK codegen's own rule, which this module no
+        # longer overrides — for a local host as much as a public one.
+        for cleartext in ("http://si-agent.localhost:3003", "http://provider.example.com/tmp"):
+            with _pytest.raises(_ValidationError):
+                TMPProviderDiscoveryEntry.model_validate({**payload, "endpoint": cleartext})

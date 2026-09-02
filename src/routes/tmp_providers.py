@@ -34,7 +34,7 @@ key set of the pinned ``provider-registration.json``
   "providers": [
     {
       "provider_id": "5f1c0e3a9b7d4e8fa1c2b3d4e5f60718",
-      "endpoint": "http://si-agent.localhost:3003",
+      "endpoint": "https://si-agent.localhost:3003",
       "context_match": true,
       "identity_match": true,
       "countries": ["US"],
