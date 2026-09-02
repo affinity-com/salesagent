@@ -1402,8 +1402,11 @@ class TMPSyncMixin:
 
         origin_ctx = run_local_origin(ssl_context=server_ssl_context(gen_test_tls))
         origin = origin_ctx.__enter__()
+        # No guard of its own: the drain registered at entry closes it, AFTER
+        # joining the in-flight syncs, so no thread is mid-POST when the socket
+        # goes away. A separate guard here would be released newest-first — i.e.
+        # BEFORE the drain — which is the wrong order.
         self._tmp_collector_ctx = origin_ctx
-        self._guard("tmp_collector", self._exit_tmp_collector)  # type: ignore[attr-defined]
 
         # The origin necessarily listens on loopback, which the seam refuses by
         # default — the same statement the seam's own integration tests make with
@@ -1412,41 +1415,50 @@ class TMPSyncMixin:
         hatches.start()
         self._guard("tmp_egress_hatches", hatches.stop)  # type: ignore[attr-defined]
 
-        # Registered LAST so the registry's newest-first release runs it FIRST:
-        # in-flight syncs are joined and the provider rows dropped while the
-        # origin is still listening and the hatch still open. A hand-rolled
-        # ``__exit__`` used to do this, which put the drain outside
-        # ``BaseTestEnv.__enter__``'s unwind guard — the arrangement
-        # ``test_harness_base`` now forbids, and for the reason that bit here: a
-        # real DB write in teardown could skip the base's entire cleanup chain
-        # (#1197 review).
-        self._guard("tmp_sync_drain", self._teardown_tmp_sync)  # type: ignore[attr-defined]
-
         self._tmp_collector = {"endpoint": f"{origin.base_url}/tmp", "origin": origin}
         return self._tmp_collector
 
-    def _exit_tmp_collector(self) -> None:
-        """Close the origin context, discarding ``__exit__``'s suppression verdict."""
-        self._tmp_collector_ctx.__exit__(None, None, None)
+    def _enter_post(self) -> None:
+        """Register the sync drain for EVERY scenario in this env.
+
+        Not in ``_ensure_tmp_collector``: ``fire_tmp_sync`` starts its thread on
+        any successful media-buy write that carries a tenant, whether or not a
+        provider is registered — so a plain UC-002 create in this env spawns one
+        too. Draining only the scenarios that registered a collector would leave
+        those threads to open DB sessions after their test's scope, which is the
+        defect this mixin's docstring claims to prevent (and which registering
+        the drain in the lazy path reintroduced).
+
+        ``_enter_post``, not a hand-rolled ``__exit__``: the body runs inside
+        ``BaseTestEnv.__enter__``'s unwind guard, which is what
+        ``test_harness_base::test_harness_envs_define_no_enter_exit`` requires.
+        """
+        super()._enter_post()  # type: ignore[misc]
+        self._guard("tmp_sync_drain", self._teardown_tmp_sync)  # type: ignore[attr-defined]
 
     def _teardown_tmp_sync(self) -> None:
-        """Join in-flight syncs, then drop the provider rows.
+        """Join in-flight syncs, drop the provider rows, then close the origin.
 
-        Ordering matters: joining first means no thread is still POSTing when the
-        origin socket closes (which surfaces as a connection error in the sync's
-        fan-out log), and dropping the rows before release stops a later scenario
-        sharing the e2e database from fanning out to a port that no longer
-        listens.
+        One cleanup owns the whole sequence because the order matters: joining
+        first means no thread is still POSTing when the origin socket closes
+        (which would surface as a connection error in the sync's fan-out log),
+        and dropping the rows before the socket goes away stops a later scenario
+        sharing an e2e database from fanning out to a dead port.
 
-        Releasing the origin, the hatch and the SSL_CERT_FILE patch is NOT done
-        here: each was registered with ``_guard`` on the line it was acquired, so
-        the registry releases them LIFO after this runs. Closing the context here
-        as well would double-exit it.
+        Every step is conditional on having got that far, so this is also the
+        release path for a scenario whose ``__enter__`` failed midway — and for
+        one that never registered a provider, where it is just the join.
         """
         try:
             self.join_tmp_syncs(timeout=30.0)
         finally:
-            if self._tmp_collector is not None:
-                from tests.factories import delete_tmp_providers
+            try:
+                if self._tmp_collector is not None:
+                    from tests.factories import delete_tmp_providers
 
-                delete_tmp_providers(self, self._tenant_id)  # type: ignore[attr-defined]
+                    delete_tmp_providers(self, self._tenant_id)  # type: ignore[attr-defined]
+            finally:
+                ctx, self._tmp_collector_ctx = self._tmp_collector_ctx, None
+                self._tmp_collector = None
+                if ctx is not None:
+                    ctx.__exit__(None, None, None)
