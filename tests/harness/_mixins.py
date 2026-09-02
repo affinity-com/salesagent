@@ -1412,6 +1412,16 @@ class TMPSyncMixin:
         hatches.start()
         self._guard("tmp_egress_hatches", hatches.stop)  # type: ignore[attr-defined]
 
+        # Registered LAST so the registry's newest-first release runs it FIRST:
+        # in-flight syncs are joined and the provider rows dropped while the
+        # origin is still listening and the hatch still open. A hand-rolled
+        # ``__exit__`` used to do this, which put the drain outside
+        # ``BaseTestEnv.__enter__``'s unwind guard — the arrangement
+        # ``test_harness_base`` now forbids, and for the reason that bit here: a
+        # real DB write in teardown could skip the base's entire cleanup chain
+        # (#1197 review).
+        self._guard("tmp_sync_drain", self._teardown_tmp_sync)  # type: ignore[attr-defined]
+
         self._tmp_collector = {"endpoint": f"{origin.base_url}/tmp", "origin": origin}
         return self._tmp_collector
 
